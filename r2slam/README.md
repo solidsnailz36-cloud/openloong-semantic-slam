@@ -8,10 +8,11 @@
    (ROS 1 / Gazebo) │         image, ring, meta }               │       (ROS 2 sqlite)
                     └──────────────────┬────────────────────────┘
                                        ▼
-        deskew → odometry → detect → fuse → traversable → worldmap → explore → render
-                                       │
+        deskew → odometry → detect → fuse → traversable → worldmap → 驱动 → render
+                                       │                            (explore | goto)
               ┌────────────────────────┼────────────────────────┐
           运行视频                   建图 pcd                  逐帧性能表
+                                  + 类别表 + 目标关联实例
 ```
 
 ## 为什么这么分
@@ -37,13 +38,17 @@
 | `camera.py` | 针孔 + 鱼眼等距投影、反投影方位表 |
 | `deskew.py` | **真实侧必需**：匀速模型运动补偿（`p_ref = T_motion(dt) @ p`） |
 | `odometry.py` | KISS-ICP 的唯一构造处（测量工具与管线共用，避免参数漂移） |
-| `detect.py` | `tiny-yolov3` ONNX 检测（onnxruntime / cv2 双后端，**线程数受限**） |
-| `fusion.py` | 框 → 三维人位（取框内点 30 分位深度）+ **反投影回框内的硬判据** |
+| `detect.py` | `tiny-yolov3` ONNX 检测（onnxruntime / cv2 双后端，**线程数受限**）；`detect_mapped()` 直接给**本项目的 label id** |
+| `fusion.py` | 框 → 三维位置（取框内点 30 分位深度）+ **反投影回框内的硬判据**；人与物体走同一条几何 |
+| `labels.py` | **类别表的唯一定义源**（id ↔ 名称 ↔ 颜色 ↔ COCO 映射 ↔ 门限），并导出 `label_table.yaml` |
 | `traversable.py` | 地面 RANSAC + 高度带 / 闭运算 / 障碍膨胀 → 2D 可通行栅格 |
-| `worldmap.py` | 世界系累加、俯视渲染、**带标签 pcd 输出** |
+| `worldmap.py` | 世界系累加、俯视渲染（带类别图例）、**带标签 + rgb 的 pcd 输出** |
 | `explore.py` | **frontier 探索**（官方仿真不含规划器）+ 卡住自救 + 速度发布 |
+| `nav.py` | **决赛半场**：实例关联（`ObjectRegistry`）+ 指令解析（`find_label`）+ A* + `SemanticNavigator` |
 | `viz.py` | 渲染（只用 cv2，两个平台都有） |
-| `tools/online_pipeline.py` | **主程序**：一个进程、一帧一帧、产出全部交付物 |
+| `tools/online_pipeline.py` | **主程序**：一个进程、一帧一帧、产出全部交付物（`--explore` / `--goto`） |
+| `tools/package_submission.py` | **终审脚本**：逐条核对交付物并打包，不通过就非零退出 |
+| `tools/test_explore.py` `tools/test_nav.py` | 行为测试（零 ROS 依赖，两平台逐字一致） |
 
 ## 两个数据源的差异（全部落在配置里）
 
@@ -79,6 +84,13 @@ R2SLAM_BAG_PATH=/root/sim/three1 bash run_online.sh real_corridor \
 
 # ---- 行为测试（零 ROS 依赖，两平台结果一致）----
 PYTHONPATH=. python tools/test_explore.py
+PYTHONPATH=. python tools/test_nav.py
+
+# ---- 决赛行为：先探索，直到目标类别上地图，再交棒去导航 ----
+bash run_online.sh sim_house --out /tmp/goto --explore --goto '沙发' --duration 300
+
+# ---- 终审 + 打包（不通过就非零退出）----
+python tools/package_submission.py --root out --out 提交包
 
 # ---- 只导出帧做静态检查 ----
 python tools/export_frames.py --config config/real_corridor.yaml --out out/frames_real
@@ -118,8 +130,27 @@ Gazebo 软渲染 + RViz 就能把它吃满，所有墙钟数字被放大数倍�
 
 - **视频**：≤2 min（两份组委会材料里取更严的）、必须含可视化界面。
   加速播放时**加速倍数会烧进每一帧**——否则那是对性能的不实声明。
-- **pcd**：`x y z label` 二进制，标签表 `0=background / 1=traversable / 2=person`
-  在 README 与代码里都声明（FAQ 不提供类别表，所以交付物必须自带）。
+- **pcd**：`x y z label rgb` 二进制，每点 17 B。
+  - `label` 是 uint8，取值见 `label_table.yaml`（随 pcd 一起交付）。
+  - `rgb` 是 PCL **packed-float**，**由 label 推导**，所以点云在 CloudCompare /
+    pcl_viewer / Open3D 里**打开即为语义着色**，不需要先加载调色板。
+  - **不导出 `intensity`**：真实数据有、仿真没有，而两源字段逐字相同正是"迁移能力"的证据；
+    为一个源上恒为零的字段破坏它不划算。
+  - FAQ 不提供类别表 ⇒ 交付物必须自带。`package_submission.py` 会检查
+    "pcd 里出现过的每一个 label 是否都在表里"，不满足就 FAIL。
+
+### 类别表（机制）
+
+| 段 | 内容 |
+|---|---|
+| 几何类 0/1 | `background` / `traversable` —— LiDAR 几何判定，**零训练** |
+| 物体类 2.. | 23 类室内物体（person、sofa、chair、bed、table、tv、fridge、plant、sink、toilet、oven、microwave、bench、suitcase、backpack、vase、clock、book、laptop、keyboard、bottle、cup、bowl），COCO 2D 检测经标定投影到三维 |
+
+保留哪些 COCO 类别不是"能检出什么"（那是全部 80 类），而是两条物理约束：
+**LiDAR 看得见**（太小就没有回波，只会变成误报）与**人能用一句话指出来**
+（决赛是"语音指令 → 导航到目标物"）。此外每类还有两个门限
+（`min_points` 支撑点数、`min_box_frac` 框高占画面比例），都是物理量而不是调参。
+**检测器本身没有被训练或微调过。**
 
 ## 待确认（已知的不确定项）
 

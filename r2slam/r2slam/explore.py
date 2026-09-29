@@ -45,7 +45,9 @@ class FrontierExplorer:
                  centre_tol: float = 0.6,                  clearance_step: float = 0.10,
                  n_sectors: int = 72, max_search: int = 60,
                  max_candidates: int = 200,
-                 max_turn_frames: int = 18, backoff_frames: int = 10):
+                 max_turn_frames: int = 18, backoff_frames: int = 10,
+                 min_frontier_cells: int = 25, commit_frames: int = 25,
+                 reach_dist: float = 0.7):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
@@ -56,10 +58,33 @@ class FrontierExplorer:
         self.clearance_step = float(clearance_step)
         # One candidate per angular sector before any second candidate is
         # considered, then a bounded fallback over the rest.  See `command`
-        # for the two failure modes these two settings fix and their numbers.
+        # for the failure modes these settings fix and their numbers.
         self.n_sectors = int(n_sectors)
         self.max_search = int(max_search)
         self.max_candidates = int(max_candidates)
+        # --- what actually makes it explore rather than twitch --------------
+        # The first version scored candidates by DISTANCE alone, and on a
+        # 586 s simulator run it visited 15 distinct 1 m cells, spent 77 of
+        # 2932 frames driving, and left 1254 frames parked in a single cell.
+        # The cause is not the drive logic: once the map fills in, lone
+        # frontier specks appear a few centimetres away (at the edge of the
+        # floor-return range, behind furniture legs).  Nearest-first means the
+        # robot turns toward the speck, sees it, finds the next speck just as
+        # close, turns back -- a limit cycle that looks like motion and covers
+        # nothing.
+        #
+        # So: prefer **big** frontier clusters (a real unexplored area), and
+        # require a minimum size so specks are not candidates at all.  Distance
+        # still matters, as a decay on the score.
+        self.min_frontier_cells = int(min_frontier_cells)
+        # And commit to the chosen target for a while.  Re-deciding every frame
+        # is what lets two similar targets flip back and forth.
+        self.commit_frames = int(commit_frames)
+        self.reach_dist = float(reach_dist)
+        self._target: Optional[Tuple[float, float]] = None
+        self._target_age = 0
+        self.n_committed = 0
+        self.n_switches = 0
         # Stuck recovery.  "Turn in place until the front is clear" has no exit
         # if the robot is jammed in a corner: it rotates forever, the video
         # shows a stationary robot, and nothing reports an error.  Measured on
@@ -76,6 +101,24 @@ class FrontierExplorer:
         self.n_targets = 0
         self.n_search_turns = 0        # consecutive: resets when a target is found
         self.n_search_frames = 0       # cumulative: for the run report
+        self.n_reused = 0              # frames spent on a committed target
+        self.last_candidates: list = []
+
+    def _frontier_sizes(self, front: np.ndarray) -> np.ndarray:
+        """Size of the connected frontier cluster each cell belongs to.
+
+        A frontier cell on its own means "one pixel of the boundary is
+        adjacent to something unseen" -- it may be a shadow behind a chair leg.
+        The same cell inside a 500-cell cluster means "there is a room behind
+        this".  Only the second is worth driving to, and this is what tells
+        them apart.
+        """
+        n_lab, lab = cv2.connectedComponents(front.astype(np.uint8),
+                                            connectivity=8)
+        if n_lab <= 1:
+            return np.zeros_like(lab, dtype=np.int32)
+        counts = np.bincount(lab.ravel(), minlength=n_lab)
+        return counts[lab].astype(np.int32)
 
     # ------------------------------------------------------------------ core
     def _free_unknown(self, wmap):
@@ -104,6 +147,78 @@ class FrontierExplorer:
         near_unknown = cv2.dilate(u, np.ones((3, 3), np.uint8)) > 0
         near_obstacle = cv2.dilate(o, np.ones((3, 3), np.uint8)) > 0
         return free & near_unknown & ~near_obstacle
+
+    def _target_still_frontier(self, wmap, tx, ty) -> bool:
+        """Is the committed target still at the edge of the known?
+
+        Checked over a small window rather than the exact cell: the target is
+        the centroid of a cluster, and the cluster's shape moves as the map
+        grows.  Once the whole window is observed the target is spent and a new
+        one is chosen.
+        """
+        free, unknown = self._free_unknown(wmap)
+        front = self._frontier(wmap, free, unknown)
+        cx, cy = wmap.cell_of(tx, ty)
+        cx, cy = int(cx), int(cy)
+        y0, y1 = max(cy - 3, 0), min(cy + 4, wmap.n)
+        x0, x1 = max(cx - 3, 0), min(cx + 4, wmap.n)
+        if y1 <= y0 or x1 <= x0:
+            return False
+        return bool(front[y0:y1, x0:x1].any())
+
+    def _pick_target(self, wmap, x0, y0, yaw, wx, wy, dist, fsize,
+                     in_range, xs, ys, front) -> Optional[int]:
+        """Choose a frontier cell to drive to.  Returns an index into `wx`, or None.
+
+        Scoring, in order of importance:
+
+        1. **cluster size** -- how much unexplored space sits behind it.  This
+           is the term the first version was missing, and the reason it
+           twitched in a 4x3 m box for ten minutes instead of exploring: a lone
+           frontier speck a few centimetres away always beat a room-sized
+           cluster four metres away.
+        2. **distance**, as a decay (`size / (1 + d)`) -- of two comparable
+           clusters the nearer one wins, because efficiency is 30% of the
+           finals marking.
+        3. one candidate per **angular sector** first, so one blocked direction
+           cannot hide every other one.  Measured on the plain 60-nearest
+           version: 75 frames rotating against 35 frames of driving, because
+           the 60 nearest cells all sat behind the same wall.
+
+        Reachability is checked, never assumed: "nearest" by straight-line
+        distance is regularly a cell on the far side of a wall.
+        """
+        rel = np.arctan2(wy - y0, wx - x0) - yaw
+        rel = np.arctan2(np.sin(rel), np.cos(rel))
+        sec = (((rel + np.pi) / (2 * np.pi) * self.n_sectors).astype(np.int64)
+               % self.n_sectors)
+
+        big = [i for i in in_range if fsize[i] >= self.min_frontier_cells]
+        pool = big if big else list(in_range)   # map nearly done: take what is left
+
+        def score(i):
+            return fsize[i] / (1.0 + dist[i])
+
+        reps = {}
+        for i in pool:                      # one per sector, best-scoring first
+            s = int(sec[i])
+            if s not in reps or score(i) > score(reps[s]):
+                reps[s] = i
+        first = sorted(reps.values(), key=lambda i: -score(i))
+        rest = sorted((i for i in pool if i not in set(first)),
+                      key=lambda i: -score(i))
+        cand = first + rest[:self.max_candidates]
+        self.last_candidates = cand
+
+        for i in cand:
+            if not self._clear(wmap, x0, y0, wx[i], wy[i]):
+                continue
+            near = dist[i] <= self.centre_tol
+            if near and self.min_cluster > 1:
+                if int(front[ys[i] - 2:ys[i] + 3, xs[i] - 2:xs[i] + 3].sum()) < 2:
+                    continue
+            return i
+        return None
 
     def _clear(self, wmap, x0, y0, x1, y1) -> bool:
         """Ray-march the occupancy grid; False if the line hits an obstacle."""
@@ -151,75 +266,60 @@ class FrontierExplorer:
         wx = (xs + 0.5) * wmap.resolution - wmap.extent
         wy = (ys + 0.5) * wmap.resolution - wmap.extent
         dist = np.hypot(wx - x0, wy - y0)
+        # how big is the unexplored region behind each candidate
+        fsize = self._frontier_sizes(front)[ys, xs]
+
         order = np.argsort(dist)
         in_range = order[dist[order] <= self.max_target_range]
         if len(in_range) == 0:
             in_range = order                      # nothing near: consider anything
 
-        # Thin the candidates to one per fine angular sector, nearest first, then
-        # fall back to the remaining distance-sorted list.  Both halves matter:
-        #
-        #   * The sector pass is what stops a single blocked direction from
-        #     hiding everything else.  On the simulator the plain 60-nearest
-        #     version spent 75 frames rotating against 35 frames of driving,
-        #     because the 60 nearest frontier cells all sat in the same
-        #     direction behind the same wall.
-        #   * The fallback is what stops the sector pass from *hiding* cells.
-        #     A distant frontier subtends a tiny angle, so cells that are close
-        #     together in space can share a sector; a coarse bin count (24 over
-        #     360 deg = 15 deg, wider than the whole span of a far frontier
-        #     line) then keeps the blocked nearest cell and discards the
-        #     reachable one in the same bin.  Measured on a synthetic corridor
-        #     with a gap in the blocking wall: 24 bins -> "search", 72 bins ->
-        #     drives.  72 bins is 5 deg, finer than the angular size of a
-        #     frontier at sensor range.
-        rel = np.arctan2(wy - y0, wx - x0) - yaw
-        rel = np.arctan2(np.sin(rel), np.cos(rel))
-        sec = (((rel + np.pi) / (2 * np.pi) * self.n_sectors).astype(np.int64)
-               % self.n_sectors)
-        reps = {}
-        for i in in_range:                 # in_range is already distance-sorted
-            s = int(sec[i])
-            if s not in reps:
-                reps[s] = i
-        cand = sorted(reps.values(), key=lambda i: dist[i])
-        rest = [i for i in in_range if i not in set(cand)]
-        cand = cand + rest[:self.max_candidates]
-
-        target = None
-        for i in cand:
-            # reachability is checked, not assumed: "nearest" by straight-line
-            # distance is regularly a cell on the far side of a wall
-            if not self._clear(wmap, x0, y0, wx[i], wy[i]):
-                continue
-            near = dist[i] <= self.centre_tol
-            if near and self.min_cluster > 1:
-                if int(front[ys[i] - 2:ys[i] + 3, xs[i] - 2:xs[i] + 3].sum()) < 2:
-                    continue
-            target = (float(wx[i]), float(wy[i]))
-            break
-
-        if target is None:
-            self.n_search_turns += 1
-            self.n_search_frames += 1
-            info["candidates"] = len(cand)
-            rec = self._recovery(info)
-            if rec is not None:
-                return rec
-            if self.n_search_turns > self.max_search:
-                # rotated through every sector and found nothing reachable:
-                # the honest answer is to stop, not to spin forever
-                self.state = "done"
-                info["state"] = "done"
-                return 0.0, 0.0, info
-            self.state = "search"
-            info["state"] = "search"
-            return 0.0, self.w_max * 0.7, info
+        # --- commitment: keep driving to the target we already chose --------
+        reuse = False
+        if self._target is not None and self._target_age < self.commit_frames:
+            tx, ty = self._target
+            d = float(np.hypot(tx - x0, ty - y0))
+            if d > self.reach_dist and self._target_still_frontier(wmap, tx, ty):
+                reuse = True
+            else:
+                self._target = None
+        if reuse:
+            self._target_age += 1
+            self.n_reused += 1
+            tx, ty = self._target
+        else:
+            pick = self._pick_target(wmap, x0, y0, yaw, wx, wy, dist, fsize,
+                                     in_range, xs, ys, front)
+            if pick is None:
+                target_res = None
+            else:
+                i = pick
+                # stabilise on the centroid of the chosen cluster
+                sel = np.hypot(wx - wx[i], wy - wy[i]) <= 1.0
+                target_res = (float(wx[sel].mean()), float(wy[sel].mean()))
+            if target_res is None:
+                self._target = None
+                self.n_search_turns += 1
+                self.n_search_frames += 1
+                info["candidates"] = len(self.last_candidates)
+                rec = self._recovery(info)
+                if rec is not None:
+                    return rec
+                if self.n_search_turns > self.max_search:
+                    # rotated through every sector and found nothing reachable:
+                    # the honest answer is to stop, not to spin forever
+                    self.state = "done"
+                    info["state"] = "done"
+                    return 0.0, 0.0, info
+                self.state = "search"
+                info["state"] = "search"
+                return 0.0, self.w_max * 0.7, info
+            if self._target is not None and target_res != self._target:
+                self.n_switches += 1
+            self._target = target_res
+            self._target_age = 0
+            tx, ty = self._target
         self.n_search_turns = 0
-
-        # stabilise on the centroid of the chosen cluster
-        sel = np.hypot(wx - target[0], wy - target[1]) <= 1.0
-        tx, ty = float(wx[sel].mean()), float(wy[sel].mean())
 
         # "turn then drive": heading error gates the throttle, so a large
         # heading error produces an in-place turn instead of a wide arc
@@ -234,7 +334,7 @@ class FrontierExplorer:
 
         self.state = "turn" if blocked else "drive"
         self.n_targets += 1
-        info.update({"state": self.state, "candidates": len(cand),
+        info.update({"state": self.state, "candidates": len(self.last_candidates),
                      "target": (round(tx, 2), round(ty, 2)),
                      "dist": round(float(np.hypot(tx - x0, ty - y0)), 2),
                      "heading_err_deg": round(float(np.degrees(err)), 1),

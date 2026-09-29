@@ -252,6 +252,9 @@ def main():
 
     explorer = sender = navigator = None
     if a.goto:
+        if a.npz:
+            raise SystemExit("--goto drives the base and needs a live source "
+                             "(nothing to command in --npz replay mode)")
         # The finals task, in one flag: after (optionally) exploring, hand the
         # wheel to the navigator and drive to the named object.  Same velocity
         # sender, same loop -- the two policies share an interface on purpose.
@@ -284,6 +287,19 @@ def main():
     times = {k: [] for k in STAGES}
     rows = []
     registry = ObjectRegistry()
+    # Ground-truth comparison, simulator only.  The plan called for this in the
+    # round-2 step 3 acceptance criteria ("用真值对照：Sim 用 /state_estimation")
+    # and it is the only way to say anything about the *absolute* accuracy of a
+    # trajectory we built ourselves.
+    #
+    # Compared as RELATIVE motion, not absolute: our odometry starts at the
+    # identity by definition while the truth starts wherever Gazebo spawned the
+    # base, so the two differ by an unknown constant.  Subtracting the first
+    # sample of each removes it.  Using the truth as an *output* would be
+    # cheating; using it to measure ourselves is exactly what it is for.
+    truth0 = None
+    truth_err_xy: List[float] = []
+    truth_err_yaw: List[float] = []
     t_run = time.time()
     n = 0
     n_rec = 0
@@ -382,10 +398,28 @@ def main():
                                   float(p["world"][2]), int(p["label"]))
                                  for p in objects], float(fr.stamp))
             t_map = time.perf_counter()
+            yaw = float(np.arctan2(T[1, 0], T[0, 0]))
+
+            # ---------------- ground truth (simulator only; FOR SCORING) ----
+            truth = None
+            if ctx is not None and hasattr(ctx, "latest_ground_truth"):
+                truth = ctx.latest_ground_truth()
+            err_xy = err_yaw = None
+            if truth is not None:
+                if truth0 is None:
+                    truth0 = truth
+                dtx = truth["pos"][0] - truth0["pos"][0]
+                dty = truth["pos"][1] - truth0["pos"][1]
+                dth = truth["yaw"] - truth0["yaw"]
+                dth = float(np.arctan2(np.sin(dth), np.cos(dth)))
+                err_xy = float(np.hypot(dtx - t[0], dty - t[1]))
+                ey = dth - yaw
+                err_yaw = float(np.arctan2(np.sin(ey), np.cos(ey)))
+                truth_err_xy.append(err_xy)
+                truth_err_yaw.append(abs(err_yaw))
 
             # ---------------- drive: explore, then navigate ----------------
             cmd = None
-            yaw = float(np.arctan2(T[1, 0], T[0, 0]))
             use_nav = False
             if navigator is not None:
                 # Hand over as soon as the requested class is on the map; before
@@ -488,6 +522,17 @@ def main():
                 # these two fields tell them apart after the fact.
                 "yaw_deg": (round(float(np.degrees(np.arctan2(T[1, 0], T[0, 0]))), 1)
                             if sender is not None else None),
+                "truth_x": (round(float(truth["pos"][0] - truth0["pos"][0]), 3)
+                            if truth is not None else None),
+                "truth_y": (round(float(truth["pos"][1] - truth0["pos"][1]), 3)
+                            if truth is not None else None),
+                "truth_yaw_deg": (round(float(np.degrees(
+                    np.arctan2(np.sin(truth["yaw"] - truth0["yaw"]),
+                               np.cos(truth["yaw"] - truth0["yaw"])))), 1)
+                    if truth is not None else None),
+                "err_xy_m": (round(err_xy, 3) if err_xy is not None else None),
+                "err_yaw_deg": (round(float(np.degrees(err_yaw)), 2)
+                                if err_yaw is not None else None),
                 "heading_err_deg": (cmd or {}).get("heading_err_deg"),
                 "ahead_clear": (cmd or {}).get("ahead_clear"),
                 "objects_3d": [{k: p[k] for k in ("x", "y", "z", "depth_m",
@@ -549,6 +594,8 @@ def main():
                      "search_turns": explorer.n_search_turns,
                      "search_frames": explorer.n_search_frames,
                      "backoffs": explorer.n_backoffs,
+                     "targets_committed": explorer.n_reused,
+                     "target_switches": explorer.n_switches,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,
                      "sender_error": sender.error,
@@ -576,6 +623,17 @@ def main():
                              "p99": pct(v, 99), "max": pct(v, 100)}
                          for k, v in times.items() if v},
         "map": wmap.stats(),
+        "accuracy_vs_truth": ({"n": len(truth_err_xy),
+                               "err_xy_m": {"p50": pct(truth_err_xy, 50),
+                                            "p90": pct(truth_err_xy, 90),
+                                            "max": pct(truth_err_xy, 100)},
+                               "err_yaw_deg": {"p50": pct(truth_err_yaw, 50),
+                                               "p90": pct(truth_err_yaw, 90),
+                                               "max": pct(truth_err_yaw, 100)},
+                               "source": (cfg.ground_truth_topic or "n/a"),
+                               "note": "relative motion vs the first sample; "
+                                       "used for scoring only"}
+                              if truth_err_xy else None),
         "labels": wmap.label_histogram(),
         "objects": {"observations": wmap.object_histogram(),
                     "classes_in_map": len({lb for _x, _y, lb, _s in wmap.objects}),
@@ -673,8 +731,24 @@ def main():
         print("  targets chosen    %d   search frames %d   back-offs %d   final state %s"
               % (explorer.n_targets, explorer.n_search_frames,
                  explorer.n_backoffs, explorer.state))
+        print("  target commitment %d frames reused on a live target, %d switches"
+              % (explorer.n_reused, explorer.n_switches))
         print("  trajectory        %.2f m over %.1f s" %
               (stm["trajectory_len_m"], stm["duration_s"]))
+
+    if truth_err_xy:
+        print("\n=== accuracy vs ground truth (%s, scoring only) ==="
+              % (cfg.ground_truth_topic or "truth"))
+        print("  relative-motion error over %d frames" % len(truth_err_xy))
+        print("    position  p50 %.3f m   p90 %.3f   max %.3f"
+              % (pct(truth_err_xy, 50), pct(truth_err_xy, 90),
+                 pct(truth_err_xy, 100)))
+        print("    heading   p50 %.2f deg p90 %.2f   max %.2f"
+              % (pct(truth_err_yaw, 50), pct(truth_err_yaw, 90),
+                 pct(truth_err_yaw, 100)))
+        if pct(truth_err_yaw, 50) > 10.0:
+            print("    *** heading error is large: the base is not turning the "
+                  "way the commands assume, or the yaw convention is wrong. ***")
 
     print("\n=== object instances (the 'target association' step) ===")
     print("  instances %d  (created %d, merged %d detections)"
