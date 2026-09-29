@@ -70,10 +70,27 @@ if __name__ == "__main__":
     sftp = cli.open_sftp()
     if mode == "put":
         sftp.put(sys.argv[2], sys.argv[3])
-        print(f"put ok  {sys.argv[2]}  ->  {sys.argv[3]}")
+        n_local = os.path.getsize(sys.argv[2])
+        n_remote = sftp.stat(sys.argv[3]).st_size
+        print(f"put ok  {sys.argv[2]}  ->  {sys.argv[3]}  ({n_remote} B)")
+        if n_local != n_remote:
+            raise SystemExit(f"SIZE MISMATCH after put: local {n_local} "
+                             f"remote {n_remote} -- the upload is incomplete")
     elif mode == "get":
         sftp.get(sys.argv[2], sys.argv[3])
-        print(f"get ok  {sys.argv[2]}  ->  {sys.argv[3]}")
+        # **Verify, do not trust the tool.**  This exists because a 120 MB
+        # download reported "get ok" and left a truncated file behind, which
+        # then went through an audit that *did* catch it -- after the packaging
+        # step had already overwritten a good archive with a broken one.  A
+        # transfer is not finished when the library returns; it is finished when
+        # the bytes on both sides are the same number.
+        n_remote = sftp.stat(sys.argv[2]).st_size
+        n_local = os.path.getsize(sys.argv[3])
+        print(f"get ok  {sys.argv[2]}  ->  {sys.argv[3]}  "
+              f"({n_local}/{n_remote} B)")
+        if n_local != n_remote:
+            raise SystemExit(f"SIZE MISMATCH after get: remote {n_remote} "
+                             f"local {n_local} -- DO NOT USE THIS FILE")
     else:
         raise SystemExit("bad mode: " + mode)
     sftp.close()
