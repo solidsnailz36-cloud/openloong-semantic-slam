@@ -375,7 +375,24 @@ def main():
                    "package contents %.1f MB (limit %.0f MB)"
                    % (total_mb, MAX_ARCHIVE_MB), ""))
 
-    if not a.no_zip:
+    # ---- write the archive, but never over a good one --------------------
+    # This guard exists because the tool shipped a broken package once.  The
+    # real-side pcd had been truncated by a download that was interrupted
+    # part-way; the audit caught it and printed FAIL -- and then zipped anyway,
+    # overwriting the previous, correct archive with the broken one.  An audit
+    # that reports a problem and then destroys the last good artifact is worse
+    # than no audit at all.
+    #
+    # So: FAIL anywhere before this point means the archive is NOT written.
+    # The staged directory (and its own files) still gets updated, because that
+    # is what you want to inspect while fixing the problem.
+    n_fail_so_far = sum(1 for k, _m, _e in checks if k == "FAIL")
+    if not a.no_zip and n_fail_so_far:
+        checks.append(("FAIL", "archive NOT written: %d check(s) failed above"
+                       % n_fail_so_far,
+                       "the previous archive is left untouched on purpose"))
+        zpath = None
+    elif not a.no_zip:
         zpath = os.path.join(a.out, a.team + ".zip")
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
             for root, _dirs, files in os.walk(pkg):
