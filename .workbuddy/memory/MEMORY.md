@@ -56,9 +56,16 @@
   四处换轨＝离线→在线、RTK→室内、19 类→**人物/可通行/物体**、新增**相机-LiDAR 融合**。
   **不搬 SFPNet**（19 类 SemanticKITTI 与"人物/可通行"不是一回事）——**放弃初赛资产本身就是泛化能力的论证**。
 - **交付物与提交包**：`r2slam/out/{online_sim,online_real}/`（各 run.mp4 + map.pcd + label_table.yaml +
-  summary.json + frames.csv）；包 = `提交包/…—【固态蜗牛队】—【张煜晨】—【156****6887】.zip`，
-  131,022,899 B / md5 `70ae5a09a1dca9fb1d64b80395787e3b`，终审 **0 FAIL / 0 WARN**。
-  **pcd 字段 `x y z label rgb`（17 B/点，rgb 由 label 推导，不导 intensity）**；真实侧 114.85 m / 407.5 m²。
+  summary.json + frames.csv）。包 = `提交包/…—【固态蜗牛队】—【张煜晨】—【156****6887】.zip`，
+  **158,919,347 B / md5 `96e1953e3eb7f0da75c0b468af8f0829`**（2026-09-29 第五轮重建，终审 0 FAIL / 0 WARN）。
+  ⚠️ **更早那个 `70ae5a09…` 已作废**（被一次 FAIL 状态下仍写包的 bug 覆盖过，见下）。
+  真实侧 pcd md5 `0580cc1c418ba11577b9436f50b76814`、120,787,289 B / 407.5 m² / 114.85 m；
+  仿真侧 153.0 m² / 25.97 m / 视频 110.84 s。**pcd 字段 `x y z label rgb`（17 B/点，不导 intensity）**。
+- **★ 交付链上每一环都要能自我核对**（本轮两次真实事故换来的）：
+  ① **终审 FAIL 时绝不许写 zip** —— 它曾经用一个坏包覆盖掉最后一份好包；
+  ② **传输完必须比对远端/本地 md5** —— `get ok` 返回 0 也可能留下截断文件，
+     而且**"字节数已到位、内容还在变"是真的**（连续三次 md5 都不同而 size 不变）⇒ 尺寸不算证据。
+  坏包留在 `提交包/_broken/` 作证据。
 - **bag 的记录时刻 ≠ 传感器时间** ⇒ **必须用 header.stamp**（否则 dt 成 0/0.5 s 交替，里程计发散，130 s 跑出 9,573 m）。
   **`offset_time` 从帧戳倒推** ⇒ `time_offsets_from: end`；猜错是把畸变**翻倍**。
 - **远端 python 环境**：`slam_comp/venv`（`include-system-site-packages` 要改 `true` 才有 `rospy`；
