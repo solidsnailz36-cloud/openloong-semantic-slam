@@ -5,15 +5,16 @@
 ## 细节索引（先读这些）
 - **`docs/复赛实施方案.md`＝主文档**：§10–§17 = 五轮实施记录。**`docs/复赛自评与决赛差距.md`＝状态与差距**（含 §8 更新，判断"能不能进决赛"先读它）。
 - `docs/HANDOFF_项目交接.md`（链路/不变量/回退链）、`docs/评审意见归因与修正方案.md`（初赛根因）、`docs/灾备与恢复清单.md`（"东西是不是丢了"先读它）、`docs/复盘_踩坑手册_小白向.md`（改前先备份到 `docs/_bak/`）、对外说明 `out/run5_keepdeg/`。
-- 技能：`gazebo-classic-headless-container` / `camera-lidar-person-fusion` / `remote-job-and-snapshot` / `headless-rviz-recording` / `lidar-map-forensics` / `competition-dataset-triage` / `competition-submission-final-audit`。
+- 技能：`gazebo-classic-headless-container` / `remote-job-and-snapshot` / `camera-lidar-person-fusion` /
+  `headless-rviz-recording` / `lidar-map-forensics` / `competition-dataset-triage` / `competition-submission-final-audit`。
 
 ## 家底 / 赛事现状（2026-09-28 清点，别重复清点）
 - **唯一"丢了不可再得"的是 `D:\E-Downd\data.bag`**（初赛原始 2,532 MB / `/livox/lidar` 6,522 帧）。
   复赛数据集、官方仿真包、代码、成品、权重**全在本地**；云端独占的只有 `run/scans/`（恰好不需要）。
 - 本机：GPU RTX 2060 / CPU 16 线程；`wsl.exe`·`wmic.exe` 被安全策略拦截。**交付三项都不需要 GPU**。
-- 初赛 = **81 分**（点云分类不错 / **轨迹平滑度欠缺** / **RTK 置信度偏高**）。
-  根因**不是**"最近邻"，是 **RTK 降级段的水平位置回退到里程计**（`docs/评审意见归因与修正方案.md` §5–§6）；
-  修复包 `out/run5_keepdeg/` 未提交（窗口已关）。邮箱 `open@openloong.org.cn`，抄送 `luqinghua@openloong.net`。
+- 初赛 = **81 分**（点云分类不错 / **轨迹平滑度欠缺** / **RTK 置信度偏高**）。根因**不是**"最近邻"，
+  是 **RTK 降级段的水平位置回退到里程计**（`docs/评审意见归因与修正方案.md` §5–§6）；修复包未提交。
+  赛事邮箱 `open@openloong.org.cn`，抄送 `luqinghua@openloong.net`。
 
 ## 复赛：仿真环境（Gazebo Classic + ROS 1 Noetic）
 - 官方包 `gazebo_models.zip` / `src.zip`；`roslaunch vehicle_simulator house_vehicle.launch`。
@@ -71,9 +72,8 @@
   `compileall` 都是绿的。
 
 ## 探索策略（四个坑，同一族，都已修 + 都有测试 + 详见方案 §16.5/§17）
-1. **候选只按距离排 ⇒ 极限环**（586 s 只到过 15 个 1 m 格）：地图一填满，身边不断冒出孤立前沿格
-   （地面回波射程边缘、椅腿阴影），永远选它 → 用**前沿簇连通分量** + `score = 簇大小/(1+距离)`，
-   并以 `min_target_range`（≥1 m）兜"簇大小在连通环上退化"。
+1. **候选只按距离排 ⇒ 极限环**（地图一填满，身边不断冒出孤立前沿格：地面回波射程边缘、椅腿阴影）
+   → **前沿簇连通分量** + `score = 簇大小/(1+距离)` + `min_target_range`（≥1 m）兜"簇大小在连通环上退化"。
 2. **★ 可达性必须是"连通分量"，不是"直线射线"**。射线＝假设机器人能飞：只有门口正对着才可能
    选中门后的前沿，门在侧面时门后整片区域**永远**被否掉（症状＝看得见门口、进不去）。
    正解：取**机器人所在可走连通域**，直线不通就 **A\* 规划 + 前视跟随**（复用 `nav.PathPlanner`，
@@ -135,8 +135,7 @@
   `frames_missing_control_yaw` 并**大声报**。
 
 ## 复赛：真实数据集（`D:\E-Downd\openloong.zip` 1.97 GB）
-- 4 个文件：`calib.yaml` / `LiDAR Map.pcd`(**先验图，仅墙体**，72×52×6.7 m) / `map_*.bin`(554 MB) / `three1.zip`(1.45 GB)。
-- **标定齐全不用自己标**：鱼眼 `FishPoly` 1600×1296；`Tcl_0` 语义已解。**等距 `r=f·θ`（f=730.6）投影已验证**。
+- **标定齐全不用自己标**：鱼眼 `FishPoly` 1600×1296；`Tcl_0` 语义已解；**等距 `r=f·θ`（f=730.6）投影已验证**。
 - **`three1` = 真机 ROS 2 bag**，130 s：`/odin1/cloud_raw`(1336) / `image/compressed`(1335 JPEG 鱼眼) / `imu`(559)。
   点云 **49,152 点/帧**，带 `offset_time` 0–0.094 s ⇒ **必须去斜**。**IMU 基本不可用**，赛题也不要求。
 - `map_*.bin`（`MAPV0001`）厂商私有、**我方不需要解析**；**`LiDAR Map.pcd` 与仿真 house 不是同一场景**。
