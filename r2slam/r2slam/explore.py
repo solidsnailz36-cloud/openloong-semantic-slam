@@ -96,6 +96,7 @@ class FrontierExplorer:
         self.stagnate_eps = float(stagnate_eps)      # m^2 of new area needed
         self._last_area = None
         self._stagnant = 0
+        self._last_pose = None
         self.n_done_reason = None
         # And commit to the chosen target for a while.  Re-deciding every frame
         # is what lets two similar targets flip back and forth.
@@ -275,20 +276,34 @@ class FrontierExplorer:
         """Return (linear.x, angular.z, info) for the current map and pose."""
         # ---- stagnation guard, before anything else --------------------------
         # `ground` is the traversable grid, so its sum is the map's own answer to
-        # "how much do I know".  If it has not moved in `stagnate_frames`, there
+        # "how much do I know".  If it has not grown in `stagnate_frames`, there
         # is nothing left to find and the honest output is a stop.
+        #
+        # **Counted in metres driven, not in frames.**  The first version counted
+        # frames and stopped the simulator run after 104 of them -- because in
+        # that simulator the LiDAR does not rotate with the base, so a robot
+        # turning on the spot learns exactly nothing and looks identical to a
+        # robot that has finished.  Stagnation is only evidence when the robot
+        # has actually *been* somewhere: `moved_frames` counts frames in which it
+        # translated, and the guard needs that many of them.
         area = float(wmap.ground.sum()) * wmap.resolution ** 2
+        x0, y0 = float(pose_xy[0]), float(pose_xy[1])
+        moved = (0.0 if self._last_pose is None
+                 else float(np.hypot(x0 - self._last_pose[0],
+                                     y0 - self._last_pose[1])))
+        self._last_pose = (x0, y0)
         if self._last_area is None or area > self._last_area + self.stagnate_eps:
             self._last_area = area
             self._stagnant = 0
-        else:
+        elif moved >= 0.03:                     # driving, and learning nothing
             self._last_area = max(self._last_area, area)
             self._stagnant += 1
         if self._stagnant >= self.stagnate_frames:
             self.state = "done"
-            self.n_done_reason = ("map stopped growing (%d frames with less than "
-                                  "%.1f m2 of new area)"
-                                  % (self.stagnate_frames, self.stagnate_eps))
+            self.n_done_reason = ("drove without adding area for %d frames "
+                                  "(%.1f m2 known, %g m2 per frame min)"
+                                  % (self.stagnate_frames, area,
+                                     self.stagnate_eps))
             return 0.0, 0.0, {"state": "done", "nf": 0,
                               "why": self.n_done_reason,
                               "area_m2": round(area, 1)}

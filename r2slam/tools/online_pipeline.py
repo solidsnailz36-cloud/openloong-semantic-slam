@@ -337,6 +337,27 @@ def main():
             deskewer.update_pose(T, fr.stamp)
             t_odom = time.perf_counter()
 
+            # ---- which yaw do we steer by, and fuse with? -------------------
+            # Computed HERE, before the detector, because the projection needs it
+            # too: when the scanner does not rotate with the base the camera
+            # extrinsic has to be pre-rotated (see `camera.to_camera_frame`).
+            # It used to be computed after the map update, which was fine until
+            # fusion asked for it -- and the resulting `UnboundLocalError` is
+            # **data-dependent**: it fires only if the FIRST frame contains a
+            # detection, because otherwise the loop body is skipped and `yaw` is
+            # bound later in that same iteration, so every later frame is fine.
+            # The simulator happened to start facing a blank wall and never
+            # tripped it; the real corridor tripped it on frame one.
+            yaw_odom = float(np.arctan2(T[1, 0], T[0, 0]))
+            if heading is not None:
+                # Scanner does not turn with the base: yaw is unobservable from
+                # the scans, so dead-reckon it from the command we issued last
+                # frame (see `heading.py`).
+                yaw = (heading.update(prev_cmd_w, dt_frame)
+                       if dt_frame is not None else heading.yaw)
+            else:
+                yaw = yaw_odom
+
             # ---------------- detect ----------------
             # `detect_mapped` returns OUR label ids (see r2slam/labels.py), not
             # COCO indices, so nothing downstream has to know about COCO.
@@ -406,19 +427,6 @@ def main():
                                   float(p["world"][2]), int(p["label"]))
                                  for p in objects], float(fr.stamp))
             t_map = time.perf_counter()
-            yaw_odom = float(np.arctan2(T[1, 0], T[0, 0]))
-            # ---- which yaw do we steer by? ----------------------------------
-            # When the scanner turns with the base (the real rig) the odometry
-            # has it and this is a no-op.  The tournament simulator zeroes the
-            # LiDAR's yaw, so the scans carry no rotation at all and the
-            # odometry is right to report none -- the heading then has to be
-            # dead-reckoned from the command we issued last frame, which is what
-            # `heading.py` does.  See LidarSpec.rotates_with_base.
-            if heading is not None:
-                yaw = (heading.update(prev_cmd_w, dt_frame)
-                       if dt_frame is not None else heading.yaw)
-            else:
-                yaw = yaw_odom
 
             # ---------------- ground truth (simulator only; FOR SCORING) ----
             truth = None

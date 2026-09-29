@@ -243,19 +243,36 @@ def main():
     # policy with no stop condition grinds against that ring forever -- measured
     # 813 of 1005 frames in `turn`, a frozen pose, and 900 frames with no new
     # area.  A judge sees a robot spinning in the middle of a finished map.
+    #
+    # Two halves, and the second is the one that bit: the guard must fire when
+    # the robot has *driven* without learning anything, and must NOT fire while
+    # it is turning on the spot.  In this simulator turning learns nothing by
+    # construction (the LiDAR does not rotate), so a frame-counting guard stopped
+    # a real run after 104 frames.
     e7 = FrontierExplorer(stagnate_frames=20, stagnate_eps=0.5)
     w7 = world()
-    states7 = []
-    for _ in range(60):
-        v, om, i7 = e7.command(w7, (0.0, 0.0), 0.0)
-        states7.append(i7["state"])
-    first_done = states7.index("done") if "done" in states7 else None
-    print("7) map that never grows -> first 'done' at frame %s of 60" % first_done)
-    print("   reason: %s" % (e7.n_done_reason,))
+    states7 = [e7.command(w7, (0.0, 0.0), 0.0)[2]["state"] for _ in range(60)]
+    print("7) parked and turning, map never grows -> any 'done'? %s"
+          % ("done" in states7))
+    if "done" in states7:
+        fails.append("declared done while merely turning -- turning is not "
+                     "evidence that the map is complete")
+    e8 = FrontierExplorer(stagnate_frames=20, stagnate_eps=0.5)
+    first_done = None
+    for k in range(60):
+        # a robot being moved along, on a map that never grows
+        _v, _om, i8 = e8.command(w7, (0.0, 0.25 * k), 0.0)
+        if i8["state"] == "done":
+            first_done = k
+            break
+    print("8) driving but learning nothing -> first 'done' at frame %s of 60"
+          % first_done)
+    print("   reason: %s" % (e8.n_done_reason,))
     if first_done is None:
-        fails.append("never reported done on a map that stopped growing")
+        fails.append("never reported done while driving on a map that stopped "
+                     "growing")
     elif first_done > 25:
-        fails.append("took %d frames to notice stagnation" % first_done)
+        fails.append("took %d moving frames to notice stagnation" % first_done)
 
     print()
     if fails:
@@ -263,7 +280,7 @@ def main():
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (7/7)")
+    print("verdict: PASS (8/8)")
     return 0
 
 
