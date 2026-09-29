@@ -117,7 +117,39 @@ def parse_args():
                     help="playback fps; 0 = keep the source rate")
     ap.add_argument("--speed", type=float, default=1.0,
                     help="playback speed-up for --encode (round 2 caps the video at 2 min)")
+    ap.add_argument("--dump-grids", default=None, metavar="DIR",
+                    help="save the final occupancy grids (ground/obstacle/seen) so "
+                         "coverage can be analysed offline instead of guessed at")
     return ap.parse_args()
+
+
+def dump_grids(dest, wmap, cfg):
+    """Write the final occupancy grids, plus the frame they are expressed in.
+
+    Why this exists: "the robot only covered half the house" is a fact, but *why*
+    is not -- the answer lives in which cells are unknown, whether those cells
+    were reachable at all, and how far the frontier that led to them sat.  Those
+    questions cannot be answered from a video or a summary line, so the grids
+    get written to disk and analysed properly.
+
+    `seen` here is exactly `wmap.seen`; `unknown = ~seen`.  The extras
+    (resolution, extent, the trajectory, the final pose) are what make the dump
+    self-describing -- a visitor who did not write this code should be able to
+    load it and compute anything without asking.
+    """
+    os.makedirs(dest, exist_ok=True)
+    np.save(os.path.join(dest, "ground.npy"), wmap.ground)
+    np.save(os.path.join(dest, "obstacle.npy"), wmap.obstacle)
+    np.save(os.path.join(dest, "seen.npy"), wmap.seen)
+    np.save(os.path.join(dest, "traj.npy"),
+            np.asarray(wmap.traj, dtype=np.float64).reshape(-1, 2))
+    meta = {"resolution": wmap.resolution, "extent": wmap.extent, "n": wmap.n,
+            "source": cfg.name,
+            "pose_xy": (list(wmap.traj[-1]) if wmap.traj else None),
+            "truth_yaw_from_cmd": not cfg.lidar.rotates_with_base}
+    with open(os.path.join(dest, "meta.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2, ensure_ascii=False)
+    return meta
 
 
 def dump_frame(fr, out_dir, index, extra=None):
@@ -672,6 +704,14 @@ def main():
                      "backoffs": explorer.n_backoffs,
                      "targets_committed": explorer.n_reused,
                      "target_switches": explorer.n_switches,
+                     "plans": explorer.n_plans,
+                     "plan_failures": explorer.n_plan_failures,
+                     "frames_straight": explorer.n_straight,
+                     "frames_routed": explorer.n_routed,
+                     "frames_pose_off_map": explorer.n_pose_off_map,
+                     "arrivals": explorer.n_arrivals,
+                     "barren_targets": explorer.n_barren_targets,
+                     "done_reason": explorer.n_done_reason,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,
                      "sender_error": sender.error,
@@ -726,6 +766,10 @@ def main():
     # The class table ships next to the pcd: the FAQ does not publish one, so
     # a judge reading `label = 7` must be able to look it up from the package.
     L.write_table(os.path.join(a.out, "label_table.yaml"))
+
+    if a.dump_grids:
+        dump_grids(a.dump_grids, wmap, cfg)
+        print("  grids written to %s" % a.dump_grids)
 
     with open(os.path.join(a.out, "frames.csv"), "w", newline="",
               encoding="utf-8") as fh:
@@ -817,8 +861,19 @@ def main():
                  explorer.n_backoffs, explorer.state))
         print("  target commitment %d frames reused on a live target, %d switches"
               % (explorer.n_reused, explorer.n_switches))
+        print("  routing           %d straight / %d on a planned route  "
+              "(%d plans, %d failed)"
+              % (explorer.n_straight, explorer.n_routed,
+                 explorer.n_plans, explorer.n_plan_failures))
+        print("  arrivals          %d  (of which %d in a row learned nothing)"
+              % (explorer.n_arrivals, explorer.n_barren_targets))
         print("  trajectory        %.2f m over %.1f s" %
               (stm["trajectory_len_m"], stm["duration_s"]))
+        if explorer.n_done_reason:
+            print("  stop reason       %s" % explorer.n_done_reason)
+        if explorer.n_pose_off_map:
+            print("  *** %d frames had a pose outside every walkable cell -- "
+                  "the map and the pose disagree. ***" % explorer.n_pose_off_map)
 
     if truth_err_xy:
         print("\n=== accuracy vs ground truth (%s, scoring only) ==="

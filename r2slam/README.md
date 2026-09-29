@@ -44,12 +44,27 @@
 | `labels.py` | **类别表的唯一定义源**（id ↔ 名称 ↔ 颜色 ↔ COCO 映射 ↔ 门限），并导出 `label_table.yaml` |
 | `traversable.py` | 地面 RANSAC + 高度带 / 闭运算 / 障碍膨胀 → 2D 可通行栅格 |
 | `worldmap.py` | 世界系累加、俯视渲染（带类别图例）、**带标签 + rgb 的 pcd 输出** |
-| `explore.py` | **frontier 探索**（官方仿真不含规划器）+ 卡住自救 + 速度发布 |
+| `explore.py` | **frontier 探索**（官方仿真不含规划器）：可达性 ＝ **可走域连通分量**，直线不通就 **A\* 绕过去** + 卡住自救 + 速度发布 |
 | `nav.py` | **决赛半场**：实例关联（`ObjectRegistry`）+ 指令解析（`find_label`）+ A* + `SemanticNavigator` |
 | `viz.py` | 渲染（只用 cv2，两个平台都有） |
-| `tools/online_pipeline.py` | **主程序**：一个进程、一帧一帧、产出全部交付物（`--explore` / `--goto`） |
+| `tools/online_pipeline.py` | **主程序**：一个进程、一帧一帧、产出全部交付物（`--explore` / `--goto` / `--dump-grids`） |
 | `tools/package_submission.py` | **终审脚本**：逐条核对交付物并打包，不通过就非零退出 |
 | `tools/test_explore.py` `tools/test_nav.py` | 行为测试（零 ROS 依赖，两平台逐字一致） |
+| `../vendor/sim_scripts/probe_coverage.py` | **覆盖率取证**：读回 `--dump-grids` 的栅格，算"走得到多少 / 还剩哪能去"，并出一张图 |
+
+### 探索策略的两条硬规则（都是量出来的，别改回去）
+
+1. **可达性是"连通"，不是"直线"**。老版本用直线射线判断，于是**只有门口正对时才可能
+   选中门后的前沿**；门在侧面时门后整片区域永远被否掉，机器人在原地转。
+   现在是"机器人所在的可走连通域"，直线不通就用 A\* 规划一条再跟随 ——
+   用的就是 `nav.PathPlanner`，**探索与导航只差目标从哪来**。
+   单测第 5b 项端到端验证"必须真的穿到墙那侧"。
+2. **地面掩码必须先闭运算再谈"塞不塞得下机器人"**。LiDAR 对地面的采样是稀疏的：
+   0.1 m 栅格上观测很好的房间仍是一片散点（实测 146.7 m² 分成 57 块；开场第一帧
+   11.0 m² 分成 327 块）。按 0.22 m 半径直接腐蚀 ⇒ 103.1 m²；先 5×5 闭运算 ⇒ 135.5 m²。
+   **差 32 m² 全是测量假象**，而开场那一帧是 0.00 m² —— 判据会直接崩。
+   但闭运算**绝不能穿过已知障碍**（否则 1 格厚的墙会被填掉、两侧就"通"了）：
+   正解是 `free = close(free) & ~dilate(obstacle, 3×3)`。
 
 ## 两个数据源的差异（全部落在配置里）
 
@@ -97,12 +112,15 @@ LiDAR 被搬到车体位置，但**朝向恒为世界对齐**。实测：我们�
 
 ```bash
 # ---- 仿真：两阶段，唯一能拿到干净数字的流程 ----
-# 阶段一：Gazebo 在跑，探索驱动 + 每帧落盘（不检测、不渲染）
+# 阶段一：Gazebo 在跑，探索驱动 + 每帧落盘 + 落下最终栅格（不检测、不渲染）
 bash run_online.sh sim_house --duration 110 --explore --no-detect --no-render \
-     --dump /tmp/sim_capture
+     --dump /tmp/sim_capture --dump-grids /tmp/grids
 # 阶段二：停掉 Gazebo，用同一批帧复算（检测 + 渲染 + 编码）
 bash /root/sim/kill_sim.sh
 bash run_online.sh sim_house --npz /tmp/sim_capture --panel-h 540 --encode
+
+# ---- 覆盖率取证：别用"面积 / 地皮面积"讲故事，用这个 ----
+python vendor/sim_scripts/probe_coverage.py /tmp/grids --out coverage.png
 
 # ---- 真实 bag（路径由 R2SLAM_BAG_PATH 指定）----
 R2SLAM_BAG_PATH=/root/sim/three1 bash run_online.sh real_corridor \

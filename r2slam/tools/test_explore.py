@@ -8,12 +8,14 @@ What it asserts -- the things that decide whether the robot explores or merely
 looks busy:
 
   1. the edge of the known region is chosen and the robot drives toward it;
-  2. facing away from the target it turns in place instead of lurching forward;
+  2. facing away from the target it turns in place instead of lurching forward,
+     and if it stays blocked it backs off rather than spinning forever;
   3. with nothing left to see it stops;
-  4. when the only frontier is on the far side of a wall it must NOT drive, and
-     it must back off rather than spin forever;
-  5. a partially blocking wall: the reachable frontier behind the gap must be
-     found, and whatever it picks must be *reachable*;
+  4. when the only frontier is on the far side of a wall, unreachable, it must
+     NOT drive -- and it must say `done` rather than fiddle;
+  5. **a frontier behind a doorway is reachable and must be found**: the
+     straight line to it is blocked, so the policy has to plan a route.  This is
+     the case that decides whether the robot ever leaves the room it starts in.
   6. **a big unexplored region outranks small specks near the robot.**  This is
      the regression test for the worst bug this policy had (see below).
 
@@ -60,6 +62,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from r2slam.explore import FrontierExplorer                           # noqa: E402
+from r2slam.nav import path_length                                    # noqa: E402
 from r2slam.worldmap import WorldMap                                  # noqa: E402
 
 PITCH = 0.07              # deliberately not 0.1: see module docstring
@@ -150,12 +153,22 @@ def main():
     if abs(om) > 0.5:
         fails.append("heading error was small but the turn command is large")
 
-    # ---- 2. facing away -> turn in place --------------------------------
+    # ---- 2. facing away -> turn in place, then recover ---------------------
     v2, om2, info2 = e.command(w, (0.0, 0.0), np.pi)
     print("2) same map, facing away -> v=%.2f w=%+.2f state=%s"
           % (v2, om2, info2["state"]))
     if not (v2 == 0.0 and abs(om2) > 0.3):
         fails.append("did not turn in place when facing away")
+    # ...and it must not turn forever.  This is the recovered failure: on the
+    # simulator the robot spent 500 of 501 frames in `turn` with w pinned at
+    # +-0.9, 1.4 m of travel in 100 s, parked against a wall.  `turn` is right;
+    # `turn` for a hundred frames is not.  Driven here by asking the same
+    # question repeatedly with the robot unable to make progress.
+    e2b = FrontierExplorer(max_turn_frames=10, backoff_frames=5)
+    states2b = [e2b.command(w, (0.0, 0.0), np.pi)[2]["state"] for _ in range(30)]
+    print("   30 frames facing away -> states %s" % sorted(set(states2b)))
+    if "backoff" not in states2b:
+        fails.append("never backed off -- it would spin on the spot forever")
 
     # ---- 3. nothing left to see -> stop ---------------------------------
     w3 = world()
@@ -165,11 +178,20 @@ def main():
     if not (v3 == 0.0 and info3["state"] == "done"):
         fails.append("did not stop on a completed map")
 
-    # ---- 4. frontier only beyond a wall -> must not drive, and must recover --
+    # ---- 4. frontier only beyond a wall -> must not drive, and must stop ----
     # Called repeatedly on purpose.  A single call only proves it does not drive
     # on frame one; the failure that actually happened on the simulator was
     # "turn forever" -- 500 of 501 frames in `turn`, w pinned at +-0.9, 1.4 m of
     # travel in 100 s, and the robot parked against a wall at the end.
+    #
+    # The correct answer here is `done`, and it is worth being explicit about
+    # why, because it is a change from the previous revision.  The unknown is
+    # walled off: there is no free cell adjacent to it that the robot can walk
+    # to, so no target is reachable by any route, and no amount of turning will
+    # create one.  The old policy ray-marched to the frontier beyond the wall,
+    # found the line blocked, and fell into `search` -> `backoff` -> `search`,
+    # which is a robot fiddling in a corner.  "There is nothing I can do here"
+    # is both the honest report and the cheaper behaviour.
     e4 = FrontierExplorer()
     w4 = world(block_x=2.0)
     vs, states = [], []
@@ -177,33 +199,67 @@ def main():
         v, om, info4 = e4.command(w4, (0.0, 0.0), 0.0)
         vs.append(v)
         states.append(info4["state"])
-    print("4) wall across at x=2, the unknown is beyond it, 40 frames")
+    print("4) wall across at x=2, the unknown beyond it is unreachable, 40 frames")
     print("   states %s" % sorted(set(states)))
     print("   max forward command %.3f (must be <= 0)" % max(vs))
+    print("   reason: %s" % (e4.n_done_reason,))
     if max(vs) > 0.0:
         fails.append("commanded forward motion although the only frontier is "
                      "behind a wall")
-    if "backoff" not in states:
-        fails.append("never backed off -- it would spin on the spot forever")
+    if "done" not in states:
+        fails.append("did not recognise that nothing reachable is left; "
+                     "states were %s" % sorted(set(states)))
 
-    # ---- 5. a partially blocking wall: reachable frontier must be found ----
+    # ---- 5. a frontier behind a doorway: plan a route, do not give up ------
     # Wall across x=2 for y < 0.2, i.e. a gap on the +y side.  The unknown past
-    # x=4 is reachable only through that gap, so the search has to look past the
-    # nearest (blocked) candidates.  The assertion is *reachability of what it
-    # picked*, not a coordinate sign: the target is a cluster centroid, so its y
-    # is not the y of the candidate cell, and asserting on it tested the wrong
-    # thing.
+    # x=4 is reachable only through that gap.  The straight line from the robot
+    # to the far frontier crosses the wall, so the old policy rejected every
+    # candidate there and the robot circled the near side of the wall forever --
+    # which is exactly what "the robot never left the room" looks like on a real
+    # map.  The assertion is therefore not "the straight line is clear" (it is
+    # not, and it should not be) but **"a route exists"**, and that the policy
+    # is actually following one rather than driving at a wall.
     e5 = FrontierExplorer()
     w5 = world(block_x=(2.0, -1.5, 0.2))
     v5, om5, info5 = e5.command(w5, (0.0, 0.0), 0.0)
     tg = info5.get("target")
-    clear = (tg is not None and e5._clear(w5, 0.0, 0.0, tg[0], tg[1]))
-    print("5) wall across x=2 with a gap on +y -> v=%.2f state=%s target %s "
-          "reachable=%s" % (v5, info5["state"], tg, clear))
+    straight = (tg is not None and e5._clear(w5, 0.0, 0.0, tg[0], tg[1]))
+    path = None if tg is None else e5._plan(w5, (0.0, 0.0), tg)
+    print("5) wall across x=2 with a gap on +y -> v=%.2f state=%s target %s"
+          % (v5, info5["state"], tg))
+    print("   straight line clear: %s   planned route: %s   routed=%s"
+          % (straight, ("%.2f m" % path_length(path)) if path else None,
+             info5.get("routed")))
     if not (v5 > 0.2):
-        fails.append("did not find the reachable frontier through the gap")
-    if not clear:
-        fails.append("chose a target the straight line cannot reach: %s" % (tg,))
+        fails.append("did not move toward the reachable frontier through the gap")
+    if tg is None:
+        fails.append("found no target at all although the far region is reachable")
+    elif not straight and not path:
+        fails.append("chose a target with neither a straight line nor a route: %s"
+                     % (tg,))
+    elif not straight and not info5.get("routed"):
+        fails.append("has a route but is not following it")
+
+    # ---- 5b. ...and it must actually get there ----------------------------
+    # The assertion above proves a route is followed for one frame.  What the
+    # task needs is the robot on the far side of the doorway, so drive the
+    # synthetic base until it either arrives or stops trying.  This is the
+    # end-to-end form of "exploration can leave the room it started in".
+    e5b = FrontierExplorer()
+    pose = (0.0, 0.0, 0.0)
+    crossed = None
+    for k in range(150):
+        v, om, i5b = e5b.command(w5, (pose[0], pose[1]), pose[2])
+        if i5b["state"] == "done":
+            break
+        pose = drive_step(pose, v, om)
+        if crossed is None and pose[0] > 2.5:
+            crossed = k
+    print("5b) driving it: ended at (%+.2f, %+.2f) after %d frames; crossed the "
+          "wall at frame %s" % (pose[0], pose[1], k + 1, crossed))
+    if pose[0] <= 2.5:
+        fails.append("never got past the doorway -- ended at x=%.2f, y=%.2f"
+                     % (pose[0], pose[1]))
 
     # ---- 6. big unknown region must outrank near specks -------------------
     # Stagnation detection is switched off here on purpose: it exists to stop a
@@ -274,13 +330,44 @@ def main():
     elif first_done > 25:
         fails.append("took %d moving frames to notice stagnation" % first_done)
 
+    # ---- 9. a barren streak must not stop the robot while work remains ------
+    # The bug this pins: `barren_targets` was allowed to end the run
+    # unconditionally, so eight fruitless trips to small pockets ended a real
+    # simulator run at 270 frames with an 8.0 m2 open pocket untouched and 772
+    # usable frontier cells still available -- *earlier and worse* than the
+    # crude frame counter it replaced.  The rule now is "only a stop when
+    # nothing but small clusters is left", and both halves of that sentence get
+    # asserted here, because testing only one half is how the bug survived.
+    w9 = world_with_specks()                 # big region at x~4 AND 3 specks
+    e9 = FrontierExplorer(stagnate_frames=10 ** 9)
+    e9.n_barren_targets = 99                # pretend we have already failed a lot
+    _v, _om, i9 = e9.command(w9, (0.0, 0.0), 0.0)
+    print("9) 99 barren trips, but a big cluster is still reachable -> state %s"
+          "  (frontier_big=%s)" % (i9["state"], i9.get("frontier_big")))
+    if i9["state"] == "done":
+        fails.append("gave up while a substantial reachable cluster remained")
+
+    # ...and the other half: specks only, so the same streak SHOULD stop it.
+    w9b = world()
+    w9b.seen[:] = True
+    for (sx, sy) in ((0.8, 0.35), (-0.7, -0.35), (0.3, -0.8)):
+        cs = w9b.cell_of(sx, sy)
+        w9b.seen[int(cs[1]), int(cs[0])] = False
+    e9b = FrontierExplorer(stagnate_frames=10 ** 9)
+    e9b.n_barren_targets = 99
+    _v, _om, i9b = e9b.command(w9b, (0.0, 0.0), 0.0)
+    print("   same streak, only specks left -> state %s  reason: %s"
+          % (i9b["state"], e9b.n_done_reason))
+    if i9b["state"] != "done":
+        fails.append("did not stop although nothing but specks was left")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (8/8)")
+    print("verdict: PASS (10 checks)")
     return 0
 
 

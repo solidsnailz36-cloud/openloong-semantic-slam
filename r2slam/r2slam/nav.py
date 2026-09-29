@@ -265,9 +265,28 @@ class PathPlanner:
       waypoint chaser at 0.4 m/s on a 0.1 m grid.
     """
 
-    def __init__(self, robot_radius: float = 0.25, max_expand: int = 300000):
+    def __init__(self, robot_radius: float = 0.25, max_expand: int = 300000,
+                 close_px: int = 0):
         self.robot_radius = float(robot_radius)
         self.max_expand = int(max_expand)
+        # Optional morphological closing applied BEFORE the robot-radius
+        # erosion.  Default 0 = off, which is what the navigator wants: it plans
+        # on the strict mask, so a route it finds is a route the robot fits
+        # through.  The explorer needs the closing, and the numbers say why --
+        # LiDAR floor returns are sparse, so the raw `ground` mask is a field of
+        # dots, not a floor.  Measured on the official house:
+        #
+        #   free 146.7 m2 in 57 components, largest 138.8 m2
+        #   erode r=0.22 without closing -> 103.1 m2 walkable
+        #   erode r=0.22 after  5x5 close -> 135.5 m2 walkable
+        #
+        # and on the very first frame, before anything has accumulated:
+        #   free 11.0 m2 in 327 components, largest 0.47 m2  -> 0.00 m2 walkable
+        #   after a 5x5 close                                -> 5.42 m2 walkable
+        #
+        # The second row is not a curiosity: with no walkable cells the explorer
+        # has no reachable frontier and declares the run finished on frame one.
+        self.close_px = int(close_px)
         self._cache_key = None
         self._cache_free = None
 
@@ -279,10 +298,25 @@ class PathPlanner:
         """
         import cv2
         key = (int(wmap.ground.sum()), int(wmap.seen.sum()),
-               float(self.robot_radius))
+               float(self.robot_radius), int(self.close_px))
         if key == self._cache_key and self._cache_free is not None:
             return self._cache_free
         free = wmap.ground.copy()          # already `&= ~obstacle` upstream
+        if self.close_px > 1:
+            # Closing fills gaps in the floor mask -- and it will equally fill
+            # the single-cell gap that a wall appears as, which is how a
+            # synthetic corridor with a 0.1 m wall suddenly became walkable on
+            # both sides.  So the closing may only ever fill space that is NOT a
+            # known obstacle: the result is intersected with the obstacle mask,
+            # itself dilated first so that a dotted wall line becomes a solid
+            # barrier rather than a row of holes.
+            closed = cv2.morphologyEx(
+                free.astype(np.uint8), cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (self.close_px, self.close_px))) > 0
+            solid = cv2.dilate(wmap.obstacle.astype(np.uint8),
+                               np.ones((3, 3), np.uint8)) > 0
+            free = closed & ~solid
         if self.robot_radius > 0:
             k = max(1, int(round(2 * self.robot_radius / wmap.resolution)) | 1)
             bad = cv2.dilate(((~free).astype(np.uint8)),
