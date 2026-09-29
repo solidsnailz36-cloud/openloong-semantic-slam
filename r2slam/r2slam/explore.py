@@ -1,0 +1,376 @@
+"""Frontier exploration: the part the official simulation does not give us.
+
+The brief asks for "场景探索" (scene exploration), and the organisers ship the
+simulator only -- `vehicleSimulator.cpp` subscribes to `/cmd_vel` and moves the
+car, but there is no planner anywhere in `src.zip`.  So the robot has to decide
+where to go, and this module makes that decision from the map we are already
+building.
+
+The rule is the classic one, and it is a good fit here because the map is
+literally already in memory:
+
+    a **frontier** is a drivable cell that touches an unseen cell.
+    drive to the nearest reachable one.
+
+Three details that make it behave on a real 2D grid rather than in a slide:
+
+  * **reachability is checked, not assumed.**  "Nearest" by straight-line
+    distance is regularly behind a wall.  Candidates are ray-marched through the
+    occupancy grid and the first one with a clear line wins.
+  * **the target is a cluster centroid, not a single cell.**  Chasing one cell
+    of a ragged boundary makes the car twitch; the centroid of the cells around
+    the chosen one is stable.
+  * **forward clearance gates the throttle.**  Turning in place while blocked is
+    free; driving into a wall is not.  The speed is zeroed unless the corridor
+    straight ahead is clear for `front_stop` metres, which also makes the car
+    naturally slow down at corners.
+
+The controller is a plain proportional law -- there is nothing to train here,
+and the round-2 marking is about perception and portability, not about the
+planner.
+"""
+from __future__ import annotations
+
+import threading
+from typing import Dict, Optional, Tuple
+
+import cv2
+import numpy as np
+
+
+class FrontierExplorer:
+    def __init__(self, v_max: float = 0.55, w_max: float = 0.9,
+                 max_target_range: float = 7.0, front_stop: float = 0.75,
+                 turn_only_deg: float = 25.0, min_cluster: int = 4,
+                 centre_tol: float = 0.6,                  clearance_step: float = 0.10,
+                 n_sectors: int = 72, max_search: int = 60,
+                 max_candidates: int = 200,
+                 max_turn_frames: int = 18, backoff_frames: int = 10):
+        self.v_max = float(v_max)
+        self.w_max = float(w_max)
+        self.max_target_range = float(max_target_range)
+        self.front_stop = float(front_stop)
+        self.turn_only_deg = float(turn_only_deg)
+        self.min_cluster = int(min_cluster)
+        self.centre_tol = float(centre_tol)
+        self.clearance_step = float(clearance_step)
+        # One candidate per angular sector before any second candidate is
+        # considered, then a bounded fallback over the rest.  See `command`
+        # for the two failure modes these two settings fix and their numbers.
+        self.n_sectors = int(n_sectors)
+        self.max_search = int(max_search)
+        self.max_candidates = int(max_candidates)
+        # Stuck recovery.  "Turn in place until the front is clear" has no exit
+        # if the robot is jammed in a corner: it rotates forever, the video
+        # shows a stationary robot, and nothing reports an error.  Measured on
+        # the official house: 500 of 501 frames in `turn`, w pinned at +-0.9,
+        # 1.4 m of travel in 100 s.  After a while, back off and try the other
+        # way round.
+        self.max_turn_frames = int(max_turn_frames)
+        self.backoff_frames = int(backoff_frames)
+        self._n_turn = 0
+        self._backoff = 0
+        self._backoff_sign = 1.0
+        self.n_backoffs = 0
+        self.state = "init"
+        self.n_targets = 0
+        self.n_search_turns = 0        # consecutive: resets when a target is found
+        self.n_search_frames = 0       # cumulative: for the run report
+
+    # ------------------------------------------------------------------ core
+    def _free_unknown(self, wmap):
+        free = wmap.ground & ~wmap.obstacle
+        unknown = ~wmap.seen
+        return free, unknown
+
+    def _frontier(self, wmap, free, unknown) -> np.ndarray:
+        """Drivable cells adjacent to unseen space.  uint8 mask.
+
+        Two rules here, both learned the hard way on a synthetic corridor:
+
+          * The dilation radius must be **1** (3x3).  With a 5x5 kernel a free
+            cell two cells away from the boundary also qualifies -- and two
+            cells away is exactly what sits on the far side of a 1-cell-thick
+            wall.  The robot then picks a frontier it cannot reach and, worse,
+            appears to have a legitimate target through a wall.  The straight-
+            line reachability check still catches it, but it should never have
+            been a candidate.
+          * Frontier cells **touching an obstacle are dropped**.  Those are the
+            cells that hug a wall; aiming at them walks the car into it, and
+            they are also the least informative direction to explore.
+        """
+        u = unknown.astype(np.uint8)
+        o = wmap.obstacle.astype(np.uint8)
+        near_unknown = cv2.dilate(u, np.ones((3, 3), np.uint8)) > 0
+        near_obstacle = cv2.dilate(o, np.ones((3, 3), np.uint8)) > 0
+        return free & near_unknown & ~near_obstacle
+
+    def _clear(self, wmap, x0, y0, x1, y1) -> bool:
+        """Ray-march the occupancy grid; False if the line hits an obstacle."""
+        d = float(np.hypot(x1 - x0, y1 - y0))
+        n = max(int(d / self.clearance_step), 2)
+        ts = np.linspace(0.0, 1.0, n)
+        xs = x0 + (x1 - x0) * ts
+        ys = y0 + (y1 - y0) * ts
+        cx, cy = wmap.cell_of(xs, ys)
+        ok = wmap._in(cx, cy)
+        if not ok.all():
+            return False
+        return not bool(wmap.obstacle[cy[ok], cx[ok]].any())
+
+    def _ahead_clear(self, wmap, x, y, yaw) -> bool:
+        """Is the corridor straight ahead free for `front_stop` metres?"""
+        steps = max(int(self.front_stop / self.clearance_step), 2)
+        d = np.arange(1, steps + 1) * self.clearance_step
+        xs = x + np.cos(yaw) * d
+        ys = y + np.sin(yaw) * d
+        cx, cy = wmap.cell_of(xs, ys)
+        known = wmap._in(cx, cy)
+        if not known.all():
+            # off the edge of the map: treat unobserved as "not yet proven
+            # blocked", which is the same convention the frontier search uses
+            return True
+        return not bool(wmap.obstacle[cy[known], cx[known]].any())
+
+    def command(self, wmap, pose_xy: Tuple[float, float],
+                yaw: float) -> Tuple[float, float, Dict]:
+        """Return (linear.x, angular.z, info) for the current map and pose."""
+        free, unknown = self._free_unknown(wmap)
+        front = self._frontier(wmap, free, unknown)
+        x0, y0 = float(pose_xy[0]), float(pose_xy[1])
+
+        info: Dict = {"state": self.state, "nf": int(front.sum())}
+        ys, xs = np.nonzero(front)
+        if len(xs) == 0:
+            # nothing left to look for nearby -> stop, and say so
+            self.state = "done"
+            info["state"] = "done"
+            return 0.0, 0.0, info
+
+        # cells -> world metres (cell centre)
+        wx = (xs + 0.5) * wmap.resolution - wmap.extent
+        wy = (ys + 0.5) * wmap.resolution - wmap.extent
+        dist = np.hypot(wx - x0, wy - y0)
+        order = np.argsort(dist)
+        in_range = order[dist[order] <= self.max_target_range]
+        if len(in_range) == 0:
+            in_range = order                      # nothing near: consider anything
+
+        # Thin the candidates to one per fine angular sector, nearest first, then
+        # fall back to the remaining distance-sorted list.  Both halves matter:
+        #
+        #   * The sector pass is what stops a single blocked direction from
+        #     hiding everything else.  On the simulator the plain 60-nearest
+        #     version spent 75 frames rotating against 35 frames of driving,
+        #     because the 60 nearest frontier cells all sat in the same
+        #     direction behind the same wall.
+        #   * The fallback is what stops the sector pass from *hiding* cells.
+        #     A distant frontier subtends a tiny angle, so cells that are close
+        #     together in space can share a sector; a coarse bin count (24 over
+        #     360 deg = 15 deg, wider than the whole span of a far frontier
+        #     line) then keeps the blocked nearest cell and discards the
+        #     reachable one in the same bin.  Measured on a synthetic corridor
+        #     with a gap in the blocking wall: 24 bins -> "search", 72 bins ->
+        #     drives.  72 bins is 5 deg, finer than the angular size of a
+        #     frontier at sensor range.
+        rel = np.arctan2(wy - y0, wx - x0) - yaw
+        rel = np.arctan2(np.sin(rel), np.cos(rel))
+        sec = (((rel + np.pi) / (2 * np.pi) * self.n_sectors).astype(np.int64)
+               % self.n_sectors)
+        reps = {}
+        for i in in_range:                 # in_range is already distance-sorted
+            s = int(sec[i])
+            if s not in reps:
+                reps[s] = i
+        cand = sorted(reps.values(), key=lambda i: dist[i])
+        rest = [i for i in in_range if i not in set(cand)]
+        cand = cand + rest[:self.max_candidates]
+
+        target = None
+        for i in cand:
+            # reachability is checked, not assumed: "nearest" by straight-line
+            # distance is regularly a cell on the far side of a wall
+            if not self._clear(wmap, x0, y0, wx[i], wy[i]):
+                continue
+            near = dist[i] <= self.centre_tol
+            if near and self.min_cluster > 1:
+                if int(front[ys[i] - 2:ys[i] + 3, xs[i] - 2:xs[i] + 3].sum()) < 2:
+                    continue
+            target = (float(wx[i]), float(wy[i]))
+            break
+
+        if target is None:
+            self.n_search_turns += 1
+            self.n_search_frames += 1
+            info["candidates"] = len(cand)
+            rec = self._recovery(info)
+            if rec is not None:
+                return rec
+            if self.n_search_turns > self.max_search:
+                # rotated through every sector and found nothing reachable:
+                # the honest answer is to stop, not to spin forever
+                self.state = "done"
+                info["state"] = "done"
+                return 0.0, 0.0, info
+            self.state = "search"
+            info["state"] = "search"
+            return 0.0, self.w_max * 0.7, info
+        self.n_search_turns = 0
+
+        # stabilise on the centroid of the chosen cluster
+        sel = np.hypot(wx - target[0], wy - target[1]) <= 1.0
+        tx, ty = float(wx[sel].mean()), float(wy[sel].mean())
+
+        # "turn then drive": heading error gates the throttle, so a large
+        # heading error produces an in-place turn instead of a wide arc
+        err = float(np.arctan2(ty - y0, tx - x0) - yaw)
+        err = float(np.arctan2(np.sin(err), np.cos(err)))     # wrap to +-pi
+        w = float(np.clip(1.6 * err, -self.w_max, self.w_max))
+        ahead = self._ahead_clear(wmap, x0, y0, yaw)
+        blocked = abs(np.degrees(err)) > self.turn_only_deg or not ahead
+        # slow down near the target so it does not overshoot into the unknown
+        scale = min(1.0, max(float(np.hypot(tx - x0, ty - y0)) / 1.5, 0.35))
+        v = 0.0 if blocked else self.v_max * scale
+
+        self.state = "turn" if blocked else "drive"
+        self.n_targets += 1
+        info.update({"state": self.state, "candidates": len(cand),
+                     "target": (round(tx, 2), round(ty, 2)),
+                     "dist": round(float(np.hypot(tx - x0, ty - y0)), 2),
+                     "heading_err_deg": round(float(np.degrees(err)), 1),
+                     "ahead_clear": bool(ahead)})
+
+        # --- stuck recovery -------------------------------------------------
+        if blocked:
+            self._n_turn += 1
+            if self._n_turn > self.max_turn_frames and self._backoff <= 0:
+                self._backoff = self.backoff_frames
+                self._backoff_sign = -self._backoff_sign
+                self._n_turn = 0
+                self.n_backoffs += 1
+        else:
+            self._n_turn = 0
+
+        if self._backoff > 0:
+            self._backoff -= 1
+            self.state = "backoff"
+            info["state"] = "backoff"
+            info["v"] = round(-self.v_max * 0.45, 3)
+            info["w"] = round(self.w_max * 0.55 * self._backoff_sign, 3)
+            return info["v"], info["w"], info
+
+        return v, w, info
+
+    def _recovery(self, info):
+        """Common stuck handling for the `search` branch; None -> carry on."""
+        self._n_turn += 1
+        if self._n_turn > self.max_turn_frames and self._backoff <= 0:
+            self._backoff = self.backoff_frames
+            self._backoff_sign = -self._backoff_sign
+            self._n_turn = 0
+            self.n_backoffs += 1
+        if self._backoff > 0:
+            self._backoff -= 1
+            self.state = "backoff"
+            info["state"] = "backoff"
+            v = -self.v_max * 0.45
+            w = self.w_max * 0.55 * self._backoff_sign
+            info["v"], info["w"] = round(v, 3), round(w, 3)
+            return v, w, info
+        return None
+
+
+class VelocitySender:
+    """Publishes the latest twist at a fixed rate on a background thread.
+
+    Why a thread rather than one publish per frame: the loop runs at the LiDAR
+    rate (5 Hz in the simulation), and a controller that only updates 5 times a
+    second is coarse at the start of a turn.  The publisher also keeps the last
+    command alive between frames, which is what a real base expects.
+
+    ---------------------------------------------------------------------
+    THREE THINGS THIS CLASS GOT WRONG FIRST, all of which produce the same
+    symptom -- the robot sits still and nothing anywhere reports an error:
+
+    1. **The publisher was constructed before `rospy.init_node`.**  The source
+       normally initialises the node lazily on its first frame, which happens
+       *after* this object is built.  So the publisher had no node to belong
+       to.  `start()` now initialises the node itself if nobody has.
+    2. **A publisher needs time to connect.**  ROS wires publishers and
+       subscribers asynchronously, so messages sent in the first few hundred ms
+       go nowhere.  `start()` waits for `get_num_connections()`.
+    3. **The thread died silently.**  The first `rospy.Time.now()` raised, the
+       daemon thread ended, and the run reported `cmd_published: 0` only in a
+       JSON file nobody was reading.  A background worker that can fail must
+       publish its own failure -- `self.error` below, surfaced in the summary.
+    """
+
+    def __init__(self, topic: str = "/cmd_vel", rate: float = 20.0,
+                 node_name: str = "r2slam_pipeline"):
+        self.topic = topic
+        self.rate = float(rate)
+        self.node_name = node_name
+        self._v = 0.0
+        self._w = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._pub = None
+        self._thread: Optional[threading.Thread] = None
+        self.n_sent = 0
+        self.n_connections = 0
+        self.error: Optional[str] = None
+
+    def start(self, wait_connections: float = 8.0):
+        import time as _t
+        import rospy
+        from geometry_msgs.msg import TwistStamped
+
+        if not rospy.core.is_initialized():
+            rospy.init_node(self.node_name, anonymous=True, disable_signals=True)
+        self._pub = rospy.Publisher(self.topic, TwistStamped, queue_size=1)
+
+        t0 = _t.time()
+        while self._pub.get_num_connections() == 0 and (_t.time() - t0) < wait_connections:
+            _t.sleep(0.05)
+        self.n_connections = int(self._pub.get_num_connections())
+
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def _loop(self):
+        import traceback
+        import rospy
+        from geometry_msgs.msg import TwistStamped
+        period = 1.0 / self.rate
+        try:
+            while not self._stop.is_set() and not rospy.is_shutdown():
+                with self._lock:
+                    v, w = self._v, self._w
+                m = TwistStamped()
+                m.header.stamp = rospy.Time.now()
+                m.twist.linear.x = v
+                m.twist.angular.z = w
+                self._pub.publish(m)
+                self.n_sent += 1
+                self._stop.wait(period)
+        except Exception as exc:                     # noqa: BLE001
+            self.error = "%s: %s" % (type(exc).__name__, exc)
+            traceback.print_exc()
+
+    def set(self, v: float, w: float):
+        with self._lock:
+            self._v, self._w = float(v), float(w)
+
+    def halt(self, hold: float = 1.0):
+        """Zero the command and keep publishing zeros, so the base stops."""
+        self.set(0.0, 0.0)
+        import time as _t
+        _t.sleep(hold)
+
+    def close(self):
+        self.set(0.0, 0.0)
+        self.halt(0.4)
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)

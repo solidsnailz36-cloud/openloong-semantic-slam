@@ -1,0 +1,15 @@
+[render] reading header
+[render] pts=17956395 color_range=(0.00,0.98)
+[render] downsampled=600000
+[render] saved view_top.png
+[render] saved view_front.png
+[render] saved view_back.png
+[render] saved view_left.png
+[render] saved view_right.png
+[render] saved view_persp.png
+[render] DONE -> E:\SLAM-大师赛\viz_out
+[read] pcd header
+[read] pts=17956395
+[crop] kept=737267
+[traj] drawn 6522 pts (start=green end=red)
+[saved] E:\SLAM-大师赛\viz_out\view_top_traj.png

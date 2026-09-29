@@ -1,0 +1,90 @@
+name: sim_house_gazebo
+kind: sim_ros1
+
+# ---------------------------------------------------------------------------
+# Gazebo Classic.  The camera is `type="camera"` with HFOV 2.0 rad and zero
+# distortion, so a plain pinhole model is exact -- no undistortion step at all.
+# Measured from /camera/camera_info at runtime (see docs/复赛实施方案.md §10.5):
+#   K = [102.73, 0, 160.5; 0, 102.73, 90.5; 0, 0, 1]   D = all zeros
+# ---------------------------------------------------------------------------
+camera:
+  model: pinhole
+  width: 320
+  height: 180
+  fx: 102.73
+  fy: 102.73
+  cx: 160.5
+  cy: 90.5
+  distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+# ---------------------------------------------------------------------------
+# Velodyne VLP-16 as configured in velodyne_description/VLP-16.urdf.xacro:
+# 16 beams x 350 samples, 5 Hz.  The `time` field EXISTS but was measured to be
+# exactly 0.000000 for all 5600 points (min == max == 0, one unique value), i.e.
+# every return in a frame carries the same instant -> no motion distortion, no
+# deskew.  Field presence is not field validity; this was measured, not assumed.
+# ---------------------------------------------------------------------------
+lidar:
+  topic: /velodyne_points
+  xyz_fields: [x, y, z]
+  intensity_field: intensity
+  time_field: time
+  ring_field: ring
+  deskew: false
+  expected_points: 5600
+  nominal_hz: 5.0
+
+image_topic: /camera/image
+camera_info_topic: /camera/camera_info
+
+# ---------------------------------------------------------------------------
+# Per-frame budget.  See `RuntimeConfig` in r2slam/config.py for the why.
+#
+# `max_num_threads: 1` is not a typo and not a pessimisation: the container
+# advertises 80 cores (`nproc`, the HOST's count) while
+# /sys/fs/cgroup/cpu.max grants it 8, so KISS-ICP's TBB pool over-subscribes by
+# 10x and the whole cgroup gets frozen each period -- which is exactly the 20%
+# of frames that took 75-100 ms instead of 9 ms.  At 1 thread the tail went
+# 75.3 -> 23.5 ms with byte-identical trajectories.
+#
+# The sim itself is light (5,600 points at 5 Hz), so this budget is really set
+# for the real dataset; both use the same numbers on purpose.
+# ---------------------------------------------------------------------------
+runtime:
+  max_num_threads: 1
+  voxel_size: 1.0
+  min_range: 0.3
+  max_range: 40.0
+  person_conf: 0.30
+  detector_threads: 2
+  map_resolution: 0.10
+  map_extent: 30.0
+
+# Ground truth.  FOR SCORING ONLY -- never feed this into anything that produces
+# the deliverable, that would be cheating.
+ground_truth_topic: /state_estimation
+registered_cloud_topic: /registered_scan
+
+# NOT the identity -- that was the first assumption and it put ZERO points in
+# the image.  The robot's +X is forward, but the camera is an optical frame
+# (z forward, x right, y down) while the LiDAR is a body frame (x forward,
+# y left, z up), so the two differ by a fixed 90-degree-per-axis permutation.
+#
+# Measured, not assumed (`vendor/sim_scripts/motion_probe.py`): drive the robot,
+# take the real world displacement from /state_estimation, rotate it into the
+# LiDAR frame with the authoritative map->sensor TF, and it comes out as exactly
+# (1, 0, 0) -- angle to +X_L = -0.00 deg.  So +X_L is forward, the forward-facing
+# camera's optical axis is +X_L, hence camera z <- LiDAR x, camera x <- -LiDAR y,
+# camera y <- -LiDAR z.
+#
+# Two candidate rotations survive a floor/ceiling check (they differ only by a
+# yaw about the optical axis), which is why this needed a motion measurement.
+Tcl: [0, -1, 0, 0,
+      0, 0, -1, 0,
+      1, 0, 0, 0,
+      0, 0, 0, 1]
+
+notes: >
+  Official OpenLoong round-2 simulation (house.world, ~20x15 m single storey).
+  LiDAR is light (5.6k points at 5 Hz) so the real-time budget is dominated by
+  the real dataset, not by this one.

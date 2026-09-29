@@ -1,0 +1,22 @@
+# 统一换行符：远端是 Linux，**shell 脚本带 CRLF 会直接报 `\r: command not found`**。
+# 这条规则让 `git checkout` 出来的 .sh 永远是 LF，省掉每次上传后的 `sed -i "s/\r$//"`。
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+*.svm  text eol=lf
+
+# 二进制：不做任何行尾转换
+*.pcd    binary
+*.onnx   binary
+*.zip    binary
+*.mp4    binary
+*.bag    binary
+*.bin    binary
+*.dae    binary
+*.stl    binary
+*.png    binary
+*.jpg    binary

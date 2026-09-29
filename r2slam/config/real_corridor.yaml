@@ -1,0 +1,108 @@
+name: real_corridor_three1
+kind: bag_ros2
+path: D:/E-Downd/openloong_ex/three1
+
+# ---------------------------------------------------------------------------
+# Organiser-supplied calibration, transcribed verbatim from calib.yaml.
+#   cam_model FishPoly, 1600 x 1296 (the file's own comments say 1920 x 1080 --
+#   see the "待确认" note in README.md).
+#
+# The model used here is equidistant, r = A11 * theta.  It was verified by
+# projecting the LiDAR frame onto the fisheye image: corridor floor edges, walls
+# and ceiling lines all line up, while a pinhole model visibly fans out at the
+# periphery.  Check: 839.09 px half-width / 730.56 px = 1.1485 rad = 65.8 deg
+# half-HFOV, i.e. ~131.6 deg HFOV -- consistent with a 120 deg-class fisheye
+# cropped to 1600 x 1296.
+#
+# `fishpoly_k` are the k2..k7 radial coefficients from calib.yaml.  They are
+# carried here for completeness but NOT applied: their closed form is not
+# documented anywhere in the delivered material and every guess produces
+# nonsense at 120 deg.  Kept so that asking the organisers is a one-line
+# question ("what is the FishPoly radial polynomial in?").
+# ---------------------------------------------------------------------------
+camera:
+  model: fisheye_equidistant
+  width: 1600
+  height: 1296
+  a11: 730.5554054616883
+  a12: -0.24224985823987671
+  a22: 730.25912516133496
+  u0: 839.08999139227705
+  v0: 657.92171275072382
+  max_incident_angle_deg: 120
+  fishpoly_k: [0.010126610249984532, -0.071926952083687406, 0.14876251316557848,
+               -0.19907383968027517, 0.12617348728080629, -0.032004783520352624]
+
+# ---------------------------------------------------------------------------
+# 48 beams x 1024 samples = 49,152 points at a nominal 10 Hz, point_step 19.
+# `offset_time` spans 0 .. 0.094 s within a single frame -> the robot moves
+# during acquisition, so the cloud IS skewed and must be deskewed.  Unlike the
+# sim, this field is real: field presence AND variation were both measured.
+#
+# Deskew uses our own odometry (constant-velocity model), never the IMU --
+# /odin1/imu arrives in bursts (12 gaps >1 s, ~0.67 s of usable data in total).
+# ---------------------------------------------------------------------------
+lidar:
+  topic: /odin1/cloud_raw
+  xyz_fields: [x, y, z]
+  intensity_field: intensity
+  time_field: offset_time
+  deskew: true
+  # The real sensor's stamp marks the END of the sweep, so `offset_time` counts
+  # *backwards* from it.  Setting this wrong is worse than not deskewing at all
+  # -- it doubles the distortion and the odometry feeds on its own mistake.
+  # Measured over the same 300 frames of this bag:
+  #     offsets_from: start  -> 60.9 m of trajectory   (wrong: 2.8x inflated)
+  #     offsets_from: end    -> 22.2 m                 (right)
+  #     deskew disabled      -> 21.5 m                 (baseline)
+  # With the sign right the correction is nearly neutral here, which is the
+  # honest result: 0.094 s at ~0.7 m/s is only 6.6 cm of smear.
+  time_offsets_from: end
+  expected_points: 49152
+  nominal_hz: 10.0
+
+image_topic: /odin1/image/compressed
+
+# ---------------------------------------------------------------------------
+# Per-frame budget -- identical to the simulator's, which is the point: the same
+# stack has to hold 49,152 points at 10 Hz (100 ms/frame) here and 5,600 at 5 Hz
+# there, and the numbers below are set for the harder of the two.
+#
+# `max_num_threads: 1` is the decisive one.  Measured on this dataset, 250
+# consecutive frames: auto -> p50 8.2 / p90 75.3 ms; 1 thread -> p50 8.8 /
+# p90 23.5 / p99 47.7 ms.  The cause is not the algorithm: the container reports
+# 80 cores via `nproc` but /sys/fs/cgroup/cpu.max allows 8, so the TBB pool
+# over-subscribes 10x and the cgroup is frozen each period -- 22% of periods
+# throttled, 27,540 s of accumulated freeze.  Trajectories are byte-identical
+# either way, so this is pure latency.
+# ---------------------------------------------------------------------------
+runtime:
+  max_num_threads: 1
+  voxel_size: 1.0
+  min_range: 0.3
+  max_range: 40.0
+  person_conf: 0.30
+  detector_threads: 2
+  map_resolution: 0.10
+  # The real venue is 72 x 52 m of building; +-30 m clipped it.  +-60 m at
+  # 0.10 m is 1200x1200 cells, which still costs nothing.
+  map_extent: 60.0
+  # 1336 frames of 49k points held at 0.10 m is ~13 M points / 180 MB, most of
+  # the submission size budget for a density nobody can see.  0.15 m is a third
+  # of the points and still finer than the beam spacing beyond a few metres.
+  pcd_voxel: 0.15
+
+# LiDAR -> camera.  Reading the rotation: camera z (optical axis) <- LiDAR x
+# (forward), camera x (right) <- -LiDAR y (left), camera y (down) <- -LiDAR z
+# (up).  Translation ~3 cm, so camera and LiDAR sit in the same housing.
+Tcl: [0.00095, -0.99997, -0.00735, 0.02344,
+      -0.00365, 0.00734, -0.99997, -0.0049,
+      0.99999, 0.00098, -0.00364, -0.03012,
+      0, 0, 0, 1]
+
+notes: >
+  Real machine recording, 130.15 s, indoor corridor.  No RTK and no usable IMU,
+  so pose comes from our own LiDAR odometry; LiDAR Map.pcd (walls only,
+  72x52 m) is the prior map for absolute correction.  Note this is NOT the same
+  place as the Gazebo house -- the two scenes are deliberately different sizes,
+  which is the point of the migration story.
