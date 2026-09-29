@@ -174,9 +174,9 @@ def write_table(path: str) -> str:
     lines = [
         "# SLAM 大师赛 · 赛题二 · 语义类别表 / semantic label table",
         "#",
-        "# 随建图 pcd 一并提交。pcd 的 `label` 列取本表的 `id`（uint8），",
-        "# `rgb` 列取本表 `rgb`（PCL packed-float 形式，可直接被 CloudCompare /",
-        "# pcl_viewer / Open3D 识别）。",
+        "# 随建图 pcd 一并提交。pcd 的 `label` 列取本表的 `id`（uint8）；",
+        "# 同一颜色以 PCL packed-float 写进 pcd 的 `rgb` 列（= r<<16 | g<<8 | b），",
+        "# 所以 CloudCompare / pcl_viewer / Open3D 打开即为语义着色。",
         "#",
         "# 几何类（0/1）由 LiDAR 几何判定，零训练；",
         "# 物体类（2..）由 COCO 2D 检测经相机-LiDAR 标定投影到三维。",

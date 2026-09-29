@@ -120,13 +120,21 @@ def parse_args():
     return ap.parse_args()
 
 
-def dump_frame(fr, out_dir, index):
+def dump_frame(fr, out_dir, index, extra=None):
     """Write one frame as .npz for later replay.
 
     The image is stored **PNG-encoded** rather than as a raw array.  Raw would
     be 6.2 MB per frame for the real fisheye (1600x1296x3) -- 1.5 GB for a
     4-minute capture.  PNG at 40 KB (sim) / ~1.5 MB (real) keeps it lossless
     and manageable, and the 320x180 simulator frames cost almost nothing.
+
+    `extra` carries anything the replay cannot recompute on its own.  Right now
+    that is exactly one thing: the **heading used at capture time**.  The replay
+    has no driver, so it cannot dead-reckon a heading -- and on the simulator,
+    where the LiDAR does not rotate with the base, a heading of zero rotates
+    every fused object around the robot in the finished map.  The first
+    version of the two-phase workflow did precisely that and produced a
+    plausible-looking map with every person at the wrong bearing.
     """
     import cv2
     d = {"stamp": np.float64(fr.stamp),
@@ -137,6 +145,8 @@ def dump_frame(fr, out_dir, index):
         ok, buf = cv2.imencode(".png", fr.image)
         if ok:
             d["image_png"] = buf.reshape(-1)
+    for k, v in (extra or {}).items():
+        d[str(k)] = np.float64(v)
     np.savez_compressed(os.path.join(out_dir, "%06d.npz" % index), **d)
 
 
@@ -155,6 +165,8 @@ def frames_from_npz(d, limit=0):
             import cv2
             buf = np.asarray(z["image_png"], dtype=np.uint8).reshape(-1)
             f.image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if "control_yaw" in z:
+            f.meta["control_yaw"] = float(z["control_yaw"])
         f.meta["file"] = os.path.basename(p)
         yield f
 
@@ -312,6 +324,7 @@ def main():
     n_rec = 0
     n_skipped = 0
     n_unmapped_total = 0
+    n_yaw_missing = 0
     prev_stamp = None
 
     try:
@@ -349,14 +362,27 @@ def main():
             # The simulator happened to start facing a blank wall and never
             # tripped it; the real corridor tripped it on frame one.
             yaw_odom = float(np.arctan2(T[1, 0], T[0, 0]))
-            if heading is not None:
-                # Scanner does not turn with the base: yaw is unobservable from
-                # the scans, so dead-reckon it from the command we issued last
-                # frame (see `heading.py`).
+            if fr.meta.get("control_yaw") is not None:
+                # Replay of a capture: use the heading that was actually in
+                # effect when this frame was recorded.  A replay has no driver,
+                # so it cannot dead-reckon one -- and on a scanner that does not
+                # rotate with the base, a heading of zero rotates every fused
+                # object around the robot in the finished map.  The first
+                # version of this workflow did exactly that.
+                yaw = float(fr.meta["control_yaw"])
+            elif heading is not None:
+                # Live, scanner does not turn with the base: dead-reckon the
+                # yaw from the command issued last frame (see `heading.py`).
                 yaw = (heading.update(prev_cmd_w, dt_frame)
                        if dt_frame is not None else heading.yaw)
             else:
                 yaw = yaw_odom
+                if not cfg.lidar.rotates_with_base:
+                    # A source that needs a stored yaw, being replayed without
+                    # one.  Say so once per frame and shout at the end: silently
+                    # using zero here is how the bug above survived a whole
+                    # pipeline run.
+                    n_yaw_missing += 1
 
             # ---------------- detect ----------------
             # `detect_mapped` returns OUR label ids (see r2slam/labels.py), not
@@ -490,7 +516,8 @@ def main():
 
             # ---------------- optional capture ----------------
             if dump_dir is not None:
-                dump_frame(fr, dump_dir, n - 1)
+                dump_frame(fr, dump_dir, n - 1,
+                           extra={"control_yaw": yaw})
             t_dump = time.perf_counter()
 
             # ---------------- render ----------------
@@ -626,6 +653,7 @@ def main():
         "frames": n,
         "frames_recorded": n_rec,
         "frames_skipped_nonmonotonic": n_skipped,
+        "frames_missing_control_yaw": n_yaw_missing,
         "source_stamps": ({"from_header": ctx.n_header_stamp,
                            "from_bag_write_time": ctx.n_bag_time,
                            "paired_with_image": ctx.n_paired,
@@ -748,6 +776,11 @@ def main():
     print("\n=== source health ===")
     print("  frames processed          %d" % n)
     print("  skipped (non-monotonic)   %d" % n_skipped)
+    if n_yaw_missing:
+        print("  *** %d/%d frames had NO recorded control yaw, but this source's "
+              "scanner does not rotate with the base: their fused objects are at "
+              "the wrong bearing.  Re-capture with a pipeline that dumps "
+              "'control_yaw'. ***" % (n_yaw_missing, n))
     print("  deskew applied / skipped  %d / %d (bad dt)"
           % (deskewer.n_applied, deskewer.n_skipped_dt))
     if ctx is not None and hasattr(ctx, "n_header_stamp"):
