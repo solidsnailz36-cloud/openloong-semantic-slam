@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Behavioural tests for the semantics->navigation chain (`r2slam/nav.py`).
+
+Written as a standalone script (no pytest on the target box) and printable, so
+the same file can be run on both machines and compared line for line -- that is
+how the explore tests caught a machine-dependent assumption before.
+
+The synthetic world follows the lesson from `test_explore.py`: **sample pitch
+must not be commensurate with the grid resolution.**  A 0.1 m pitch on a 0.1 m
+grid makes `(-1.3 + 12) / 0.1` evaluate to 106.99999999999999, whole rows land
+one cell low, and a perfectly observed floor grows a one-cell "unseen" stripe
+that the planner then refuses to cross.  0.07 m here.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import numpy as np
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _cand in (os.environ.get("R2SLAM_PKG"),
+              os.path.join(_HERE, ".."),
+              os.path.join(_HERE, "..", ".."),
+              "/root/sim"):
+    if _cand and os.path.isdir(os.path.join(_cand, "r2slam")):
+        sys.path.insert(0, os.path.abspath(_cand))
+        break
+else:
+    raise SystemExit("cannot find the r2slam package; set R2SLAM_PKG")
+
+from r2slam import labels as L                                      # noqa: E402
+from r2slam.nav import (ObjectRegistry, PathPlanner, SemanticNavigator,  # noqa: E402
+                        find_label, path_length)
+from r2slam.worldmap import WorldMap                                # noqa: E402
+
+P = 0.07            # sample pitch, deliberately not the 0.1 m grid step
+WALL_Z = 0.6
+
+
+def corridor(block_x=None, x1=8.0):
+    """Floor x in [-2, x1], walls along y = +-1.5, closed at +x1.
+
+    The far wall matters for the navigation tests: a navigator that just drives
+    at the target will stop looking correct the moment the target needs a
+    detour, and a closed corridor is the smallest world where that shows.
+    """
+    gx, gy = np.meshgrid(np.arange(-2.0, x1, P), np.arange(-1.5, 1.5, P))
+    parts = [np.column_stack([gx.ravel(), gy.ravel(),
+                              np.full(gx.size, -0.8)])]
+    ys = np.arange(-1.5, 1.5, P)
+    xs = np.arange(-2.0, x1, P)
+    for wy in (1.51, -1.51):
+        parts.append(np.column_stack([xs, np.full(len(xs), wy),
+                                      np.full(len(xs), WALL_Z)]))
+    parts.append(np.column_stack([np.full(len(ys), x1 + 0.01), ys,
+                                  np.full(len(ys), WALL_Z)]))       # far cap
+    parts.append(np.column_stack([np.full(len(ys), -2.01), ys,
+                                  np.full(len(ys), WALL_Z)]))       # near cap
+    if block_x is not None:
+        parts.append(np.column_stack([np.full(len(ys), block_x), ys,
+                                      np.full(len(ys), WALL_Z)]))
+    allp = np.vstack(parts)
+    ground = np.zeros(len(allp), bool)
+    ground[:gx.size] = True
+    return allp, ground
+
+
+def world(block_x=None, x1=8.0, extent=14.0):
+    allp, ground = corridor(block_x, x1)
+    w = WorldMap(resolution=0.1, extent=extent)
+    w.add(allp, ground, ~ground, None, (0.0, 0.0), 0.0)
+    return w
+
+
+def drive_step(pose, v, w, dt=0.2):
+    x, y, yaw = pose
+    return (x + v * np.cos(yaw) * dt, y + v * np.sin(yaw) * dt, yaw + w * dt)
+
+
+def main():
+    fails = []
+    print("=== test_nav: %d labels in the table ===" % len(L.LABEL_NAMES))
+
+    # ---------------------------------------------------------------- 1. words
+    print("\n1) utterance -> label")
+    cases = [("沙发", "couch"), ("sofa", "couch"), ("the red sofa", "couch"),
+             ("椅子", "chair"), ("chair", "chair"), ("冰箱", "refrigerator"),
+             ("fridge", "refrigerator"), ("电视", "tv"), ("人", "person"),
+             ("餐桌", "dining table"), ("桌子", "dining table"),
+             ("请到沙发旁边去", "couch"), ("Sofa", "couch")]
+    for text, want in cases:
+        got = find_label(text)
+        ok = got is not None and L.name(got) == want
+        print("   %-16s -> %-14s %s" % (text, L.name(got) if got is not None
+                                        else None, "ok" if ok else "FAIL"))
+        if not ok:
+            fails.append("find_label(%r) = %r, wanted %s" % (text, got, want))
+    for text in ("", "   ", "紫金山天文台", "qwertyuiop"):
+        got = find_label(text)
+        print("   %-16s -> %s" % (repr(text), got))
+        if got is not None:
+            fails.append("find_label(%r) should be None, got %r" % (text, got))
+
+    # ------------------------------------------------------------ 2. instances
+    print("\n2) detection -> persistent instances")
+    reg = ObjectRegistry()
+    sofa = L.COCO_TO_LABEL[57]
+    chair = L.COCO_TO_LABEL[56]
+    # one sofa seen 5 times from slightly different angles (jitter ~0.2 m)
+    rng = np.random.default_rng(0)
+    for k in range(5):
+        reg.update([(4.0 + rng.normal(0, 0.2), 0.5 + rng.normal(0, 0.2), 0.4,
+                    sofa)], stamp=float(k))
+    # a second sofa, 6 m away and a different label, twice
+    for k in range(2):
+        reg.update([(7.0 + rng.normal(0, 0.05), 0.0, 0.4, sofa),
+                    (3.0, -1.0, 0.5, chair)], stamp=float(10 + k))
+    print("   instances: %s" % reg.summary())
+    print("   created %d / merged %d" % (reg.n_created, reg.n_merged))
+    sofas = reg.query(sofa)
+    if len(sofas) != 2:
+        fails.append("expected 2 sofa instances, got %d" % len(sofas))
+    if len(reg.query(chair)) != 1:
+        fails.append("expected 1 chair instance, got %d" % len(reg.query(chair)))
+    if sofas:
+        near = min(sofas, key=lambda it: it.id)
+        if not (3.7 < near.x < 4.3 and -0.2 < near.y < 0.8):
+            fails.append("merged mean is off: (%.2f, %.2f)" % (near.x, near.y))
+        if near.n != 5:
+            fails.append("expected 5 observations on the first sofa, got %d" % near.n)
+    # a person must not be welded onto a chair 0.3 m away (different labels)
+    reg2 = ObjectRegistry()
+    reg2.update([(1.0, 1.0, 0.9, L.PERSON), (1.2, 1.0, 0.4, chair)], 0.0)
+    if len(reg2.items) != 2:
+        fails.append("different labels at the same place must stay separate")
+    print("   different labels 0.2 m apart stay separate: %d instances"
+          % len(reg2.items))
+
+    # --------------------------------------------------------------- 3. planner
+    print("\n3) A* planner")
+    w = world(block_x=4.0, x1=8.0)              # wall across at x = 4
+    for radius in (0.0, 0.25):
+        pp = PathPlanner(robot_radius=radius)
+        path = pp.plan(w, (0.0, 0.0), (7.0, 0.0))
+        print("   robot_radius %.2f -> path %s  len %s"
+              % (radius, "found" if path else "NONE",
+                 ("%.2f m" % path_length(path)) if path else "-"))
+        if path is None:
+            # the corridor is capped at x=8 but the wall at x=4 has no gap, so
+            # "unreachable" is the correct answer
+            print("      (blocked corridor: None is correct)")
+        else:
+            fails.append("a fully blocked corridor must yield no path")
+    # with a gap in the wall the plan must exist and must go through the gap
+    allp, ground = corridor()
+    ys = np.arange(-1.5, 1.5, P)
+    blk = np.column_stack([np.full(len(ys), 4.0), ys, np.full(len(ys), WALL_Z)])
+    keep = np.abs(ys - 1.0) > 0.45                    # leave a 0.9 m gap at y=1
+    allp2 = np.vstack([allp, blk[keep]])
+    g2 = np.concatenate([ground, np.zeros(len(blk[keep]), bool)])
+    w2 = WorldMap(resolution=0.1, extent=14.0)
+    w2.add(allp2, g2, ~g2, None, (0.0, 0.0), 0.0)
+    pp = PathPlanner(robot_radius=0.25)
+    path = pp.plan(w2, (0.0, 0.0), (7.0, 0.0))
+    if path is None:
+        fails.append("with a 0.9 m gap the plan must exist")
+        print("   gap at y=1.0 -> NONE (FAIL)")
+    else:
+        gap_pts = [p for p in path if abs(p[0] - 4.0) < 0.35]
+        maxy = max(p[1] for p in gap_pts) if gap_pts else float("nan")
+        print("   gap at y=1.0 -> path %.2f m, crossing x=4 at y up to %.2f"
+              % (path_length(path), maxy))
+        if not gap_pts or maxy < 0.4:
+            fails.append("path did not go through the gap")
+        # every waypoint must be on known-traversable ground
+        bad = 0
+        for px, py in path:
+            c = w2.cell_of(px, py)
+            if not w2.ground[int(c[1]), int(c[0])]:
+                bad += 1
+        if bad:
+            fails.append("%d path waypoints are not on traversable ground" % bad)
+
+    # ------------------------------------------------------------- 4. navigator
+    print("\n4) navigator end to end (corridor, sofa on the map)")
+    w3 = world(x1=8.0)
+    reg3 = ObjectRegistry()
+    for k in range(4):
+        reg3.update([(6.0, 0.3, 0.4, sofa)], stamp=float(k))
+
+    nav = SemanticNavigator("sofa", arrive_dist=0.9, robot_radius=0.25)
+    pose = (0.0, 0.0, 0.0)
+    states = []
+    for k in range(400):
+        v, om, info = nav.command(w3, (pose[0], pose[1]), pose[2], reg3)
+        states.append(info["state"])
+        if info["state"] == "arrived":
+            break
+        pose = drive_step(pose, v, om)
+    print("   final state %s after %d steps; pose (%.2f, %.2f), target (6.0, 0.3)"
+          % (nav.state, k + 1, pose[0], pose[1]))
+    print("   distance to target %.2f m (arrive_dist %.2f)"
+          % (np.hypot(pose[0] - 6.0, pose[1] - 0.3), nav.arrive_dist))
+    if nav.state != "arrived":
+        fails.append("navigator never arrived (state %s, %d of %d frames in "
+                     "'drive')" % (nav.state, states.count("drive"), len(states)))
+    if "drive" not in states:
+        fails.append("navigator never entered 'drive'")
+
+    print("\n5) navigator reports what it cannot do")
+    nav2 = SemanticNavigator("sofa")
+    v, om, info = nav2.command(w3, (0.0, 0.0), 0.0, ObjectRegistry())
+    print("   empty registry      -> state %s  v=%.2f" % (info["state"], v))
+    if info["state"] != "no_target" or v != 0.0:
+        fails.append("with no instances the navigator must report no_target and stop")
+
+    nav3 = SemanticNavigator("紫金山")
+    v, om, info = nav3.command(w3, (0.0, 0.0), 0.0, reg3)
+    print("   meaningless command -> state %s  (known: %d classes)"
+          % (info["state"], len(info.get("known", []))))
+    if info["state"] != "bad_command":
+        fails.append("an unknown word must be reported as bad_command")
+
+    # target exists but is walled off -> unreachable, not a blind drive
+    w4 = world(block_x=4.0, x1=8.0)
+    reg4 = ObjectRegistry()
+    for k in range(4):
+        reg4.update([(6.5, 0.0, 0.4, sofa)], stamp=float(k))
+    nav4 = SemanticNavigator("sofa")
+    v, om, info = nav4.command(w4, (0.0, 0.0), 0.0, reg4)
+    print("   walled-off target   -> state %s  v=%.2f" % (info["state"], v))
+    if info["state"] != "unreachable" or v != 0.0:
+        fails.append("a walled-off target must be reported unreachable, not driven at")
+
+    print()
+    if fails:
+        print("verdict: FAIL (%d)" % len(fails))
+        for f in fails:
+            print("   - %s" % f)
+        return 1
+    print("verdict: PASS (5/5)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

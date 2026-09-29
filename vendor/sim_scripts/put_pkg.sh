@@ -1,7 +1,8 @@
 #!/bin/bash
 # Upload the r2slam package to the cloud box.
-# The remote runs it with the *system* python3 (that is where rospy lives), so
-# nothing is pip-installed there -- the package is dependency-free by design.
+# The remote runs it through `vendor/sim_scripts/run_online.sh`, which is the
+# single entry point and composes the interpreter (slam_comp/venv + the ROS
+# PYTHONPATH).  Do NOT run the pipeline with the bare system python3.
 set -e
 # Git Bash rewrites arguments that look like POSIX paths into Windows paths
 # before handing them to a native .exe.  A remote path like /root/sim/x.py thus
@@ -20,15 +21,31 @@ REMOTE="/root/sim/r2slam"
 FILES="
 r2slam/__init__.py
 r2slam/config.py
+r2slam/labels.py
 r2slam/frames.py
 r2slam/sensors.py
 r2slam/camera.py
 r2slam/viz.py
+r2slam/sysinfo.py
+r2slam/detect.py
+r2slam/fusion.py
+r2slam/traversable.py
+r2slam/deskew.py
+r2slam/odometry.py
+r2slam/worldmap.py
+r2slam/explore.py
 r2slam/sources/__init__.py
 r2slam/sources/base.py
 r2slam/sources/bag_ros2.py
 r2slam/sources/sim_ros1.py
 tools/export_frames.py
+tools/dump_frames.py
+tools/perception_demo.py
+tools/time_odometry.py
+tools/motion_cost_experiment.py
+tools/thread_consistency.py
+tools/test_explore.py
+tools/online_pipeline.py
 config/sim_house.yaml
 config/real_corridor.yaml
 README.md

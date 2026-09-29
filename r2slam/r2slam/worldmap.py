@@ -14,37 +14,42 @@ Two representations, on purpose:
   * a **voxelised 3D point list with labels** for the `.pcd`, because that is
     what the organisers ask for.
 
-Labels, declared here and repeated in the README because the FAQ does not
-publish a class table:
+Labels come from `r2slam/labels.py` -- that module is the single source of
+truth, and it also emits the `label_table.yaml` that ships with the pcd,
+because the FAQ does not publish a class table and a judge reading
+`label = 7` has to be able to look it up.
 
-    0  background / obstacle        (anything above the drivable band)
-    1  traversable ground           (the floor band, free of obstacles)
-    2  person                       (LiDAR returns inside a detected 3D box)
+Two of them are **geometric** (a statement about driveability, decided from the
+LiDAR alone, no training):
 
-Note the honest limit: this is a *geometric* labelling, not a learned semantic
-one.  "Traversable" means "flat, low, and not occupied", which is a statement
-about driveability rather than about material.
+    0  background          anything above the drivable band
+    1  traversable         the floor band, free of obstacles
+
+and the rest are **objects**: a learned 2D detection projected into 3D through
+the camera-LiDAR calibration (`person` = 2, then the furniture classes).
+
+Note the honest limit on the geometric half: "traversable" means "flat, low and
+not occupied", which is a statement about driveability rather than material.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
-# --- label table (declared once; the README repeats it for the organisers) ---
-LABEL_BACKGROUND = 0
-LABEL_TRAVERSABLE = 1
-LABEL_PERSON = 2
-LABEL_NAMES = {LABEL_BACKGROUND: "background",
-               LABEL_TRAVERSABLE: "traversable",
-               LABEL_PERSON: "person"}
-# BGR, chosen to read at a glance in the video
-LABEL_COLORS = {LABEL_BACKGROUND: (110, 110, 110),
-                LABEL_TRAVERSABLE: (80, 200, 80),
-                LABEL_PERSON: (60, 60, 255)}
+from . import labels as L
+
+# Re-exported so callers (and older scripts) keep one obvious place to read the
+# ids from, while `labels.py` remains the definition.
+LABEL_BACKGROUND = L.BACKGROUND
+LABEL_TRAVERSABLE = L.TRAVERSABLE
+LABEL_PERSON = L.PERSON
+LABEL_NAMES = L.LABEL_NAMES
+# BGR (cv2 order), derived from the RGB table so there is one definition
+LABEL_COLORS = {k: L.bgr(k) for k in L.LABEL_NAMES}
 
 
 @dataclass
@@ -73,6 +78,9 @@ class WorldMap:
     traj: List[Tuple[float, float]] = field(default_factory=list, init=False)
     persons: List[Tuple[float, float, float]] = field(default_factory=list,
                                                       init=False)
+    # (x, y, label, stamp) for every object observation, not just people
+    objects: List[Tuple[float, float, int, float]] = field(default_factory=list,
+                                                           init=False)
     n_frames: int = field(default=0, init=False)
     t_first: Optional[float] = field(default=None, init=False)
     t_last: Optional[float] = field(default=None, init=False)
@@ -95,13 +103,22 @@ class WorldMap:
 
     # ------------------------------------------------------------------- add
     def add(self, world_pts: np.ndarray, ground_mask: np.ndarray,
-            obstacle_mask: np.ndarray, person_mask: Optional[np.ndarray],
+            obstacle_mask: np.ndarray, obj_mask: Optional[np.ndarray],
             pose_xy: Tuple[float, float], stamp: float,
-            persons_xy: Sequence[Tuple[float, float]] = ()) -> None:
+            persons_xy: Sequence[Tuple[float, float]] = (),
+            obj_labels: Optional[np.ndarray] = None,
+            objects_xy: Sequence[Tuple[float, float, int]] = ()) -> None:
         """Fold one frame in.
 
-        `world_pts` is (N,3) in the world frame; the masks are (N,) boolean and
-        describe what each point *is* in this frame (person, obstacle, ground).
+        `world_pts` is (N,3) in the world frame; the two boolean masks are (N,)
+        and describe what each point *is* in this frame (ground / obstacle).
+
+        `obj_mask` says which points fell inside a detected object box;
+        `obj_labels` gives the label id for exactly those points (uint8,
+        0 elsewhere).  It is an array rather than a single id because a frame
+        can contain a person *and* a chair, and a per-point label is the only
+        representation that survives that.  `obj_mask=None` means "no detector
+        on this run" and the frame is labelled geometrically only.
 
         The order below matters.  The 2D grid is updated first, and the 3D
         labels are then read back from the **cell-level** decision rather than
@@ -115,6 +132,8 @@ class WorldMap:
         self.traj.append((float(pose_xy[0]), float(pose_xy[1])))
         for px, py in persons_xy:
             self.persons.append((float(px), float(py), float(stamp)))
+        for px, py, lb in objects_xy:
+            self.objects.append((float(px), float(py), int(lb), float(stamp)))
 
         v = np.asarray(world_pts)
         if v.size == 0:
@@ -123,8 +142,12 @@ class WorldMap:
         v = v[finite]
         g = np.asarray(ground_mask)[finite]
         o = np.asarray(obstacle_mask)[finite]
-        p = (np.zeros(len(v), bool) if person_mask is None
-             else np.asarray(person_mask)[finite])
+        p = (np.zeros(len(v), bool) if obj_mask is None
+             else np.asarray(obj_mask)[finite])
+        olab = None
+        if p.any():
+            olab = (np.zeros(len(v), np.uint8) if obj_labels is None
+                    else np.asarray(obj_labels)[finite].astype(np.uint8))
 
         # ---- 2D occupancy first ----
         cx, cy = self.cell_of(v[:, 0], v[:, 1])
@@ -145,7 +168,8 @@ class WorldMap:
             trav_cell[ok] = self.ground[cy[ok], cx[ok]]
         lab = np.where(trav_cell, LABEL_TRAVERSABLE,
                        LABEL_BACKGROUND).astype(np.uint8)
-        lab[p] = LABEL_PERSON
+        if olab is not None:
+            lab[p] = olab[p]
 
         keep = self._voxel_keep(v)
         self._pts.append(v[keep].astype(np.float32))
@@ -188,8 +212,29 @@ class WorldMap:
             "traversable_area_m2": round(trav * self.resolution ** 2, 1),
             "points": int(sum(len(p) for p in self._pts)),
             "n_persons": len(self.persons),
+            "n_object_obs": len(self.objects),
+            "n_object_classes": len({lb for _x, _y, lb, _s in self.objects}),
             "trajectory_len_m": self._traj_len(),
         }
+
+    def class_counts(self) -> Dict[str, int]:
+        """Points per label in the 3D store, by name -- the map's own summary."""
+        lab = (np.concatenate(self._lab) if self._lab
+               else np.zeros(0, np.uint8))
+        out = {}
+        for k in sorted(LABEL_NAMES):
+            n = int((lab == k).sum())
+            if n:
+                out[LABEL_NAMES[k]] = n
+        return out
+
+    def object_histogram(self) -> Dict[str, int]:
+        """How many *observations* per object class (not points)."""
+        out: Dict[str, int] = {}
+        for _x, _y, lb, _s in self.objects:
+            k = LABEL_NAMES.get(int(lb), "label_%d" % lb)
+            out[k] = out.get(k, 0) + 1
+        return out
 
     def _traj_len(self) -> float:
         if len(self.traj) < 2:
@@ -199,27 +244,47 @@ class WorldMap:
 
     # ------------------------------------------------------------------- pcd
     def write_pcd(self, path: str) -> str:
-        """Binary PCD: x y z label, one uint8 label per point.
+        """Binary PCD: `x y z label rgb`.
 
-        Deliberately minimal -- xyz + label is what the organisers' own
-        `LiDAR Map.pcd` carries (it uses a 4-byte field we do not need), and a
-        bare `label` column is unambiguous once the table above is declared.
+        `label` is the project's own id (see `r2slam/labels.py`, and the
+        `label_table.yaml` written next to this file).  It is one uint8 per
+        point rather than the organisers' 4-byte field, because that field is
+        vendor-private and we have no definition for it.
+
+        `rgb` is PCL's **packed float** convention and is derived from the label
+        through the table -- so it carries no information the label does not.
+        It is there so that the cloud opens *coloured* in CloudCompare /
+        pcl_viewer / Open3D without anyone having to load a palette first; a
+        semantic map that renders correctly on first open is the difference
+        between a judge seeing the work and a judge seeing white noise.
+
+        `intensity` is deliberately **not** exported.  The real dataset carries
+        it (uint8) and the simulator does not, and keeping both sources
+        field-for-field identical is the whole point of this stack -- it is the
+        evidence for "deployment and transferability".  Adding a field that is
+        zero everywhere on one of the two sources would quietly break that.
         """
         pts = (np.concatenate(self._pts) if self._pts
                else np.zeros((0, 3), np.float32))
         lab = (np.concatenate(self._lab) if self._lab
                else np.zeros(0, np.uint8))
         rec = np.empty(len(pts), dtype=[("x", "<f4"), ("y", "<f4"),
-                                        ("z", "<f4"), ("label", "u1")])
+                                        ("z", "<f4"), ("label", "u1"),
+                                        ("rgb", "<f4")])
         rec["x"], rec["y"], rec["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
         rec["label"] = lab
+        if len(lab):
+            lut = np.zeros(256, np.float32)
+            for k in range(256):
+                lut[k] = L.pack_rgb(k)
+            rec["rgb"] = lut[lab]
         header = (
             "# .PCD v0.7 - Point Cloud Data file format\n"
             "VERSION 0.7\n"
-            "FIELDS x y z label\n"
-            "SIZE 4 4 4 1\n"
-            "TYPE F F F U\n"
-            "COUNT 1 1 1 1\n"
+            "FIELDS x y z label rgb\n"
+            "SIZE 4 4 4 1 4\n"
+            "TYPE F F F U F\n"
+            "COUNT 1 1 1 1 1\n"
             "WIDTH %d\n"
             "HEIGHT 1\n"
             "VIEWPOINT 0 0 0 1 0 0 0\n"
@@ -238,7 +303,7 @@ class WorldMap:
         lab = (np.concatenate(self._lab) if self._lab
                else np.zeros(0, np.uint8))
         out = {}
-        for k in (LABEL_BACKGROUND, LABEL_TRAVERSABLE, LABEL_PERSON):
+        for k in sorted(LABEL_NAMES):
             n = int((lab == k).sum())
             out[LABEL_NAMES[k]] = {"label": k, "points": n,
                                    "pct": round(100.0 * n / max(len(lab), 1), 2)}
@@ -299,18 +364,31 @@ class WorldMap:
                 cv2.polylines(img, [pts], False, (255, 210, 90), 2,
                               cv2.LINE_AA)
 
-        # Persons, most recent last.  Only the tail is drawn: the marker is
-        # never removed, so over a 90 s run 300 observations pile into a single
-        # red blob that hides the map underneath.  Older ones fade to a dim
+        # Object markers, most recent last.  Only the tail is drawn: a marker is
+        # never removed, so over a 90 s run several hundred observations pile
+        # into one blob that hides the map underneath.  Older ones fade to a dim
         # colour rather than disappearing, so the trail is still readable.
-        recent = self.persons[-max_persons:] if max_persons else self.persons
-        for i, (x, y, _s) in enumerate(recent):
+        #
+        # Colours come from the label table, so a chair on the map is the same
+        # colour as a chair in the legend and in the pcd.  Persons keep the
+        # larger marker because they are the round-2 headline class.
+        obs = self.objects
+        if not obs and self.persons:            # geometry-only run: no detector
+            obs = [(x, y, LABEL_PERSON, s) for x, y, s in self.persons]
+        recent = obs[-max_persons:] if max_persons else obs
+        for i, (x, y, lb, _s) in enumerate(recent):
             px, py = to_px(x, y)
-            if 0 <= px < size and 0 <= py < size:
-                age = len(recent) - i
-                col = (60, 60, 255) if age <= 8 else (90, 90, 160)
-                cv2.circle(img, (int(px), int(py)), 7, col, 2, cv2.LINE_AA)
-                cv2.circle(img, (int(px), int(py)), 2, col, -1, cv2.LINE_AA)
+            if not (0 <= px < size and 0 <= py < size):
+                continue
+            age = len(recent) - i
+            col = LABEL_COLORS.get(int(lb), (255, 255, 255))
+            if age > 8:                          # fade the older half
+                col = tuple(int(0.45 * c) for c in col)
+            rad = 8 if int(lb) == LABEL_PERSON else 5
+            cv2.circle(img, (int(px), int(py)), rad, col, 2, cv2.LINE_AA)
+            cv2.circle(img, (int(px), int(py)), 2, col, -1, cv2.LINE_AA)
+
+        self._legend(img, size)
 
         # robot
         if self.traj:
@@ -328,3 +406,33 @@ class WorldMap:
             cv2.putText(img, "5 m", (12, y - 6), cv2.FONT_HERSHEY_SIMPLEX,
                         0.4, (230, 230, 230), 1, cv2.LINE_AA)
         return img
+
+    def _legend(self, img: np.ndarray, size: int, max_items: int = 6) -> None:
+        """Class colour key in the corner, most-observed classes first.
+
+        Without this, a coloured semantic map is just pretty: the judge has to
+        be able to tell a couch marker from a chair marker without reading a
+        separate file.  The three geometric entries are always shown.
+        """
+        counts = self.object_histogram()
+        items = [(LABEL_NAMES.get(LABEL_TRAVERSABLE, "traversable"),
+                  LABEL_COLORS[LABEL_TRAVERSABLE], "cell"),
+                 (LABEL_NAMES.get(LABEL_BACKGROUND, "background"),
+                  LABEL_COLORS[LABEL_BACKGROUND], "cell")]
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:max_items]
+        for nm, n in ranked:
+            lb = next((k for k, v in LABEL_NAMES.items() if v == nm), None)
+            if lb is None:
+                continue
+            items.append(("%s %d" % (nm, n), LABEL_COLORS[lb], "dot"))
+        x0, y0 = 10, 14
+        for i, (txt, col, kind) in enumerate(items):
+            y = y0 + i * 15
+            if y > size - 6:
+                break
+            if kind == "dot":
+                cv2.circle(img, (x0 + 5, y - 3), 4, col, -1, cv2.LINE_AA)
+            else:
+                cv2.rectangle(img, (x0, y - 7), (x0 + 10, y + 1), col, -1)
+            cv2.putText(img, txt, (x0 + 16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                        (235, 235, 235), 1, cv2.LINE_AA)

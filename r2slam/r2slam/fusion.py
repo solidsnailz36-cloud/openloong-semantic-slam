@@ -1,4 +1,4 @@
-"""Camera -> LiDAR fusion: turn a 2D person box into a 3D position.
+"""Camera -> LiDAR fusion: turn a 2D box into a 3D object position.
 
 The one place where the round-1 calibration work pays off.  Two directions are
 possible; this module does the one that is robust at low resolution:
@@ -10,6 +10,11 @@ rather than reprojecting the cloud into the image and clustering there.  With a
 depth of the LiDAR points that fall inside the box* is far more stable than
 trying to segment anything in the image.
 
+The same routine serves every object class -- a chair and a person differ only
+in the `min_points` gate and the label they carry, not in the geometry.  That
+is deliberate: the finals need "navigate to the sofa", and the cheapest honest
+way there is to stop treating person as a special case.
+
 Requires `Tcl` (LiDAR -> camera) from the config and the camera model, both of
 which differ between the two sources -- and nothing else does.
 """
@@ -19,6 +24,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from . import labels as L
 from .camera import in_view, project, to_camera_frame
 from .config import SourceConfig
 
@@ -42,17 +48,23 @@ def points_in_box(cloud: np.ndarray, cfg: SourceConfig, box,
     return np.nonzero(m)[0]
 
 
-def person_3d(cloud: np.ndarray, cfg: SourceConfig, box,
+def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
               score: Optional[float] = None,
-              min_points: int = 4,
+              label: int = L.PERSON,
+              min_points: Optional[int] = None,
               depth_percentiles=(30, 70)) -> Optional[Dict]:
     """3D localisation of one detection, in the LiDAR frame.
 
     Depth is taken from the 30th percentile of the in-box returns rather than
-    the mean: the LiDAR sees the front surface of the person, and background
+    the mean: the LiDAR sees the front surface of the object, and background
     points leaking in through a loose box would drag a mean backwards.  The
     footprint is from the same percentile band so the box hugs the near surface.
+
+    `min_points` comes from the label table by default, so a couch needs more
+    support than a vase without this function knowing which is which.
     """
+    if min_points is None:
+        min_points = L.LABEL_MIN_POINTS.get(int(label), 4)
     idx = points_in_box(cloud, cfg, box, pad=2.0)
     if len(idx) < min_points:
         return None
@@ -63,6 +75,8 @@ def person_3d(cloud: np.ndarray, cfg: SourceConfig, box,
     if len(band) < max(2, min_points // 2):
         band = p
     return {
+        "label": int(label),
+        "name": L.name(int(label)),
         "x": float(np.median(band[:, 0])),
         "y": float(np.median(band[:, 1])),
         "z": float(np.median(band[:, 2])),
@@ -76,6 +90,16 @@ def person_3d(cloud: np.ndarray, cfg: SourceConfig, box,
         "extent_xy": [float(band[:, 0].max() - band[:, 0].min()),
                       float(band[:, 1].max() - band[:, 1].min())],
     }
+
+
+def person_3d(cloud: np.ndarray, cfg: SourceConfig, box,
+              score: Optional[float] = None,
+              min_points: int = 4,
+              depth_percentiles=(30, 70)) -> Optional[Dict]:
+    """Person-shaped shorthand for `object_3d`.  Kept as its own name because
+    person is the round-2 headline class and callers read better this way."""
+    return object_3d(cloud, cfg, box, score, label=L.PERSON,
+                     min_points=min_points, depth_percentiles=depth_percentiles)
 
 
 def project_person_back(cfg: SourceConfig, person: Dict):

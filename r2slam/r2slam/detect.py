@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""COCO person detection, shared by both data sources.
+"""COCO object detection, shared by both data sources.
 
 Model: `tiny-yolov3-11.onnx` from the ONNX model zoo.  Two properties make it
 the right choice here rather than an ultralytics stack:
@@ -12,21 +12,22 @@ the right choice here rather than an ultralytics stack:
     which matters because a wrong decoder fails silently and produces
     plausible-but-mislocated boxes.
 
-Output is a list of `(x1, y1, x2, y2, score)` in ORIGINAL image pixels for COCO
-class 0 (`person`), ready for the LiDAR/RGB fusion step.
-
-Runtime note: on the cloud box this needs a newer OpenCV/numpy than the ROS
-system ones, installed side by side:
-
-    pip3 install --target /root/sim/pylibs --no-deps opencv-python-headless==4.8.1.78
-    pip3 install --target /root/sim/pylibs onnxruntime==1.17.3
-    PYTHONPATH=/root/sim/pylibs python3 ...
+The network is a **COCO-80** detector and is used as-is: nothing here is
+trained or fine-tuned.  Which of the 80 classes end up in the map is decided by
+the label table in `r2slam/labels.py` (physical gates, not tuned weights), and
+`detect_mapped()` returns the project's own label id so the rest of the stack
+never has to know about COCO.
 """
 from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
+
+try:                                    # imported as a package (the normal case)
+    from . import labels as L
+except ImportError:                     # run as a loose script
+    import labels as L                  # type: ignore
 
 PERSON_CLASS = 0
 COCO80 = None
@@ -77,6 +78,9 @@ class OnnxYoloDetector:
         self.in_names: List[str] = []
         self.num_threads = int(num_threads)
         self.threads_applied = None
+        # bookkeeping for detect_mapped: how many candidate boxes the network's
+        # top-1 class was one we have no name for (see its docstring)
+        self.n_unmapped = 0
 
         order = ["onnxruntime", "cv2"] if backend == "auto" else [backend]
         errs = []
@@ -213,21 +217,115 @@ class OnnxYoloDetector:
     def detect_all(self, bgr: np.ndarray) -> List[Tuple[int, int, int, int, float, int]]:
         return self.detect(bgr, want_class=None)
 
+    def detect_mapped(self, bgr: np.ndarray, iou: float = 0.45,
+                      min_frac: Optional[dict] = None
+                      ) -> List[Tuple[int, int, int, int, float, int]]:
+        """One forward pass, every class this project can *name*.
+
+        Returns `[(x1, y1, x2, y2, score, label)]` where `label` is **our** id
+        from `r2slam/labels.py`, not a COCO index.
+
+        The selection rule is stated rather than hidden:
+
+        * take the detector's own **top-1** class for the box -- never invent a
+          class the network did not prefer;
+        * keep it only if the project has a name for that COCO class;
+        * apply that class's own confidence floor and minimum box size from the
+          label table.
+
+        The tempting alternative -- take the best *mapped* class regardless of
+        what top-1 was -- recovers objects the network confused with an unmapped
+        class, but it also turns "bicycle 0.9 / chair 0.2" into a reported chair.
+        A semantic map with confident wrong labels is worse than one with fewer
+        labels.  `self.n_unmapped` counts what this rule discarded, so the
+        trade-off is visible in the run report instead of being a silent choice.
+        """
+        h, w = bgr.shape[:2]
+        blob, ishape = self.preprocess(bgr)
+        boxes, scores = self._run(blob, ishape)
+        boxes = boxes[0]
+        scores = scores[0]
+        # onnxruntime hands back (80, N), cv2.dnn (N, 80) -- see detect()
+        if scores.ndim == 2 and scores.shape[0] != 80 and scores.shape[1] == 80:
+            scores = scores.T
+        n = boxes.shape[0]
+        if n == 0:
+            return []
+        top = np.argmax(scores, axis=0)
+        top_s = scores[top, np.arange(n)]
+
+        frac = min_frac or {}
+        cand = []                       # (j, label, score)
+        self.n_unmapped = 0
+        for j in range(n):
+            coco = int(top[j])
+            lab = L.COCO_TO_LABEL.get(coco)
+            if lab is None:
+                # Count only boxes the mapped classes would also have had to
+                # clear: `self.conf` is the lowest floor in the table, so this
+                # is "a confident box we could not name", not "one of the ten
+                # thousand near-zero boxes every frame carries".  Without that
+                # filter the number is meaningless (it is ~10k/frame).
+                if float(top_s[j]) >= self.conf:
+                    self.n_unmapped += 1
+                continue
+            s = float(top_s[j])
+            if s < L.LABEL_MIN_CONF.get(lab, self.conf):
+                continue
+            y1, x1, y2, x2 = boxes[j]
+            bx = (max(0.0, x1), max(0.0, y1), min(float(w), x2), min(float(h), y2))
+            if bx[2] <= bx[0] or bx[3] <= bx[1]:
+                continue
+            # the box has to be a sane fraction of the frame height -- this is
+            # what rejects confident speculation on distant clutter
+            if (bx[3] - bx[1]) < frac.get(lab, L.LABEL_MIN_BOX_FRAC[lab]) * h:
+                continue
+            cand.append((j, lab, s, bx))
+        if not cand:
+            return []
+        cand.sort(key=lambda c: -c[2])
+
+        keep: List[Tuple[int, int, int, int, float, int]] = []
+        for _j, lab, s, bx in cand:
+            if any(_iou(bx, (k[0], k[1], k[2], k[3])) > iou for k in keep):
+                continue
+            keep.append((int(bx[0]), int(bx[1]), int(bx[2]), int(bx[3]), s, lab))
+        return keep
+
+
+def box_colour(label_id: int):
+    """BGR for one of our label ids -- the same colour the map and pcd use."""
+    return L.bgr(label_id)
+
 
 def draw(bgr: np.ndarray, boxes: Sequence, names: Optional[List[str]] = None,
-         scale: int = 1, colour=(0, 255, 0)) -> np.ndarray:
+         scale: int = 1, colour=(0, 255, 0), colors=None,
+         use_label_table: bool = False) -> np.ndarray:
+    """Annotate boxes.
+
+    Two naming schemes are supported on purpose.  `names` indexes a COCO name
+    list (that is what the standalone `detect.py` CLI still wants), while
+    `use_label_table` interprets `b[5]` as **our** label id and colours the box
+    from the shared table -- so a chair is the same colour in the picture, in
+    the map panel and in the pcd.  Keeping both avoids a fork of this function.
+    """
     import cv2
     out = (cv2.resize(bgr, (bgr.shape[1] * scale, bgr.shape[0] * scale),
                       interpolation=cv2.INTER_LINEAR) if scale > 1 else bgr.copy())
     for b in boxes:
         x1, y1, x2, y2, s = b[0], b[1], b[2], b[3], b[4]
         cid = b[5] if len(b) > 5 else 0
-        label = (names[cid] if names and cid < len(names) else str(cid))
+        if use_label_table:
+            label = L.name(cid)
+            col = L.bgr(cid)
+        else:
+            label = (names[cid] if names and cid < len(names) else str(cid))
+            col = (colors or {}).get(cid, colour)
         cv2.rectangle(out, (x1 * scale, y1 * scale), (x2 * scale, y2 * scale),
-                      colour, max(1, scale))
+                      col, max(1, scale))
         txt = "%s %.2f" % (label, s)
         cv2.putText(out, txt, (x1 * scale, max(11, y1 * scale - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42 * scale, colour, max(1, scale))
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42 * scale, col, max(1, scale))
     return out
 
 

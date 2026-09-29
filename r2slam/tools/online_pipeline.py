@@ -43,11 +43,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from r2slam import load_config, open_source, viz                     # noqa: E402
+from r2slam import labels as L                                        # noqa: E402
 from r2slam.deskew import Deskewer                                   # noqa: E402
 from r2slam.detect import OnnxYoloDetector, load_names                 # noqa: E402
 from r2slam.explore import FrontierExplorer, VelocitySender           # noqa: E402
 from r2slam.frames import Frame                                      # noqa: E402
-from r2slam.fusion import person_3d, points_in_box, project_person_back  # noqa: E402
+from r2slam.fusion import object_3d, points_in_box, project_person_back  # noqa: E402
+from r2slam.nav import (ObjectRegistry, SemanticNavigator,           # noqa: E402
+                        path_length)
 from r2slam.odometry import apply_thread_limits, make_odometry, register  # noqa: E402
 from r2slam.traversable import fit_ground                            # noqa: E402
 from r2slam import sysinfo                                           # noqa: E402
@@ -82,6 +85,10 @@ def parse_args():
                     help="A/B switch: skip motion compensation even if the config asks for it")
     ap.add_argument("--no-detect", action="store_true",
                     help="geometry only; useful for a fast end-to-end smoke test")
+    ap.add_argument("--person-only", action="store_true",
+                    help="A/B switch: keep only COCO person, i.e. the round-2 "
+                         "baseline.  Used to quantify what adding the furniture "
+                         "classes actually buys (and costs).")
     ap.add_argument("--dump", default=None,
                     help="also write every frame to this directory as .npz, so the run "
                          "can be REPLAYED later with --npz.  This is the recommended "
@@ -99,6 +106,10 @@ def parse_args():
     ap.add_argument("--explore", action="store_true",
                     help="drive the robot with a frontier policy and publish /cmd_vel "
                          "(live sources only -- the simulator has no planner of its own)")
+    ap.add_argument("--goto", default=None, metavar="OBJECT",
+                    help="finals behaviour: drive to the named object, e.g. "
+                         "--goto '沙发' / --goto sofa.  With --explore it first "
+                         "looks around until the class appears on the map.")
     ap.add_argument("--v-max", type=float, default=0.55, help="m/s")
     ap.add_argument("--w-max", type=float, default=0.9, help="rad/s")
     ap.add_argument("--out-fps", type=float, default=0.0,
@@ -174,6 +185,11 @@ def annotate(img, boxes, names, target_h):
     The real fisheye is 1600x1296 and has to come DOWN, so the pipeline needs a
     proportional path.  Keeping it here means the two sources share one
     rendering routine and the labels stay legible at either size.
+
+    Names and colours both come from `r2slam/labels.py`, because `boxes` now
+    carry **our** label ids: that is what makes a chair the same colour in the
+    camera panel, in the map panel and in the pcd.  `names` is kept only so the
+    signature stays stable for callers that still pass a COCO name list.
     """
     import cv2
     out = camera_panel(img, target_h)
@@ -182,11 +198,12 @@ def annotate(img, boxes, names, target_h):
     fs = max(0.45, 0.42 * sc)
     for b in boxes:
         x1, y1, x2, y2 = (int(round(v * sc)) for v in b[:4])
-        cid = b[5] if len(b) > 5 else 0
-        label = names[cid] if names and cid < len(names) else str(cid)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), th, cv2.LINE_AA)
+        lid = b[5] if len(b) > 5 else 0
+        label = L.name(lid)
+        col = L.bgr(lid)
+        cv2.rectangle(out, (x1, y1), (x2, y2), col, th, cv2.LINE_AA)
         cv2.putText(out, "%s %.2f" % (label, b[4]), (x1, max(12, y1 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), th, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, col, th, cv2.LINE_AA)
     return out
 
 
@@ -233,14 +250,27 @@ def main():
         os.makedirs(dump_dir, exist_ok=True)
         print("dump        : every frame -> %s" % dump_dir)
 
-    explorer = sender = None
+    explorer = sender = navigator = None
+    if a.goto:
+        # The finals task, in one flag: after (optionally) exploring, hand the
+        # wheel to the navigator and drive to the named object.  Same velocity
+        # sender, same loop -- the two policies share an interface on purpose.
+        navigator = SemanticNavigator(a.goto, v_max=a.v_max, w_max=a.w_max)
+        if navigator.label is None:
+            print("goto        : *** '%s' is not a class this map can hold ***"
+                  % a.goto)
+            print("              known: %s" % ", ".join(navigator.known_names()))
+        else:
+            print("goto        : '%s' -> label %d (%s)"
+                  % (a.goto, navigator.label, L.name(navigator.label)))
     if a.explore:
         if a.npz:
             raise SystemExit("--explore needs a live source (nothing to drive in --npz mode)")
         explorer = FrontierExplorer(v_max=a.v_max, w_max=a.w_max)
-        sender = VelocitySender().start()
         print("explore     : frontier policy  v_max=%.2f m/s  w_max=%.2f rad/s"
               % (a.v_max, a.w_max))
+    if explorer is not None or navigator is not None:
+        sender = VelocitySender().start()
 
     if a.npz:
         ctx = None
@@ -253,10 +283,12 @@ def main():
               "trav_mask", "map", "explore", "dump", "render", "total")
     times = {k: [] for k in STAGES}
     rows = []
+    registry = ObjectRegistry()
     t_run = time.time()
     n = 0
     n_rec = 0
     n_skipped = 0
+    n_unmapped_total = 0
     prev_stamp = None
 
     try:
@@ -282,24 +314,34 @@ def main():
             t_odom = time.perf_counter()
 
             # ---------------- detect ----------------
+            # `detect_mapped` returns OUR label ids (see r2slam/labels.py), not
+            # COCO indices, so nothing downstream has to know about COCO.
             boxes = []
             if det is not None and fr.image is not None:
-                boxes = det.detect(fr.image)
+                boxes = det.detect_mapped(fr.image)
+                # accumulate: n_unmapped is per-call, and the run report needs a
+                # total, not whatever the last frame happened to contain
+                n_unmapped_total += det.n_unmapped
+                if a.person_only:
+                    boxes = [b for b in boxes if b[5] == L.PERSON]
             t_detect = time.perf_counter()
 
             # ---------------- fuse (box -> 3D, in the LiDAR frame) ----------------
-            persons = []
-            person_mask = np.zeros(len(cloud), bool)
+            objects = []
+            obj_mask = np.zeros(len(cloud), bool)
+            obj_label = np.zeros(len(cloud), np.uint8)
             for b in boxes:
-                p = person_3d(cloud, cfg, b[:4], b[4])
+                p = object_3d(cloud, cfg, b[:4], b[4], label=b[5])
                 if p is None:
                     continue
                 u, v = project_person_back(cfg, p)
                 x1, y1, x2, y2 = b[:4]
                 p["reproj"] = (round(u, 1), round(v, 1))
                 p["reproj_ok"] = bool(x1 <= u <= x2 and y1 <= v <= y2)
-                persons.append(p)
-                person_mask[points_in_box(cloud, cfg, p["box"], pad=2.0)] = True
+                objects.append(p)
+                idx = points_in_box(cloud, cfg, p["box"], pad=2.0)
+                obj_mask[idx] = True
+                obj_label[idx] = int(b[5])
             t_fuse = time.perf_counter()
 
             # ---------------- traversable (geometric, per frame) ----------------
@@ -312,31 +354,58 @@ def main():
             rng_xy = np.hypot(cloud[:, 0], cloud[:, 1])
             tol = GROUND_TOL_BASE + GROUND_TOL_SLOPE * rng_xy
             ground_mask = np.abs(h) < tol
-            obstacle_mask = (h > OBSTACLE_LO) & (h <= OBSTACLE_HI) & ~person_mask
+            obstacle_mask = (h > OBSTACLE_LO) & (h <= OBSTACLE_HI) & ~obj_mask
             t_trav = time.perf_counter()
 
             # ---------------- map (world frame) ----------------
             R, t = T[:3, :3], T[:3, 3]
             world_pts = cloud.astype(np.float64) @ R.T + t
             persons_world = []
-            for p in persons:
+            objects_world = []
+            for p in objects:
                 pw = R @ np.array([p["x"], p["y"], p["z"]]) + t
                 p["world"] = [round(float(pw[0]), 2), round(float(pw[1]), 2),
                               round(float(pw[2]), 2)]
-                persons_world.append((pw[0], pw[1]))
-            wmap.add(world_pts, ground_mask, obstacle_mask, person_mask,
+                objects_world.append((pw[0], pw[1], p["label"]))
+                if p["label"] == L.PERSON:
+                    persons_world.append((pw[0], pw[1]))
+            wmap.add(world_pts, ground_mask, obstacle_mask, obj_mask,
                      pose_xy=(t[0], t[1]), stamp=float(fr.stamp),
-                     persons_xy=persons_world)
+                     persons_xy=persons_world,
+                     obj_labels=obj_label, objects_xy=objects_world)
             st = wmap.stats()
+            # Instance association runs on the same loop as the map: a named
+            # instance is what the finals' "navigate to the sofa" needs, and it
+            # has to be maintained online, not reconstructed afterwards.
+            if objects_world:
+                registry.update([(float(p["world"][0]), float(p["world"][1]),
+                                  float(p["world"][2]), int(p["label"]))
+                                 for p in objects], float(fr.stamp))
             t_map = time.perf_counter()
 
-            # ---------------- exploration (drive the base) ----------------
+            # ---------------- drive: explore, then navigate ----------------
             cmd = None
-            if explorer is not None:
-                yaw = float(np.arctan2(T[1, 0], T[0, 0]))
+            yaw = float(np.arctan2(T[1, 0], T[0, 0]))
+            use_nav = False
+            if navigator is not None:
+                # Hand over as soon as the requested class is on the map; before
+                # that, keep exploring if we were told to explore.  This is the
+                # actual finals sequence -- look around, then go to what was asked.
+                acquired = (navigator.goal is not None
+                            or registry.best(navigator.label, (t[0], t[1]),
+                                             min_obs=1) is not None
+                            or not a.explore)
+                use_nav = acquired or navigator.state == "arrived"
+            if use_nav:
+                v, w, ex = navigator.command(wmap, (t[0], t[1]), yaw, registry)
+                sender.set(v, w)
+                cmd = dict(ex, v=round(v, 3), w=round(w, 3))
+                cmd["mode"] = "navigate"
+            elif explorer is not None:
                 v, w, ex = explorer.command(wmap, (t[0], t[1]), yaw)
                 sender.set(v, w)
                 cmd = dict(ex, v=round(v, 3), w=round(w, 3))
+                cmd["mode"] = "explore"
             t_explore = time.perf_counter()
 
             # ---------------- optional capture ----------------
@@ -368,12 +437,14 @@ def main():
                     "total %5.1f ms  (odom %.1f  detect %.1f  rest %.1f)"
                     % (total_ms, stage_ms["odom"], stage_ms["detect"],
                        total_ms - stage_ms["odom"] - stage_ms["detect"]),
-                    "person %d   traversable %.0f m2   map %.1fk pts"
-                    % (len(persons), st["traversable_area_m2"], st["points"] / 1e3),
+                    "objects %d (%d cls)   traversable %.0f m2   map %.1fk pts"
+                    % (len(objects), len({p["label"] for p in objects}),
+                       st["traversable_area_m2"], st["points"] / 1e3),
                 ]
                 if cmd is not None:
-                    lines.append("explore %s  v=%.2f m/s  w=%+.2f rad/s%s"
-                                 % (cmd["state"], cmd["v"], cmd["w"],
+                    lines.append("%s %s  v=%.2f m/s  w=%+.2f rad/s%s"
+                                 % (cmd.get("mode", "drive"), cmd["state"],
+                                    cmd["v"], cmd["w"],
                                     "" if cmd.get("target") is None
                                     else "  target %.1f m" % cmd["dist"]))
                 sheet = viz.banner(sheet, lines, scale=0.5)
@@ -399,8 +470,10 @@ def main():
                 "frame": n, "stamp": round(float(fr.stamp), 3),
                 "points": int(len(cloud)),
                 "registered": int(len(reg_in)),
-                "persons": len(persons),
-                "person_reproj_ok": sum(1 for p in persons if p.get("reproj_ok")),
+                "objects": len(objects),
+                "object_classes": sorted({L.name(p["label"]) for p in objects}),
+                "persons": sum(1 for p in objects if p["label"] == L.PERSON),
+                "obj_reproj_ok": sum(1 for p in objects if p.get("reproj_ok")),
                 "ground_z_m": round(float(plane.c), 3),
                 "ground_tilt_deg": round(float(plane.normal_deg_from_vertical()), 3),
                 "traversable_m2": st["traversable_area_m2"],
@@ -414,19 +487,23 @@ def main():
                 # commanded, or commanded but physically stuck -- and only
                 # these two fields tell them apart after the fact.
                 "yaw_deg": (round(float(np.degrees(np.arctan2(T[1, 0], T[0, 0]))), 1)
-                            if explorer is not None else None),
+                            if sender is not None else None),
                 "heading_err_deg": (cmd or {}).get("heading_err_deg"),
                 "ahead_clear": (cmd or {}).get("ahead_clear"),
-                "persons_3d": [{k: p[k] for k in ("x", "y", "z", "depth_m",
+                "objects_3d": [{k: p[k] for k in ("x", "y", "z", "depth_m",
                                                   "n_points", "score",
-                                                  "reproj_ok")} for p in persons],
+                                                  "reproj_ok")}
+                               for p in objects],
+                "object_names": [p["name"] for p in objects],
                 **{("ms_" + k): round(v[-1], 2) for k, v in times.items() if v},
             })
             if n % 20 == 0 or n == 1:
-                print("  frame %4d  t=%8.2f s  pts %5d  persons %d  "
+                print("  frame %4d  t=%8.2f s  pts %5d  obj %2d (%s)  "
                       "trav %5.1f m2  total %6.1f ms"
-                      % (n, fr.stamp, len(cloud), len(persons),
-                         st["traversable_area_m2"], times["total"][-1]), flush=True)
+                      % (n, fr.stamp, len(cloud), len(objects),
+                         ",".join(sorted({p["name"] for p in objects})) or "-",
+                         st["traversable_area_m2"], times["total"][-1]),
+                      flush=True)
 
             if ctx is not None and ctx.is_streaming \
                     and (time.time() - t_run) > a.duration:
@@ -477,6 +554,22 @@ def main():
                      "sender_error": sender.error,
                      "final_state": explorer.state}
                     if explorer is not None else {"enabled": False}),
+        "navigation": ({"enabled": True, "query": navigator.query,
+                        "resolved_to": (L.name(navigator.label)
+                                        if navigator.label is not None else None),
+                        "state": navigator.state,
+                        "replans": navigator.n_replans,
+                        "backoffs": navigator.n_backoffs,
+                        "path_len_m": round(path_length(navigator.path), 2),
+                        "target_instance": (navigator.goal.as_dict()
+                                            if navigator.goal is not None else None),
+                        "arrived": bool(navigator.state == "arrived")}
+                       if navigator is not None
+                       else {"enabled": False, "try": a.goto}),
+        "instances": {"n": len(registry.items), "created": registry.n_created,
+                      "merged": registry.n_merged,
+                      "by_class": registry.summary(),
+                      "list": [it.as_dict() for it in registry.items]},
         "runtime": {"threads": rt.max_num_threads, "voxel_size": rt.voxel_size,
                     "min_range": rt.min_range, "max_range": rt.max_range},
         "per_stage_ms": {k: {"p50": pct(v, 50), "p90": pct(v, 90),
@@ -484,9 +577,18 @@ def main():
                          for k, v in times.items() if v},
         "map": wmap.stats(),
         "labels": wmap.label_histogram(),
+        "objects": {"observations": wmap.object_histogram(),
+                    "classes_in_map": len({lb for _x, _y, lb, _s in wmap.objects}),
+                    "detector_unmapped_boxes": (n_unmapped_total
+                                                if det is not None else None),
+                    "person_only_mode": bool(a.person_only)},
     }
     with open(os.path.join(a.out, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
+
+    # The class table ships next to the pcd: the FAQ does not publish one, so
+    # a judge reading `label = 7` must be able to look it up from the package.
+    L.write_table(os.path.join(a.out, "label_table.yaml"))
 
     with open(os.path.join(a.out, "frames.csv"), "w", newline="",
               encoding="utf-8") as fh:
@@ -511,9 +613,15 @@ def main():
     print("\n=== map ===")
     for k, v in st.items():
         print("  %-26s %s" % (k, v))
-    print("  label histogram:")
-    for k, v in wmap.label_histogram().items():
+    print("  labels present (points):")
+    for k, v in wmap.class_counts().items():
         print("    %-26s %s" % (k, v))
+    print("  object observations:")
+    for k, v in sorted(wmap.object_histogram().items(), key=lambda kv: -kv[1]):
+        print("    %-26s %s" % (k, v))
+    if det is not None and n_unmapped_total:
+        print("  detector boxes dropped (confident but class not in our table): %d"
+              % n_unmapped_total)
     # Silent frame loss is the thing to be loud about: a dropped frame hands the
     # odometry a wrong dt, and a wrong dt is how the trajectory ran away once.
     print("\n=== machine during the run ===")
@@ -567,15 +675,49 @@ def main():
                  explorer.n_backoffs, explorer.state))
         print("  trajectory        %.2f m over %.1f s" %
               (stm["trajectory_len_m"], stm["duration_s"]))
+
+    print("\n=== object instances (the 'target association' step) ===")
+    print("  instances %d  (created %d, merged %d detections)"
+          % (len(registry.items), registry.n_created, registry.n_merged))
+    for name, k in sorted(registry.summary().items(), key=lambda kv: -kv[1]):
+        print("    %-16s %d" % (name, k))
+
+    if navigator is not None:
+        stm = wmap.stats()
+        print("\n=== navigation ===")
+        print("  query             '%s' -> %s" % (navigator.query,
+              L.name(navigator.label) if navigator.label is not None
+              else "*** unknown class ***"))
+        print("  final state       %s   (replans %d, back-offs %d)"
+              % (navigator.state, navigator.n_replans, navigator.n_backoffs))
+        print("  path length       %.2f m" % path_length(navigator.path))
+        if navigator.goal is not None:
+            print("  target instance   #%d %s at (%.2f, %.2f), %d observations"
+                  % (navigator.goal.id, navigator.goal.name, navigator.goal.x,
+                     navigator.goal.y, navigator.goal.n))
+        if navigator.state != "arrived":
+            print("  *** DID NOT ARRIVE: %s ***"
+                  % {"no_target": "the class is not on the map",
+                     "unreachable": "no traversable route yet",
+                     "bad_command": "the word is not a class this map can hold",
+                     "drive": "ran out of time while driving",
+                     "turn": "ran out of time while turning",
+                     "init": "never started"}.get(navigator.state,
+                                                  navigator.state))
+        print("  trajectory        %.2f m over %.1f s"
+              % (stm["trajectory_len_m"], stm["duration_s"]))
+
+    if sender is not None:
+        stm = wmap.stats()
         if sender.error:
-            print("  *** SENDER THREAD DIED: %s" % sender.error)
+            print("\n  *** SENDER THREAD DIED: %s" % sender.error)
         if sender.n_sent == 0:
-            print("  *** NOTHING WAS PUBLISHED -- the robot never moved. ***")
+            print("\n  *** NOTHING WAS PUBLISHED -- the robot never moved. ***")
         elif sender.n_connections == 0:
-            print("  *** NO SUBSCRIBER on %s -- commands went nowhere. ***"
+            print("\n  *** NO SUBSCRIBER on %s -- commands went nowhere. ***"
                   % sender.topic)
         elif stm["trajectory_len_m"] < 0.5:
-            print("  *** trajectory under 0.5 m: publishing worked but the base "
+            print("\n  *** trajectory under 0.5 m: publishing worked but the base "
                   "did not move. ***")
 
     if a.encode and n_rec:
