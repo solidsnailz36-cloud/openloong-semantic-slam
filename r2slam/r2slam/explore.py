@@ -662,6 +662,9 @@ class FrontierExplorer:
         # frame counter -- is what says the map is finished, so arrival is where
         # the bookkeeping happens.
         reuse = False
+        prev_target = self._target          # for the switch counter below: the
+        # commitment block clears `_target` on arrival, so comparing against it
+        # inside the branch would compare against None and count nothing
         if self._target is not None and self._target_age < self.commit_frames:
             tx, ty = self._target
             d = float(np.hypot(tx - x0, ty - y0))
@@ -717,7 +720,7 @@ class FrontierExplorer:
                 self.state = "search"
                 info["state"] = "search"
                 return 0.0, self.w_max * 0.7, info
-            if self._target is not None and target_res != self._target:
+            if prev_target is not None and target_res != prev_target:
                 self.n_switches += 1
             self._target = target_res
             self._target_age = 0
