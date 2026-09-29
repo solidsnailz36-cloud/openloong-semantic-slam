@@ -10,11 +10,36 @@ import numpy as np
 from .config import CameraModel
 
 
-def to_camera_frame(xyz: np.ndarray, Tcl: np.ndarray) -> np.ndarray:
-    """LiDAR frame -> camera frame.  `Tcl` is the organiser-supplied extrinsic."""
+def yaw_about_z(cloud: np.ndarray, yaw: float) -> np.ndarray:
+    """Rotate a point set by `-yaw` about z, in place-free form.
+
+    Used to bridge a scanner that does NOT turn with its base (see
+    `LidarSpec.rotates_with_base`): its points are world-aligned, while the
+    camera turns with the base, so the camera-LiDAR extrinsic has to be
+    pre-rotated by the vehicle heading.
+    """
+    if not yaw:
+        return cloud
+    c, s = np.cos(-yaw), np.sin(-yaw)
+    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    return (R @ np.asarray(cloud, dtype=np.float64).T).T
+
+
+def to_camera_frame(xyz: np.ndarray, Tcl: np.ndarray,
+                    yaw: float = 0.0) -> np.ndarray:
+    """LiDAR frame -> camera frame.  `Tcl` is the organiser-supplied extrinsic.
+
+    `yaw` is the vehicle heading and is only non-zero when the LiDAR does not
+    rotate with the base (the tournament simulator).  In that case the points
+    are world-aligned while the camera is body-aligned, so the correction is
+    `p_cam = Rz(-yaw) @ Tcl @ p_lidar` -- applying `Tcl` alone is right only at
+    yaw = 0, and a robot that turns spends most of its time away from yaw = 0.
+    """
     xyz = np.asarray(xyz, dtype=np.float64)
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError("expected (N,3), got %r" % (xyz.shape,))
+    if yaw:
+        xyz = yaw_about_z(xyz, yaw)
     return (Tcl[:3, :3] @ xyz.T).T + Tcl[:3, 3]
 
 

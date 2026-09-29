@@ -33,6 +33,24 @@ lidar:
   deskew: false
   expected_points: 5600
   nominal_hz: 5.0
+  # This is the tournament simulator's biggest trap, and it is not documented.
+  # `vehicleSimulator.cpp` reassigns the orientation quaternion before it moves
+  # the LiDAR model:
+  #
+  #     geoQuat = tf::createQuaternionMsgFromRollPitchYaw(terrainRoll, terrainPitch, 0);
+  #     lidarState.pose.orientation = geoQuat;      // vehicleYaw is gone
+  #
+  # so the LiDAR is teleported to the vehicle's position while keeping a
+  # world-aligned heading -- and the camera, two lines earlier, gets the full
+  # attitude.  Effects, both measured:
+  #   * Rotation is invisible in the scans.  Against /state_estimation our yaw
+  #     stayed within 1.6 deg of zero while the true yaw swept 359 deg; KISS-ICP
+  #     was reporting the truth.  Any heading-following policy then spins
+  #     forever -- which is what our explorer did for 586 s.
+  #   * The camera-LiDAR extrinsic only holds at yaw = 0, so fusion needs
+  #     `Rz(-yaw)` in front of `Tcl` or people land at the wrong bearing.
+  # Heading therefore comes from the commanded yaw rate (r2slam/heading.py).
+  rotates_with_base: false
 
 image_topic: /camera/image
 camera_info_topic: /camera/camera_info
@@ -48,11 +66,23 @@ camera_info_topic: /camera/camera_info
 # 75.3 -> 23.5 ms with byte-identical trajectories.
 #
 # The sim itself is light (5,600 points at 5 Hz), so this budget is really set
-# for the real dataset; both use the same numbers on purpose.
+# for the real dataset; both use the same numbers on purpose -- EXCEPT the
+# voxel, which is not a budget knob here at all.  See below.
 # ---------------------------------------------------------------------------
 runtime:
   max_num_threads: 1
-  voxel_size: 1.0
+  # 0.30, not 1.0.  `vendor/sim_scripts/probe_kiss_rotation.py` feeds KISS-ICP a
+  # furnished room rotated by known angles: at voxel 1.0 the recovered yaw is
+  # systematically 8-15 deg short on every large step; at 0.5 it is right to
+  # <1 deg.  A 1 m voxel turns the source cloud into a coarse grid where
+  # rotation barely changes the nearest-neighbour set.
+  #
+  # This is the reason the simulator robot spent 586 s and 91 m of wheel travel
+  # inside a 4x3 m box: our yaw stayed at 0 while the true yaw swung through
+  # 359 deg, so every heading error the explorer computed was wrong and it
+  # turned forever.  The coarse voxel was chosen for budget on the REAL dataset
+  # (49k points at 10 Hz) and was simply wrong for a 5.6k-point scan.
+  voxel_size: 0.50
   min_range: 0.3
   max_range: 40.0
   person_conf: 0.30

@@ -109,6 +109,31 @@ class LidarSpec:
     deskew: bool = False
     expected_points: int = 0
     nominal_hz: float = 0.0
+    # --- does the scanner turn with the robot? ---------------------------------
+    # Normally yes, and the question would not need asking.  In the official
+    # tournament simulator it is **no**: `vehicleSimulator.cpp` sets the camera
+    # and body orientations from the full vehicle attitude but reassigns the
+    # quaternion before the LiDAR --
+    #
+    #     geoQuat = tf::createQuaternionMsgFromRollPitchYaw(terrainRoll, terrainPitch, 0);
+    #     lidarState.pose.orientation = geoQuat;        // yaw is gone
+    #
+    # -- so the LiDAR model is teleported to the vehicle's position while keeping
+    # a world-aligned heading.  Two consequences, both load-bearing:
+    #
+    #  1. **Yaw is unobservable from the scans.**  Measured against
+    #     `/state_estimation`: our yaw sat within 1.6 deg of zero while the true
+    #     yaw swept 359 deg, and KISS-ICP was *right* to say so.  Any policy that
+    #     steers by heading therefore spins forever -- which is exactly what the
+    #     simulator robot did (586 s, 91 m of wheel travel, 4 distinct cells).
+    #     Heading has to be dead-reckoned from the commanded yaw rate instead.
+    #  2. **The camera-LiDAR extrinsic is only valid at yaw = 0**, because the
+    #     camera *does* turn with the base.  The correct map is
+    #     `p_cam = Rz(-yaw) @ Tcl @ p_lidar`.
+    #
+    # Both are properties of the data source, so they live here.  The real rig
+    # rotates its LiDAR (the scans plainly do), so it is `true` there.
+    rotates_with_base: bool = True
 
     @property
     def deskew_sign(self) -> float:

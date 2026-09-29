@@ -31,15 +31,19 @@ from .config import SourceConfig
 
 def points_in_box(cloud: np.ndarray, cfg: SourceConfig, box,
                   min_depth: float = 0.4, max_depth: float = 25.0,
-                  pad: float = 0.0):
+                  pad: float = 0.0, yaw: float = 0.0):
     """Indices of LiDAR points whose projection lands inside `box`.
 
     `pad` shrinks the box before testing (a negative-ish margin), which is
     useful because box edges are the least reliable part of a weak detector.
+
+    `yaw` is required whenever the LiDAR does not rotate with the base -- see
+    `camera.to_camera_frame`.  It defaults to 0 so the real rig, where the
+    scanner does turn, needs no change.
     """
     x1, y1, x2, y2 = box
     x1, y1, x2, y2 = x1 - pad, y1 - pad, x2 + pad, y2 + pad
-    xc = to_camera_frame(cloud, cfg.Tcl)
+    xc = to_camera_frame(cloud, cfg.Tcl, yaw)
     u, v = project(xc, cfg.camera)
     m = in_view(u, v, cfg.camera)
     z = xc[:, 2]
@@ -52,7 +56,8 @@ def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
               score: Optional[float] = None,
               label: int = L.PERSON,
               min_points: Optional[int] = None,
-              depth_percentiles=(30, 70)) -> Optional[Dict]:
+              depth_percentiles=(30, 70),
+              yaw: float = 0.0) -> Optional[Dict]:
     """3D localisation of one detection, in the LiDAR frame.
 
     Depth is taken from the 30th percentile of the in-box returns rather than
@@ -61,11 +66,12 @@ def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
     footprint is from the same percentile band so the box hugs the near surface.
 
     `min_points` comes from the label table by default, so a couch needs more
-    support than a vase without this function knowing which is which.
+    support than a vase without this function knowing which is which.  `yaw` is
+    the vehicle heading, for scanners that do not turn with their base.
     """
     if min_points is None:
         min_points = L.LABEL_MIN_POINTS.get(int(label), 4)
-    idx = points_in_box(cloud, cfg, box, pad=2.0)
+    idx = points_in_box(cloud, cfg, box, pad=2.0, yaw=yaw)
     if len(idx) < min_points:
         return None
     p = cloud[idx].astype(np.float64)
@@ -95,22 +101,31 @@ def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
 def person_3d(cloud: np.ndarray, cfg: SourceConfig, box,
               score: Optional[float] = None,
               min_points: int = 4,
-              depth_percentiles=(30, 70)) -> Optional[Dict]:
+              depth_percentiles=(30, 70),
+              yaw: float = 0.0) -> Optional[Dict]:
     """Person-shaped shorthand for `object_3d`.  Kept as its own name because
     person is the round-2 headline class and callers read better this way."""
     return object_3d(cloud, cfg, box, score, label=L.PERSON,
-                     min_points=min_points, depth_percentiles=depth_percentiles)
+                     min_points=min_points, depth_percentiles=depth_percentiles,
+                     yaw=yaw)
 
 
-def project_person_back(cfg: SourceConfig, person: Dict):
-    """Re-project a 3D person back to pixels -- a cheap consistency check.
+def project_person_back(cfg: SourceConfig, person: Dict, yaw: float = 0.0):
+    """Re-project a 3D object back to pixels -- a cheap consistency check.
 
     The reprojected centre must land inside the box it came from; if it does
     not, the extrinsic or the camera model is wrong.  This is the test that
     catches a sign error, which no amount of eyeballing a picture reliably does.
+
+    `yaw` must be the SAME value that was used to localise it.  Mixing the two
+    is not a subtle difference: this check is a round trip through one
+    transform, so it passes for *any* transform that is applied consistently --
+    it cannot see a global frame error, only an inconsistent one.  (Which is
+    exactly why the simulator's yaw-zeroed LiDAR went unnoticed: the person
+    positions were rotated with the robot and every round trip still agreed.)
     """
     xyz = np.array([[person["x"], person["y"], person["z"]]])
-    u, v = project(to_camera_frame(xyz, cfg.Tcl), cfg.camera)
+    u, v = project(to_camera_frame(xyz, cfg.Tcl, yaw), cfg.camera)
     return float(u[0]), float(v[0])
 
 

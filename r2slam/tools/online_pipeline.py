@@ -49,6 +49,7 @@ from r2slam.detect import OnnxYoloDetector, load_names                 # noqa: E
 from r2slam.explore import FrontierExplorer, VelocitySender           # noqa: E402
 from r2slam.frames import Frame                                      # noqa: E402
 from r2slam.fusion import object_3d, points_in_box, project_person_back  # noqa: E402
+from r2slam.heading import CommandedHeading                          # noqa: E402
 from r2slam.nav import (ObjectRegistry, SemanticNavigator,           # noqa: E402
                         path_length)
 from r2slam.odometry import apply_thread_limits, make_odometry, register  # noqa: E402
@@ -300,6 +301,12 @@ def main():
     truth0 = None
     truth_err_xy: List[float] = []
     truth_err_yaw: List[float] = []
+    prev_cmd_w = 0.0
+    # Only needed when the scanner cannot see rotation (see LidarSpec).
+    heading = (None if cfg.lidar.rotates_with_base else CommandedHeading())
+    if heading is not None:
+        print("heading     : LiDAR does NOT rotate with the base (simulator); "
+              "dead-reckoning yaw from the commanded rate")
     t_run = time.time()
     n = 0
     n_rec = 0
@@ -312,6 +319,7 @@ def main():
             if prev_stamp is not None and fr.stamp <= prev_stamp:
                 n_skipped += 1                 # out-of-order / duplicate
                 continue
+            dt_frame = None if prev_stamp is None else float(fr.stamp - prev_stamp)
             prev_stamp = fr.stamp
             n += 1
 
@@ -347,15 +355,15 @@ def main():
             obj_mask = np.zeros(len(cloud), bool)
             obj_label = np.zeros(len(cloud), np.uint8)
             for b in boxes:
-                p = object_3d(cloud, cfg, b[:4], b[4], label=b[5])
+                p = object_3d(cloud, cfg, b[:4], b[4], label=b[5], yaw=yaw)
                 if p is None:
                     continue
-                u, v = project_person_back(cfg, p)
+                u, v = project_person_back(cfg, p, yaw)
                 x1, y1, x2, y2 = b[:4]
                 p["reproj"] = (round(u, 1), round(v, 1))
                 p["reproj_ok"] = bool(x1 <= u <= x2 and y1 <= v <= y2)
                 objects.append(p)
-                idx = points_in_box(cloud, cfg, p["box"], pad=2.0)
+                idx = points_in_box(cloud, cfg, p["box"], pad=2.0, yaw=yaw)
                 obj_mask[idx] = True
                 obj_label[idx] = int(b[5])
             t_fuse = time.perf_counter()
@@ -398,7 +406,19 @@ def main():
                                   float(p["world"][2]), int(p["label"]))
                                  for p in objects], float(fr.stamp))
             t_map = time.perf_counter()
-            yaw = float(np.arctan2(T[1, 0], T[0, 0]))
+            yaw_odom = float(np.arctan2(T[1, 0], T[0, 0]))
+            # ---- which yaw do we steer by? ----------------------------------
+            # When the scanner turns with the base (the real rig) the odometry
+            # has it and this is a no-op.  The tournament simulator zeroes the
+            # LiDAR's yaw, so the scans carry no rotation at all and the
+            # odometry is right to report none -- the heading then has to be
+            # dead-reckoned from the command we issued last frame, which is what
+            # `heading.py` does.  See LidarSpec.rotates_with_base.
+            if heading is not None:
+                yaw = (heading.update(prev_cmd_w, dt_frame)
+                       if dt_frame is not None else heading.yaw)
+            else:
+                yaw = yaw_odom
 
             # ---------------- ground truth (simulator only; FOR SCORING) ----
             truth = None
@@ -416,7 +436,12 @@ def main():
                 ey = dth - yaw
                 err_yaw = float(np.arctan2(np.sin(ey), np.cos(ey)))
                 truth_err_xy.append(err_xy)
-                truth_err_yaw.append(abs(err_yaw))
+                # DEGREES.  `err_yaw` above is radians (it has to be, for the
+                # wrap); storing it raw and labelling the summary "deg" made a
+                # 83 deg heading error print as "1.46 deg" and I believed it for
+                # a while.  Convert where the value is produced, not where it is
+                # printed, so the JSON and the CSV cannot disagree.
+                truth_err_yaw.append(abs(float(np.degrees(err_yaw))))
 
             # ---------------- drive: explore, then navigate ----------------
             cmd = None
@@ -440,6 +465,7 @@ def main():
                 sender.set(v, w)
                 cmd = dict(ex, v=round(v, 3), w=round(w, 3))
                 cmd["mode"] = "explore"
+            prev_cmd_w = (cmd or {}).get("w") or 0.0
             t_explore = time.perf_counter()
 
             # ---------------- optional capture ----------------
@@ -520,8 +546,10 @@ def main():
                 # not moving" has two completely different causes -- never
                 # commanded, or commanded but physically stuck -- and only
                 # these two fields tell them apart after the fact.
-                "yaw_deg": (round(float(np.degrees(np.arctan2(T[1, 0], T[0, 0]))), 1)
+                "yaw_deg": (round(float(np.degrees(yaw)), 1)
                             if sender is not None else None),
+                "yaw_odom_deg": (round(float(np.degrees(yaw_odom)), 1)
+                                 if sender is not None else None),
                 "truth_x": (round(float(truth["pos"][0] - truth0["pos"][0]), 3)
                             if truth is not None else None),
                 "truth_y": (round(float(truth["pos"][1] - truth0["pos"][1]), 3)
@@ -618,7 +646,10 @@ def main():
                       "by_class": registry.summary(),
                       "list": [it.as_dict() for it in registry.items]},
         "runtime": {"threads": rt.max_num_threads, "voxel_size": rt.voxel_size,
-                    "min_range": rt.min_range, "max_range": rt.max_range},
+                    "min_range": rt.min_range, "max_range": rt.max_range,
+                    "lidar_rotates_with_base": bool(cfg.lidar.rotates_with_base)},
+        "heading": (heading.as_dict() if heading is not None
+                    else {"source": "odometry (scanner rotates with the base)"}),
         "per_stage_ms": {k: {"p50": pct(v, 50), "p90": pct(v, 90),
                              "p99": pct(v, 99), "max": pct(v, 100)}
                          for k, v in times.items() if v},
@@ -739,7 +770,9 @@ def main():
     if truth_err_xy:
         print("\n=== accuracy vs ground truth (%s, scoring only) ==="
               % (cfg.ground_truth_topic or "truth"))
-        print("  relative-motion error over %d frames" % len(truth_err_xy))
+        src = ("dead-reckoned heading" if heading is not None
+               else "odometry heading")
+        print("  relative-motion error over %d frames, %s" % (len(truth_err_xy), src))
         print("    position  p50 %.3f m   p90 %.3f   max %.3f"
               % (pct(truth_err_xy, 50), pct(truth_err_xy, 90),
                  pct(truth_err_xy, 100)))
@@ -748,7 +781,16 @@ def main():
                  pct(truth_err_yaw, 100)))
         if pct(truth_err_yaw, 50) > 10.0:
             print("    *** heading error is large: the base is not turning the "
-                  "way the commands assume, or the yaw convention is wrong. ***")
+                  "way the commands assume, the yaw convention is wrong, or "
+                  "(simulator) the LiDAR does not rotate with the base so the "
+                  "odometry cannot see rotation at all. ***")
+    if heading is not None:
+        h = heading.as_dict()
+        print("\n=== heading source ===")
+        print("  LiDAR does not rotate with the base, so yaw is dead-reckoned "
+              "from the commanded rate")
+        print("  turned %.1f deg over %d updates (%d frames with a clamped dt)"
+              % (h["turned_deg"], h["updates"], h["clamped_dt"]))
 
     print("\n=== object instances (the 'target association' step) ===")
     print("  instances %d  (created %d, merged %d detections)"

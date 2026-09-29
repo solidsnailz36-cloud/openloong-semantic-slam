@@ -60,6 +60,11 @@ lidar:
   time_offsets_from: end
   expected_points: 49152
   nominal_hz: 10.0
+  # The real rig's LiDAR turns with the robot -- the scans plainly do (the
+  # trajectory is only consistent if they do).  Stated explicitly rather than
+  # left to the default, because the simulator is the opposite case and the
+  # difference changes how the heading is obtained.
+  rotates_with_base: true
 
 image_topic: /odin1/image/compressed
 
