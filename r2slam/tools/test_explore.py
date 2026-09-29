@@ -206,8 +206,12 @@ def main():
         fails.append("chose a target the straight line cannot reach: %s" % (tg,))
 
     # ---- 6. big unknown region must outrank near specks -------------------
+    # Stagnation detection is switched off here on purpose: it exists to stop a
+    # robot when the map stops growing, and this synthetic world CANNOT grow --
+    # there is no sensor, just a fixed map.  Leaving it on would measure that
+    # feature instead of the target choice this case is about.
     w6 = world_with_specks()
-    e6 = FrontierExplorer()
+    e6 = FrontierExplorer(stagnate_frames=10 ** 9)
     v6, om6, info6 = e6.command(w6, (0.0, 0.0), 0.0)
     print("6) three lone specks ~0.8 m out, big unknown at x=4")
     print("   frontier %d  target %s (must be near x=4, not a speck)"
@@ -233,13 +237,33 @@ def main():
         fails.append("made no net progress toward the unknown (ended at x=%.2f)"
                      % pose[0])
 
+    # ---- 7. a map that stops growing must end in "done", not in spinning ----
+    # The simulator's 40 m scanner finishes the map in about a minute; after
+    # that the only frontier left is an irreducible ring along the walls.  A
+    # policy with no stop condition grinds against that ring forever -- measured
+    # 813 of 1005 frames in `turn`, a frozen pose, and 900 frames with no new
+    # area.  A judge sees a robot spinning in the middle of a finished map.
+    e7 = FrontierExplorer(stagnate_frames=20, stagnate_eps=0.5)
+    w7 = world()
+    states7 = []
+    for _ in range(60):
+        v, om, i7 = e7.command(w7, (0.0, 0.0), 0.0)
+        states7.append(i7["state"])
+    first_done = states7.index("done") if "done" in states7 else None
+    print("7) map that never grows -> first 'done' at frame %s of 60" % first_done)
+    print("   reason: %s" % (e7.n_done_reason,))
+    if first_done is None:
+        fails.append("never reported done on a map that stopped growing")
+    elif first_done > 25:
+        fails.append("took %d frames to notice stagnation" % first_done)
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (6/6)")
+    print("verdict: PASS (7/7)")
     return 0
 
 

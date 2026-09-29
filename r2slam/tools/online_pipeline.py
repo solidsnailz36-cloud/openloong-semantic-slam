@@ -468,6 +468,18 @@ def main():
             prev_cmd_w = (cmd or {}).get("w") or 0.0
             t_explore = time.perf_counter()
 
+            # Stop the run when exploration says it is finished.  Without this
+            # the loop keeps recording a parked robot -- on the simulator the map
+            # is complete after about a minute, so two thirds of the video would
+            # be a still frame.  Only used when exploration is the sole driver;
+            # with --goto the wheel has been handed over on purpose.
+            if (explorer is not None and navigator is None
+                    and explorer.state == "done"):
+                print("  exploration complete: %s" % (explorer.n_done_reason or
+                                                     "no reachable frontier"),
+                      flush=True)
+                break
+
             # ---------------- optional capture ----------------
             if dump_dir is not None:
                 dump_frame(fr, dump_dir, n - 1)
