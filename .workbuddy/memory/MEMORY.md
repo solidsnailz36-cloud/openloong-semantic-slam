@@ -16,10 +16,8 @@
   复赛数据集、官方仿真包、代码、成品、权重**全在本地**。云端独占的只有 `run/scans/`（而它恰好不需要）。
 - 本机：GPU RTX 2060 / CPU 16 线程；`wsl.exe`·`wmic.exe` 被安全策略拦截。**交付三项都不需要 GPU**。
 - 初赛 = **81 分**，意见＝点云分类不错 / **轨迹平滑度欠缺** / **RTK 置信度偏高**。
-  已提交包 `out/run4_v2/submission.zip`（132,544,618 B）；**修复包未提交（窗口已关）**
-  `out/run5_keepdeg/submission.zip`（138,917,347 B / md5 `4065213c…`），终审 PASS。
-- 初赛根因已归档：真凶**不是**"最近邻"，是 **RTK 降级段的水平位置回退到里程计** ⇒ 里程计自己的周期被暴露。
-  修后降级段 r1 **−0.929 → −0.337**、与插值 RTK 偏离 **12.49 → 0.08 cm**。详见 `docs/评审意见归因与修正方案.md` §5–§6。
+  初赛根因已归档：真凶**不是**"最近邻"，是 **RTK 降级段的水平位置回退到里程计**（详见
+  `docs/评审意见归因与修正方案.md` §5–§6）。修复包 `out/run5_keepdeg/` 未提交（窗口已关）。
 - 邮箱 `open@openloong.org.cn`，抄送 `luqinghua@openloong.net`。
 
 ## 复赛：仿真环境（Gazebo Classic + ROS 1 Noetic）
@@ -31,7 +29,7 @@
 - **cam↔LiDAR 外参不是单位阵** + **LiDAR 不随车体旋转** → 见下面两个 ★ 节。
 - 云端 T4 `gpufree-container`：Ubuntu 20.04 + ROS Noetic + Gazebo 11.15.1 预装；80 核/376 GB；llvmpipe + `Xvfb :99`。
   依赖全在 `slam_comp/venv`（`include-system-site-packages` 要改 `true` 才有 `rospy`）；**`/root/sim/pylibs` 已废弃**。
-- **版本化副本 `vendor/sim_scripts/`**：`run_online.sh`（**唯一入口**）/ `kill_sim.sh` / `sim_up.sh` / `verify_sim.sh` /
+- **版本化副本 `vendor/sim_scripts/`**（33 个）：`run_online.sh`（**唯一入口**）/ `kill_sim.sh` / `sim_up.sh` /
   `t4_state.sh` / `probe_cpu.py` / `probe_kiss_rotation.py` / `put_pkg.sh` / `rmt.py` / `rr.sh`·`rr_proxy.sh` / `t4_diag.sh`…
   **凭据只放 `.workbuddy/tmp/ssh_env.sh`，不进 vendor。** 补件模型 `vendor/gazebo_models_patch/hokuyo/`（务必保留）。
 - **容器重启会重置 `/etc/hosts`** ⇒ `models.gazebosim.org` 的黑洞化**每次开机后要补一遍**，
@@ -48,9 +46,9 @@
 ## 复赛：算法栈 `r2slam/`（一套代码两个数据源）
 - **纪律**：`r2slam/config.py` + `r2slam/sources/` 是全项目**唯一**允许知道"仿真/真实"的地方，分支写在 `config/*.yaml`；下游只认 `Frame`。
   **下游出现 `if sim` = 设计失败。** 唯一例外是 bag **路径**（属机器不属数据集）⇒ 用 `R2SLAM_BAG_PATH` 覆盖。
-- 模块 `config/labels/frames/sensors/camera/viz/detect/fusion/traversable/deskew/odometry/heading/worldmap/explore/nav.py` +
-  `sources/{base,bag_ros2,sim_ros1}` + `tools/{online_pipeline,package_submission,test_explore,test_nav,...}.py`；
-  **`viz.py` 只用 cv2**（远端无 matplotlib）。
+- 模块（细节看代码）：`config/labels/frames/sensors/camera/viz/detect/fusion/traversable/deskew/`
+  `odometry/heading/worldmap/explore/nav.py` + `sources/{base,bag_ros2,sim_ros1}` +
+  `tools/{online_pipeline,package_submission,test_explore,test_nav}.py`；**`viz.py` 只用 cv2**（远端无 matplotlib）。
 - **`r2slam/labels.py` 是类别表的唯一定义源**（id↔名称↔颜色↔COCO 映射↔门限），并由它导出 `label_table.yaml`
   随 pcd 交付（FAQ 不提供类别表 ⇒ **交付物必须自带**）。25 类 = 2 几何 + **23 类室内物体**。
 - **`tools/online_pipeline.py` 是产出交付物的主程序**：一条循环
@@ -64,6 +62,11 @@
 - 实测：仿真 5.000 Hz / 5,600 点；真实 10.328 Hz / 49,152 点。**入画率差异是视场比**，不是 bug。
 - **三项交付物已齐**（2026-09-29 第二轮重出）：`r2slam/out/online_sim/`、`r2slam/out/online_real/`；
   真实侧 114.85 m 轨迹 / 可通行 407.5 m²；**pcd 字段 `x y z label rgb`（17 B/点，rgb 由 label 推导，不导 intensity）**。
+- **复赛提交包已生成并通过终审（0 FAIL / 0 WARN）**：
+  `提交包/大师赛第一期赛题2—【固态蜗牛队】—【张煜晨】—【156****6887】.zip`
+  = **131,022,899 B / md5 `70ae5a09a1dca9fb1d64b80395787e3b`**，内含
+  `online_sim/` 与 `online_real/`（各 run.mp4 + map.pcd + label_table.yaml + summary.json + frames.csv）+ README.md。
+  重跑命令：`python tools/package_submission.py --root out --out 提交包`。
 - **bag 的记录时刻 ≠ 传感器时间**（`rosbags` 的 `t` vs `msg.header.stamp`）——**必须用 header.stamp**，
   否则记录器缓冲一冲刷 dt 就成 0/0.5 s 交替，里程计从那一帧起发散（实测 130 s 跑出 9,573 m）。
 - **`offset_time` 从帧戳倒推** ⇒ `lidar.time_offsets_from: end`；猜错是把畸变**翻倍**。
@@ -90,29 +93,33 @@
 - **检测器本身没有被训练或微调过。**
 - **解码三坑（都静默出错）**：① 框是 **(y1,x1,y2,x2) 且已是原图像素**（当归一化会算出负高度）；② **图内 NMS 的 `indices` 是空的**，必须自写 NMS；
   ③ `onnxruntime` scores `(80,N)` vs `cv2.dnn` `(N,80)` 且长度都对不上 ⇒ **解码要轴序免疫**，`cv2.dnn` 后端弃用。
-- **可通行（几何法、零训练）三个归零点**：① 障碍只取**离地 0.35–2.0 m 的带**（否则天花板把全图标成障碍 ⇒ 0.0%）；
+- **可通行（几何法、零训练）三个归零点**：① 障碍只取**离地 0.35–2.0 m 的带**（否则天花板把全图标成障碍）；
   ② **先闭运算补地面圆环缝、再对障碍膨胀**（直接腐蚀自由空间 ⇒ 0.1%）；③ 地面容差**随距离增长** `0.10+0.035·d`。
-  实测真实地面 `z≈−1.18 m`；仿真 `z≈−0.79 m`。**两源阈值完全相同、没调参。**
-- **融合硬判据**：三维位置**反投影回图像必须落回原框内**——真实侧 6/6 OK。
+  真实地面 `z≈−1.18 m`；仿真 `z≈−0.79 m`。**两源阈值完全相同、没调参。**
+- **融合硬判据**：三维位置**反投影回图像必须落回原框内**（真实侧 6/6 OK）。
   ⚠️ **但它抓不到"整体错一个角度"**（往返自消），见"★★ LiDAR 不随车体旋转"。深度取框内点 **30 分位**。
-- 仿真侧实测（242 帧 / 200 s 且**正确停止**）：可通行 154.0 m²（占已观测 85.3%）、轨迹 10.09 m、
-  物体 person 98 / chair 13 次观测、实例 17 个。**真实走廊加类别几乎不增产出**（400 帧只多 1 个 chair）。
+- 仿真侧实测（372 帧 / 74.2 s 且**正确停止**）：可通行 146.7 m²（占已观测 85.7%）、轨迹 11.96 m、
+  物体 4 类（person 375 / couch 2 / chair 1 / tv 1 次观测）、实例 29 个。
+  **真实走廊加类别几乎不增产出**（400 帧只多 1 个 chair）。
 
 ## ★★ 官方仿真器：LiDAR **不随车体旋转**（2026-09-29 发现，最贵的一条）
 - `vehicleSimulator.cpp` 在移动 LiDAR 模型前**重新赋值四元数并把 yaw 写死为 0**
-  （`createQuaternionMsgFromRollPitchYaw(terrainRoll, terrainPitch, 0)`），而**相机拿到的是完整姿态**。
+  （`RollPitchYaw(terrainRoll, terrainPitch, 0)`），而**相机拿到的是完整姿态**
   ⇒ LiDAR 被搬到车体位置但**朝向恒为世界对齐**。
 - **实测**：我们的 yaw 全程 ±1.6°，真值 yaw 扫过 359°，指令累计转过 6656°。**KISS-ICP 报"没转"是对的。**
-- 后果一：**航向不可观测** ⇒ 按航向控制的策略永远转不完（586 s 只到过 15 个 1 m 格、2932 帧里 drive 只有 77 帧）。
+- 后果一：**航向不可观测** ⇒ 按航向控制的策略永远转不完（586 s / 15 个 1 m 格 / drive 只有 77 帧）。
   解药 `r2slam/heading.py`：用**上一帧指令角速度 × 实测帧间隔**死推航向（轮式里程计语义，不是真值），
   dt 上限夹住并计数。实测死推误差 **p50 1.85°**（原 79–89°）。
 - 后果二：**相机—LiDAR 外参只在 yaw≈0 成立** ⇒ 正解 `p_cam = Rz(-yaw) @ Tcl @ p_lidar`。
   已按 `LidarSpec.rotates_with_base` 配置化（仿真 false / 真实 true）。
-- ⚠️ **"反投影回原框"自检抓不到它**：那是一次往返，同一个错误变换首尾相消
-  （实测 98.9% 通过，yaw 90–180° 区间 100% 通过）。**自检只能抓"前后不一致"，抓不到"整体错了一个角度"。**
-- 诊断顺序：① 先查里程计（被自己的**弧度当度**打印坑了一次，已修：在产生处转度）→ ② 用
-  `vendor/sim_scripts/probe_kiss_rotation.py` 测 voxel（1.0 每步短 8–15°，0.5/0.3 正常）
-  但**换 voxel 在仿真上无效** ⇒ 不是参数问题 → ③ 读官方源码看到那一行。
+- ⚠️ **"反投影回原框"自检抓不到它**：往返自消（实测 98.9% 通过，yaw 90–180° 区间 100%）。
+- 诊断顺序：① 先查里程计（被自己的**弧度当度**打印坑了一次）→ ② 用
+  `probe_kiss_rotation.py` 测 voxel（1.0 每步短 8–15°，0.5/0.3 正常）但**换 voxel 无效**
+  ⇒ 不是参数问题 → ③ 读官方源码看到那一行。
+- **★ 两阶段流程自身的坑**：`--npz` 复算**没有驱动器** ⇒ 上一帧指令恒 0 ⇒ 航向恒 0；
+  而融合用的正是航向 ⇒ **复算出的每个物体都被绕机器人转过一个错误角度，而地图看着完全正常**。
+  处置：`dump_frame(..., extra={"control_yaw": yaw})` 存进 npz，复算优先采用；
+  summary 增 `frames_missing_control_yaw` 并**大声报**。
 
 ## ★ 仿真外参不是单位阵（实测推翻旧结论）
 - "相机与 LiDAR spawn 在同一 `(vehicleX,Y,Z)` ⇒ 外参≈单位阵"——**那是位置相同，不是朝向相同**。
@@ -126,14 +133,13 @@
 - 4 个文件：`calib.yaml` / `LiDAR Map.pcd`(**先验图，仅墙体**，72×52×6.7 m) / `map_*.bin`(554 MB) / `three1.zip`(1.45 GB)。
 - **标定齐全不用自己标**：鱼眼 `FishPoly` 1600×1296；`Tcl_0` 语义已解。**等距 `r=f·θ`（f=730.6）投影已验证**。
 - **`three1` = 真机 ROS 2 bag**，130 s：`/odin1/cloud_raw`(1336) / `image/compressed`(1335 JPEG 鱼眼) / `imu`(559)。
-  点云 **49,152 点/帧**，带 `offset_time` 0–0.094 s ⇒ **必须去斜**。**IMU 基本不可用**（突发采集，赛题也不要求）。
-- `map_*.bin`（`MAPV0001`）**厂商私有、我方不需要解析**；**`LiDAR Map.pcd` 与仿真 house 不是同一场景**。
+  点云 **49,152 点/帧**，带 `offset_time` 0–0.094 s ⇒ **必须去斜**。**IMU 基本不可用**，赛题也不要求。
+- `map_*.bin`（`MAPV0001`）厂商私有、**我方不需要解析**；**`LiDAR Map.pcd` 与仿真 house 不是同一场景**。
 
-## 复赛任务与交付
-- **四处换轨**：离线→在线；有 RTK→无 RTK 室内；19 类静态语义→**人物 + 可通行区域 + 物体**；新增**相机-LiDAR 融合**。
-  数据两套（仿真 + 真实）。**交付三项**：仿真运行视频 + 真实运行视频 + **建图 pcd**（视频取更严口径 **≤2 min + 含可视化界面**）。
+## 复赛任务与交付（一句话版）
+- 四处换轨（离线→在线、RTK→室内、19 类→人物/可通行/物体、新增相机-LiDAR 融合）；数据两套。
+  **交付三项**：仿真运行视频 + 真实运行视频 + **建图 pcd**（视频取更严口径 **≤2 min + 含可视化界面**）。
 - **不搬 SFPNet**（19 类 SemanticKITTI 与"人物/可通行"不是一回事）——**放弃初赛资产本身就是泛化能力的论证**。
-- **风险**：① 网络可达性会反复；② 实时性已关闭（见"已证伪"）；③ **仿真相机 320×180 能检出（已验，3–6 m）**。
 
 ## 初赛遗留口径（已归档，复赛偶尔沿用；细节见 `docs/HANDOFF_项目交接.md` 与 `评审意见归因与修正方案.md`）
 - 类别编号用 mmdet3d SemanticKITTI 19 类 0 基（官方表 road=9，**差 1**）。
@@ -165,7 +171,10 @@
   `competition-submission-final-audit`（"新的一件+旧的三件"、近似公式先怀疑公式）、
   `lidar-map-forensics`（RTK 只取 `status==2`、平滑"改正量"陷阱）。
 - **同一文件多处修改必须串行发 Edit**（并行会互相覆盖）；`Write` 覆盖前先 `Read`。
-- **★ 两个跨项目通用的测量纪律**（本轮各栽一次，已写进技能但这里留一句指针）：
-  ① **不要让任何库按 `nproc` 决定线程池**——KISS-ICP 的 TBB 和 onnxruntime 的 intra-op 池都会，
-     超订 10 倍 ⇒ cgroup 周期性冻结 ⇒ **连进程里无关的单线程 numpy 代码都被拖慢 3–5 倍**；
+- **★ 两条跨项目通用的测量纪律**（本轮各栽一次，已写进技能但这里留一句指针）：
+  ① **不要让任何库按 `nproc` 决定线程池**——超订 10 倍 ⇒ cgroup 周期性冻结 ⇒
+     **连进程里无关的单线程 numpy 代码都被拖慢 3–5 倍**；
   ② **不要在饱和的机器上做优化决策**——先跑 `vendor/sim_scripts/probe_cpu.py` 拿跨机可比定标。
+- **★ 一条更普适的**：**自检通过 ≠ 正确**。"反投影回原框"是往返自消、抓不到整体错一个角度；
+  "地图看着对"抓不到所有物体被转过一个角；两阶段复算"跑通了"抓不到它丢了航向。
+  **判据要落在具体量上**（npz 里到底有没有那个数、同一批数据两平台是否逐字一致）。

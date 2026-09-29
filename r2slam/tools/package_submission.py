@@ -213,6 +213,28 @@ def audit_source(key, label, out_root, checks):
     return {"video": mp4, "pcd": pcd, "summary": smy, "table": tab}
 
 
+def unpaired_note(have) -> str:
+    """The image-pairing shortfall, read from the run's own summary.
+
+    Hard-coding a number here, or leaving a `%d` unformatted, is how a shipped
+    README ends up telling a judge something that is not true about the run.
+    The first version of this file did exactly that.
+    """
+    for key in ("real", "sim"):
+        h = have.get(key)
+        if not h:
+            continue
+        try:
+            s = json.load(open(h["summary"], encoding="utf-8"))
+        except Exception:
+            continue
+        ss = s.get("source_stamps") or {}
+        if "unpaired" in ss:
+            return ("%d / %d" % (ss["unpaired"], ss.get("paired_with_image", 0)
+                                 + ss["unpaired"]))
+    return "少量（本次运行的 summary.json 里未记录）"
+
+
 def write_readme(dest, have, cfg_name):
     """The outward-facing note.  Lives in the package, so it must stand alone."""
     lines = [
@@ -268,7 +290,8 @@ def write_readme(dest, have, cfg_name):
         "",
         "* 真实数据集**没有提供真值轨迹**，轨迹的可信度来自三条内部判据（逐帧步长中位数 0.085 m、",
         "  帧间隔均匀到 ±1 ms、隐含速度 0.87 m/s 与步行一致）。**绝对精度需要组委会真值才能断言。**",
-        "* 真实数据集有 %d 帧在 0.1 s 内没有可配对的图像，这些帧只做几何建图，不做检测。",
+        "* 真实数据集有 %s 帧在 0.1 s 内没有可配对的图像，这些帧只做几何建图，不做检测。"
+        % unpaired_note(have),
         "* 实时性数字来自 Xeon + 8 核配额的容器，**不代表嵌入式平台**；在线栈本体不含出图。",
         "* 仿真里的行人模型是**静态道具**（官方 world 中 `<actor>` 出现 0 次），",
         "  动态人员只有真实数据侧能体现。",
