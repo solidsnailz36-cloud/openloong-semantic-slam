@@ -350,15 +350,26 @@ class PathPlanner:
         return None, None
 
     def plan(self, wmap, start_xy: Tuple[float, float],
-             goal_xy: Tuple[float, float]) -> Optional[List[Tuple[float, float]]]:
+             goal_xy: Tuple[float, float],
+             max_snap_cells: int = 4) -> Optional[List[Tuple[float, float]]]:
         free = self.free_space(wmap)
         n = free.shape[0]
         sx, sy = (int(v) for v in wmap.cell_of(*start_xy))
         gx, gy = (int(v) for v in wmap.cell_of(*goal_xy))
         if not (0 <= sx < n and 0 <= sy < n and 0 <= gx < n and 0 <= gy < n):
             return None
+        # The *start* may sit in the inflation shell -- the robot is allowed to
+        # stand next to a wall it must clear -- so it snaps generously.  The
+        # goal may not.  Snapping the goal without a limit was a real failure:
+        # a couch localised from a single detection landed inside a wall, the
+        # nearest free cell was two cells away *beside the robot*, and the plan
+        # became a 0.24 m path to a spot at its own feet.  The navigator then
+        # arced around a 0.24 m circle for 674 s -- 158.65 m driven for 5.78 m
+        # of progress, efficiency 0.04 -- and never once reported a problem,
+        # because from its point of view it had a path and was following it.
+        # A goal that is not reachable has to say so.
         sx, sy = self._nearest_free(free, sx, sy)
-        gx, gy = self._nearest_free(free, gx, gy)
+        gx, gy = self._nearest_free(free, gx, gy, max_r=max_snap_cells)
         if sx is None or gx is None:
             return None
         start, goal = (sx, sy), (gx, gy)
@@ -435,13 +446,33 @@ class SemanticNavigator:
                  arrive_dist: float = 0.9, turn_only_deg: float = 30.0,
                  replan_every: int = 10, robot_radius: float = 0.25,
                  min_obs: int = 2, max_turn_frames: int = 45,
-                 backoff_frames: int = 8):
+                 backoff_frames: int = 8,
+                 arc_scale: float = 0.40, arc_max_deg: float = 90.0,
+                 stuck_frames: int = 150, stuck_improve_m: float = 0.3):
         self.query = str(target)
         self.label = find_label(target)
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.arrive_dist = float(arrive_dist)
         self.turn_only_deg = float(turn_only_deg)
+        # Same "arc instead of pirouette" rule as the explorer, and for the same
+        # reason -- see `FrontierExplorer.arc_scale`.  It is *safer* here than
+        # there: the route is planned on cells already eroded by the robot
+        # radius, so a slow arc along it cannot leave the safe corridor.
+        self.arc_scale = float(arc_scale)
+        self.arc_max_deg = float(arc_max_deg)
+        self.n_arc_frames = 0
+        # --- "I cannot get there" must have a deadline ----------------------
+        # Without one, a navigator with a stale or impossible goal just keeps
+        # driving: measured on the simulator, 674 s of arcing inside a
+        # 0.6 x 1.5 m box, 158.65 m of wheel travel for 5.78 m of progress, and
+        # a state machine that was perfectly happy the whole time.  The test is
+        # "have I got closer lately", not "have I moved": circling moves.
+        self.stuck_frames = int(stuck_frames)
+        self.stuck_improve_m = float(stuck_improve_m)
+        self._best_d = float("inf")
+        self._stuck_since = 0
+        self.n_stuck = 0
         self.replan_every = int(replan_every)
         self.min_obs = int(min_obs)
         self.planner = PathPlanner(robot_radius=robot_radius)
@@ -497,6 +528,24 @@ class SemanticNavigator:
             self._backoff = 0
             return 0.0, 0.0, self.info(dist=round(d, 2))
 
+        # ---- progress check: closer lately, or say so and stop -------------
+        # The measured failure this ends: 674 s of arcing in a 0.6 x 1.5 m box,
+        # 158.65 m driven for 5.78 m of progress.  Every frame of that had a
+        # state of `arc`, a path, and no complaint.  "Getting closer" is the
+        # only honest sign of progress -- distance travelled is not, because
+        # circling travels a great deal.
+        if d < self._best_d - self.stuck_improve_m:
+            self._best_d = d
+            self._stuck_since = self.n_frames
+        elif self.n_frames - self._stuck_since > self.stuck_frames:
+            self.n_stuck += 1
+            self.state = "stuck"
+            self.finished = True
+            return 0.0, 0.0, self.info(
+                dist=round(d, 2),
+                why="no progress for %d frames (closest ever %.2f m, now "
+                    "%.2f m)" % (self.stuck_frames, self._best_d, d))
+
         if self._backoff > 0:
             self._backoff -= 1
             self.state = "backoff"
@@ -529,23 +578,30 @@ class SemanticNavigator:
         err = float(np.arctan2(aim[1] - pose_xy[1], aim[0] - pose_xy[0]) - yaw)
         err = float(np.arctan2(np.sin(err), np.cos(err)))
         deg = float(np.degrees(err))
-        if abs(deg) > self.turn_only_deg:
-            self._n_turn += 1
-            if self._n_turn > self.max_turn_frames and self._backoff <= 0:
-                self._backoff = self.backoff_frames
-                self._backoff_sign = -self._backoff_sign
-                self._n_turn = 0
-                self.n_backoffs += 1
-            self.state = "turn"
-            return 0.0, float(np.clip(1.6 * err, -self.w_max, self.w_max)), \
+        w = float(np.clip(1.6 * err, -self.w_max, self.w_max))
+        if abs(deg) <= self.turn_only_deg:
+            self._n_turn = 0
+            v = self.v_max * max(0.35,
+                                 1.0 - abs(deg) / self.turn_only_deg * 0.6)
+            self.state = "drive"
+            return float(v), w, self.info(dist=round(d, 2),
+                                          heading_err_deg=round(deg, 1))
+        if abs(deg) <= self.arc_max_deg:
+            # heading is off but the route is clear: arc, do not stop
+            self._n_turn = 0
+            self.n_arc_frames += 1
+            self.state = "arc"
+            return self.v_max * self.arc_scale, w, \
                 self.info(dist=round(d, 2), heading_err_deg=round(deg, 1))
-        self._n_turn = 0
-        v = self.v_max * max(0.35,
-                             1.0 - abs(deg) / self.turn_only_deg * 0.6)
-        w = float(np.clip(1.2 * err, -self.w_max, self.w_max))
-        self.state = "drive"
-        return float(v), w, self.info(dist=round(d, 2),
-                                      heading_err_deg=round(deg, 1))
+        # far off (or wedged): turn on the spot, with the explorer's recovery
+        self._n_turn += 1
+        if self._n_turn > self.max_turn_frames and self._backoff <= 0:
+            self._backoff = self.backoff_frames
+            self._backoff_sign = -self._backoff_sign
+            self._n_turn = 0
+            self.n_backoffs += 1
+        self.state = "turn"
+        return 0.0, w, self.info(dist=round(d, 2), heading_err_deg=round(deg, 1))
 
     def _lookahead(self, pose_xy) -> Tuple[float, float]:
         """Furthest waypoint within 1.2 m, so the base does not weave."""

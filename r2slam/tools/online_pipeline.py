@@ -112,6 +112,10 @@ def parse_args():
                          "--goto '沙发' / --goto sofa.  With --explore it first "
                          "looks around until the class appears on the map.")
     ap.add_argument("--v-max", type=float, default=0.55, help="m/s")
+    ap.add_argument("--no-sweep", action="store_true",
+                    help="disable the 'go and stand somewhere never visited' "
+                         "motive, leaving only frontier (the A/B control for "
+                         "measuring what it is worth)")
     ap.add_argument("--w-max", type=float, default=0.9, help="rad/s")
     ap.add_argument("--out-fps", type=float, default=0.0,
                     help="playback fps; 0 = keep the source rate")
@@ -314,9 +318,10 @@ def main():
     if a.explore:
         if a.npz:
             raise SystemExit("--explore needs a live source (nothing to drive in --npz mode)")
-        explorer = FrontierExplorer(v_max=a.v_max, w_max=a.w_max)
-        print("explore     : frontier policy  v_max=%.2f m/s  w_max=%.2f rad/s"
-              % (a.v_max, a.w_max))
+        explorer = FrontierExplorer(v_max=a.v_max, w_max=a.w_max,
+                                    sweep=not a.no_sweep)
+        print("explore     : frontier policy  v_max=%.2f m/s  w_max=%.2f rad/s  "
+              "sweep=%s" % (a.v_max, a.w_max, not a.no_sweep))
     if explorer is not None or navigator is not None:
         sender = VelocitySender().start()
 
@@ -358,6 +363,12 @@ def main():
     n_unmapped_total = 0
     n_yaw_missing = 0
     prev_stamp = None
+    # When the wheel is handed to the navigator, and from where.  The finals
+    # score path efficiency (30%), so the number has to come from the actual
+    # driven segment -- not from the planned path length, which is a plan, not
+    # a fact.
+    nav_start_idx = None
+    nav_start_xy = None
 
     try:
         for fr in src:
@@ -522,15 +533,20 @@ def main():
                             or not a.explore)
                 use_nav = acquired or navigator.state == "arrived"
             if use_nav:
+                if nav_start_idx is None:
+                    nav_start_idx = len(wmap.traj)
+                    nav_start_xy = (float(t[0]), float(t[1]))
                 v, w, ex = navigator.command(wmap, (t[0], t[1]), yaw, registry)
                 sender.set(v, w)
                 cmd = dict(ex, v=round(v, 3), w=round(w, 3))
                 cmd["mode"] = "navigate"
+                cmd["policy_state"] = ex.get("mode")
             elif explorer is not None:
                 v, w, ex = explorer.command(wmap, (t[0], t[1]), yaw)
                 sender.set(v, w)
                 cmd = dict(ex, v=round(v, 3), w=round(w, 3))
                 cmd["mode"] = "explore"
+                cmd["policy_state"] = ex.get("mode")
             prev_cmd_w = (cmd or {}).get("w") or 0.0
             t_explore = time.perf_counter()
 
@@ -675,6 +691,18 @@ def main():
     t1_snap = sysinfo.snapshot()
     throttled = sysinfo.throttle_delta(t0_snap, t1_snap)
 
+    # Path efficiency of the navigation leg (finals: 30% of the mark).  Measured
+    # from the recorded poses over the frames the navigator actually had the
+    # wheel -- a planned path is an intention, a driven one is a measurement.
+    nav_travel = nav_direct = nav_eff = None
+    if nav_start_idx is not None and len(wmap.traj) > nav_start_idx + 1:
+        seg = np.asarray(wmap.traj[nav_start_idx:], dtype=np.float64)
+        d = np.hypot(np.diff(seg[:, 0]), np.diff(seg[:, 1]))
+        nav_travel = round(float(d.sum()), 2)
+        nav_direct = round(float(np.hypot(seg[-1, 0] - nav_start_xy[0],
+                                          seg[-1, 1] - nav_start_xy[1])), 2)
+        nav_eff = round(nav_direct / max(nav_travel, 1e-6), 3)
+
     summary = {
         "config": a.config,
         "name": cfg.name,
@@ -708,6 +736,9 @@ def main():
                      "plan_failures": explorer.n_plan_failures,
                      "frames_straight": explorer.n_straight,
                      "frames_routed": explorer.n_routed,
+                     "frames_arc": explorer.n_arc_frames,
+                     "sweep_targets": explorer.n_sweep_targets,
+                     "targets_picked": explorer.n_picks,
                      "frames_pose_off_map": explorer.n_pose_off_map,
                      "arrivals": explorer.n_arrivals,
                      "barren_targets": explorer.n_barren_targets,
@@ -726,6 +757,10 @@ def main():
                         "path_len_m": round(path_length(navigator.path), 2),
                         "target_instance": (navigator.goal.as_dict()
                                             if navigator.goal is not None else None),
+                        "frames_arc": navigator.n_arc_frames,
+                        "travel_m": nav_travel,
+                        "direct_m": nav_direct,
+                        "path_efficiency": nav_eff,
                         "arrived": bool(navigator.state == "arrived")}
                        if navigator is not None
                        else {"enabled": False, "try": a.goto}),
@@ -865,6 +900,12 @@ def main():
               "(%d plans, %d failed)"
               % (explorer.n_straight, explorer.n_routed,
                  explorer.n_plans, explorer.n_plan_failures))
+        print("  steering          %d frames arcing (driving while turning)"
+              % explorer.n_arc_frames)
+        print("  targets picked    %d  (%d sweep = never-visited floor, "
+              "%d frontier)"
+              % (explorer.n_picks, explorer.n_sweep_targets,
+                 explorer.n_picks - explorer.n_sweep_targets))
         print("  arrivals          %d  (of which %d in a row learned nothing)"
               % (explorer.n_arrivals, explorer.n_barren_targets))
         print("  trajectory        %.2f m over %.1f s" %
@@ -912,9 +953,13 @@ def main():
         print("  query             '%s' -> %s" % (navigator.query,
               L.name(navigator.label) if navigator.label is not None
               else "*** unknown class ***"))
-        print("  final state       %s   (replans %d, back-offs %d)"
-              % (navigator.state, navigator.n_replans, navigator.n_backoffs))
+        print("  final state       %s   (replans %d, back-offs %d, arcs %d)"
+              % (navigator.state, navigator.n_replans, navigator.n_backoffs,
+                 navigator.n_arc_frames))
         print("  path length       %.2f m" % path_length(navigator.path))
+        if nav_travel is not None:
+            print("  travel            %.2f m driven for %.2f m to the goal  "
+                  "(efficiency %.2f)" % (nav_travel, nav_direct, nav_eff))
         if navigator.goal is not None:
             print("  target instance   #%d %s at (%.2f, %.2f), %d observations"
                   % (navigator.goal.id, navigator.goal.name, navigator.goal.x,
@@ -926,6 +971,8 @@ def main():
                      "bad_command": "the word is not a class this map can hold",
                      "drive": "ran out of time while driving",
                      "turn": "ran out of time while turning",
+                     "arc": "ran out of time while arcing",
+                     "stuck": "stopped getting closer to the target",
                      "init": "never started"}.get(navigator.state,
                                                   navigator.state))
         print("  trajectory        %.2f m over %.1f s"

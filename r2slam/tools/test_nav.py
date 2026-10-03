@@ -233,13 +233,64 @@ def main():
     if info["state"] != "unreachable" or v != 0.0:
         fails.append("a walled-off target must be reported unreachable, not driven at")
 
+    # ------------------------------------------- 6. an impossible goal has a name
+    # The measured failure this ends.  A couch localised from ONE detection sat
+    # at y = 3.02 in a house whose free space stopped at y ~ 2.4.  `plan` snapped
+    # the goal to the nearest free cell unconditionally, so the "path" became
+    # 0.24 m long and ended beside the robot.  The navigator then arced around a
+    # 0.24 m circle for 674 s -- 158.65 m driven for 5.78 m of progress,
+    # efficiency 0.04 -- reporting state `arc` and a healthy path the entire
+    # time.  A goal beyond any walkable cell is not a goal.
+    print("\n6) goal inside a wall / beyond the free space")
+    nav6 = SemanticNavigator("sofa")
+    w6 = world()                                   # corridor y in [-1.5, 1.5]
+    reg6 = ObjectRegistry()
+    reg6.update([(6.0, 3.0, 0.4, sofa)], stamp=0.0)   # 1.5 m beyond the wall
+    v6, om6, i6 = nav6.command(w6, (0.0, 0.0), 0.0, reg6)
+    print("   target (6.0, 3.0) vs free |y| <= 1.5 -> state %s  v=%.2f"
+          % (i6["state"], v6))
+    if i6["state"] != "unreachable":
+        fails.append("a goal 1.5 m outside the free space must be unreachable, "
+                     "got %r" % i6["state"])
+    # ...and the converse, so the gate is not simply refusing everything: a goal
+    # beside a wall (inside the free space once un-inflated) must still plan
+    reg6b = ObjectRegistry()
+    reg6b.update([(6.0, 1.2, 0.4, sofa)], stamp=0.0)
+    nav6b = SemanticNavigator("sofa")
+    _v, _om, i6b = nav6b.command(w6, (0.0, 0.0), 0.0, reg6b)
+    print("   target (6.0, 1.2), near the wall  -> state %s" % i6b["state"])
+    if i6b["state"] in ("unreachable", "no_target"):
+        fails.append("a reachable goal near a wall was refused: %r"
+                     % i6b["state"])
+
+    # ------------------------------- 7. "cannot get closer" must have a deadline
+    # Reproduced by holding the robot still: it is commanded, it does not move,
+    # and the check is "have I got closer lately" -- distance travelled is not
+    # evidence, because circling travels a great deal.
+    print("\n7) goal reachable but the robot never actually moves")
+    nav7 = SemanticNavigator("sofa", stuck_frames=30)
+    reg7 = ObjectRegistry()
+    reg7.update([(6.0, 0.0, 0.4, sofa)], stamp=0.0)
+    st7, why7 = None, None
+    for _ in range(300):
+        _v, _om, i7 = nav7.command(w6, (0.0, 0.0), 0.0, reg7)   # never moves
+        st7 = i7["state"]
+        why7 = i7.get("why")
+        if st7 in ("stuck", "arrived"):
+            break
+    print("   state %s after %d frames" % (st7, nav7.n_frames))
+    print("   why: %s" % why7)
+    if st7 != "stuck":
+        fails.append("kept driving without ever getting closer and never said "
+                     "so (state %r)" % st7)
+
     print()
     if fails:
         print("verdict: FAIL (%d)" % len(fails))
         for f in fails:
             print("   - %s" % f)
         return 1
-    print("verdict: PASS (5/5)")
+    print("verdict: PASS (7/7)")
     return 0
 
 

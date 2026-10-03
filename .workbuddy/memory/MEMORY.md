@@ -19,13 +19,14 @@
 ## 复赛：仿真环境（Gazebo Classic + ROS 1 Noetic）
 - 官方包 `gazebo_models.zip` / `src.zip`；`roslaunch vehicle_simulator house_vehicle.launch`。
   **场景 20×15 m 单层住宅（凹形）**；**行人模型是静态道具**（`<actor>` 出现 0 次）。
-- 传感器：**VLP-16 `/velodyne_points` 5 Hz / 5,600 点**（**量程 40 m**）；相机 **HFOV 114.6° / 320×180 / 零畸变**
-  （实测 ~11.6–12.0 Hz）。真值 **`/state_estimation` 200 Hz**（**只用于评分，绝不进产物**）+ `/registered_scan`；
+- 传感器：**VLP-16 `/velodyne_points` 5 Hz / 5,600 点**（**量程 40 m**）；相机 **HFOV 114.6° / 320×180 / 零畸变**。
+  真值 **`/state_estimation` 200 Hz**（**只用于评分，绝不进产物**）+ `/registered_scan`；
   控制 **`/cmd_vel`（TwistStamped）**；**仿真器不提供规划器** ⇒ "场景探索"要自己写 frontier。
 - **cam↔LiDAR 外参不是单位阵** + **LiDAR 不随车体旋转** → 见下面 ★★ 节。
-- 云端 T4 `gpufree-container`：Ubuntu 20.04 + ROS Noetic + Gazebo 11.15.1 预装；80 核/376 GB；llvmpipe + `Xvfb :99`。
-- **版本化副本 `vendor/sim_scripts/`**：`run_online.sh`（**唯一入口**）/ `kill_sim.sh` / `sim_up.sh` / `t4_state.sh` /
-  `probe_cpu.py` / `probe_kiss_rotation.py` / `probe_coverage.py` / `put_pkg.sh` / `rmt.py` / `rr.sh`·`rr_proxy.sh` / `t4_diag.sh`…
+- 云端 T4 `gpufree-container`：Ubuntu 20.04 + ROS Noetic + Gazebo 11.15.1 预装；llvmpipe + `Xvfb :99`。
+- **版本化副本 `vendor/sim_scripts/`**：**唯一入口 `run_online.sh`**；探针 `probe_cpu.py` /
+  `probe_kiss_rotation.py` / `probe_coverage.py`；传输 `put_pkg.sh` / `rmt.py` / `rr.sh`·`rr_proxy.sh`；
+  诊断 `t4_diag.sh` / `t4_state.sh`；清场 `kill_sim.sh` / `sim_up.sh`。
   **凭据只放 `.workbuddy/tmp/ssh_env.sh`，不进 vendor。** 补件模型 `vendor/gazebo_models_patch/hokuyo/`（务必保留）。
 - **容器重启会重置 `/etc/hosts`** ⇒ `models.gazebosim.org` 黑洞化**每次开机后要补一遍**，不补就是经典卡死
   （世界加载永久阻塞、`sim_time` 恒 0、**零报错**）。这是容器里唯一会丢的东西。
@@ -46,18 +47,16 @@
   **入口 `vendor/sim_scripts/run_online.sh`（唯一入口）**。
 - **`tools/package_submission.py` = 终审脚本**：逐条核对（视频≤2min / pcd 字段与字节自洽 /
   **pcd 里每个 label 都在表里** / 两源同表 / 包≤500MB），**任一条 FAIL 就非零退出**。
-- **`nav.py` = 决赛半场**：`ObjectRegistry`（跨帧实例关联）+ `find_label`（中英同义词/最长匹配/模糊）
-  + `PathPlanner`（已知可通行格上 A*，按半径膨胀）+ `SemanticNavigator`（与 FrontierExplorer 同接口）。
-  **`explore.py` 现在也用同一个 `PathPlanner`** —— 探索与导航只差"目标从哪来"。
-- 实测：仿真 5.000 Hz / 5,600 点；真实 10.328 Hz / 49,152 点。**入画率差异是视场比**，不是 bug。
-- **交付三项**：仿真运行视频 + 真实运行视频 + **建图 pcd**（视频取更严口径 **≤2 min + 含可视化界面**）。
+- **`nav.py` = 决赛半场**：`ObjectRegistry` + `find_label`（中英同义词/模糊）+ `PathPlanner`（A*，按半径膨胀）
+  + `SemanticNavigator`（与 FrontierExplorer **同接口**）。**`explore.py` 用的是同一个 `PathPlanner`。**
+- **交付三项**：仿真视频 + 真实视频 + **建图 pcd**（视频取更严口径 **≤2 min + 含可视化界面**）。
   四处换轨＝离线→在线、RTK→室内、19 类→**人物/可通行/物体**、新增**相机-LiDAR 融合**。
-  **不搬 SFPNet**（19 类 SemanticKITTI 与"人物/可通行"不是一回事）——**放弃初赛资产本身就是泛化能力的论证**。
+  **不搬 SFPNet** —— **放弃初赛资产本身就是泛化能力的论证**。
 - **交付物与提交包**：`r2slam/out/{online_sim,online_real}/`（各 run.mp4 + map.pcd + label_table.yaml +
   summary.json + frames.csv）。包 = `提交包/…—【固态蜗牛队】—【张煜晨】—【156****6887】.zip`
-  = **158,919,347 B / md5 `96e1953e3eb7f0da75c0b468af8f0829`**（第五轮重建，终审 0 FAIL / 0 WARN）。
-  ⚠️ 更早的 `70ae5a09…` **已作废**。真实侧 pcd md5 `0580cc1c418ba11577b9436f50b76814` / 407.5 m² / 114.85 m；
-  仿真侧 153.0 m² / 视频 110.84 s。**pcd 字段 `x y z label rgb`（17 B/点，不导 intensity）**。
+  = **158,919,347 B / md5 `96e1953e3eb7f0da75c0b468af8f0829`**（终审 0 FAIL / 0 WARN；更早的
+  `70ae5a09…` **已作废**）。真实侧 pcd md5 `0580cc1c…`。**pcd 字段 `x y z label rgb`（17 B/点，不导 intensity）**。
+  ⚠️ **第六轮的 arc/sweep/nav 改动尚未重出交付物**（见今日日志）。
 - **★ 交付链每一环都要能自我核对**（两次真实事故换来的，详见今日日志）：
   ① **终审 FAIL 时绝不许写 zip**（它曾用一个坏包覆盖掉最后一份好包）；
   ② **传输完要比对远端/本地 md5** —— `get ok` 也可能留下截断文件，而且
@@ -66,39 +65,44 @@
   **`offset_time` 从帧戳倒推** ⇒ `time_offsets_from: end`；猜错是把畸变**翻倍**。
 - **远端 python 环境**：`slam_comp/venv`（`include-system-site-packages` 要改 `true` 才有 `rospy`；
   **`/root/sim/pylibs` 已废弃**——自带 numpy/cv2 会顶掉 venv 的版本）。
-- **改完管线必须先两源各跑 5 帧冒烟**：一个"只在首帧有检出才触发"的 `UnboundLocalError`
-  让仿真连跑三次都没报错，真实走廊第一帧就炸。
-- **改函数签名后必须真跑一次，不能只编译**：本轮两次运行时错（`yaw` 未定义、`has_big` 用在定义前）
-  `compileall` 都是绿的。
+- **改完管线必须先两源各跑 5 帧冒烟；改函数签名后必须真跑一次，不能只编译**：
+  一个"只在首帧有检出才触发"的 `UnboundLocalError` 让仿真连跑三次没报错、真实走廊第一帧就炸；
+  另两次运行时错（`yaw` 未定义、`has_big` 用在定义前）`compileall` 都是绿的。
 
-## 探索策略（四个坑，同一族，都已修 + 都有测试 + 详见方案 §16.5/§17）
-1. **候选只按距离排 ⇒ 极限环**（地图一填满，身边不断冒出孤立前沿格：地面回波射程边缘、椅腿阴影）
-   → **前沿簇连通分量** + `score = 簇大小/(1+距离)` + `min_target_range`（≥1 m）兜"簇大小在连通环上退化"。
-2. **★ 可达性必须是"连通分量"，不是"直线射线"**。射线＝假设机器人能飞：只有门口正对着才可能
-   选中门后的前沿，门在侧面时门后整片区域**永远**被否掉（症状＝看得见门口、进不去）。
-   正解：取**机器人所在可走连通域**，直线不通就 **A\* 规划 + 前视跟随**（复用 `nav.PathPlanner`，
-   探索与导航只差目标从哪来）。实测西侧独立结构 47 格候选、同块、8.4–9.3 m 远 —— 老口径一次没去。
-   **边界**：门口若从未被观测成地面，门后与主域不连通 ⇒ 判为走不到（比射线保守，但射线在那图上连候选格都没有）。
-3. **★★ 地面掩码是"一层点"不是"地面"** ⇒ 谈"塞不塞得下机器人"前**必须先闭运算**。
-   实测 146.7 m² 可通行分成 **57 块**；**第一帧 11.0 m² 分成 327 块**；0.22 m 腐蚀：不闭合 103.1 / 闭合 135.5 m²；
-   第一帧更是 **0.00 m²** ⇒ 策略在第 1 帧宣布"探索完成"。**但闭运算不能穿过已知障碍**
-   （1 格厚的墙会被填掉、两侧就"通"了）⇒ `close(free) & ~dilate(obstacle,3×3)`，只准填"未观测格"。
-4. **停条件不能用"驱动 N 帧没长面积"**：跨 20 m 房子要 180 帧，阈值 40 帧＝**保证半路停下**
-   （实测停下时还剩 516 格可达前沿 / 28 簇 / 最近 6.7 m² 在 1.2 m 外）。
-   正解＝**"到过 N 个目标却没学到新东西"**（到达才携带信息），帧数只留 300 帧兜底。
-   **判据落在"是否真的去过"，不是"过了多少帧"**（第 3 条老坑的同一条道理）。
-- 探索报 done 后管线会 **break**，否则视频后段是定格画面。
-- **覆盖率别用"面积/地皮面积"讲故事**：`vendor/sim_scripts/probe_coverage.py` 读回 `--dump-grids` 的栅格，
-  算"可通行 / 塞得下机器人 / 从终点走得到 / 未知里哪块走得到 + 一张图"。
-  **"146.7/~280≈52%"是错的分母**（280 是地皮、房子是凹的）；正解＝**走遍了可走的 89.5%，没有未进入的房间**。
-- **★★ 这份仿真器上"探索"是假的**。逐帧导出来看：`turn` 464 / `drive` 369 帧（**56% 在转**）、
-  `|cmd_w|>0.1` 占 **96%**、位置包围盒 **2.7×3.6 m**、净位移 1.74 m / 路径 25.97 m（**比值 14.9**）。
-  根因＝LiDAR 世界对齐 ⇒ **转圈不产生任何新信息**；40 m 量程 ⇒ 一个视点基本看完屋子
-  ⇒ **"探索"退化为"微动填地板掩码的洞"**。覆盖率 146.7 → **153.0 m²**（屋内未知 19.7 → 13.8 m²，−30%）
-  是真的，但**不许讲成"探索能力提升"**。下一步＝**"边转边走"（画弧）而不是原地转**（一个参数 + 一条判据，未做）。
-- **`barren_targets` 必须只在"剩下的都是小簇"时才允许停**：第一版无条件生效 ⇒ 270 帧就停、
-  8.0 m² 开口没去、还剩 772 格可用前沿 —— **比它取代的旧判据更差**。
-- 真值对照（`/state_estimation`）**位置 p50 0.20 m** ⇒ 位姿是可信的，上面的"停在 3 m 盒子里"是真的，不是里程计坏。
+## 探索策略（五条硬规则；详见方案 §17/§18 与 `r2slam/README.md`）
+1. **候选只按距离排 ⇒ 极限环** → 前沿簇连通分量 + `score = 簇大小/(1+距离)` + `min_target_range`（≥1 m）。
+2. **★ 可达性是"连通分量"，不是"直线射线"**。射线＝假设机器人能飞（门在侧面时门后**永远**被否掉，
+   症状＝看得见门口、进不去）。正解：机器人所在可走连通域 + 直线不通就 **A\* 规划 + 前视跟随**
+   （复用 `nav.PathPlanner`，**探索与导航只差目标从哪来**）。**边界**：门口若从未被观测成地面 ⇒ 判为走不到。
+3. **★★ 地面掩码是"一层点"** ⇒ 谈"塞不塞得下机器人"前**必须先闭运算**
+   （146.7 m² 分 57 块；**第一帧 0.00 m²** ⇒ 策略在第 1 帧宣布"探索完成"），
+   但**不能穿过已知障碍** ⇒ `close(free) & ~dilate(obstacle,3×3)`。
+4. **航向差不是停车的理由 —— 该画弧**：三档油门（前挡 ⇒ 原地转；≤25° ⇒ 直行；
+   **中间且"转过去之后的方向"为空 ⇒ 走弧**，半径 `v/w ≈ 0.24 m`，比机器人本体还小）。
+   旧版"先转到位再走"实测 **56% 的帧在原地转**、25.97 m 只挪 1.74 m。近 180° 掉头仍原地转。
+5. **★ 大视场传感器上 frontier 不够用**：40 m 世界对齐扫描器**一个视点看完屋子** ⇒ 前沿都在身边一两米，
+   而**真能走到**的 100.4 m² 里 **94 m² 从没靠近过**（中位 4.57 m）。⇒ 新增 `sweep`：去"从没靠近过的可达地面"
+   （用 `wmap.traj` 标访问过的位置），frontier 兜底。价值是**把目标放远、从而逼出 A\* 绕行**：
+   同场景对照 —— **关 sweep：`0 帧在规划路径上` / 138.5 m² / 24.6 m；开 sweep：`456 帧` / **165.9 m²（+19.8%）** / 36.3 m**。
+   配套：目标指向**块的深处**（指最近格＝每 0.6 m 换目标的蠕行）；块按**离起点**排序
+   （否则走廊里左右等距时来回横跳，实测 214 帧只挪 0.61 m）。
+- **★ 判据三次盯错量**（症状每次相同：机器人停下，而理由听起来很合理）：
+  停条件盯“**过了多少帧**”（原地转一帧也不产生信息）→ 改“到过目标却没学到东西”；
+  可达性盯“**直线**”（机器人不能飞）→ 改连通分量；
+  停滞盯“**看到的地面**”（走过新地方不长这个量）→ 改“**没走过的地面**”。
+  **每个“什么都没发生”的判据，都要说清它盯的是哪个量。**
+- **`barren_targets` 只在“剩下的都是小簇”时才允许停**（第一版无条件 ⇒ 270 帧就停、
+  还剩 772 格可用前沿，**比它取代的旧判据更差**）。探索报 done 后管线 **break**，否则视频后段是定格画面。
+- **覆盖率口径**：`vendor/sim_scripts/probe_coverage.py` 读回 `--dump-grids` 的栅格 + 出一张图。
+  **“146.7/~280≈52%”是错的分母**（280 是地皮、房子是凹的）。
+  ⚠️ **`traversable_area_m2` 衡量的是“看到”不是“走过”** —— 混淆这两者会把“测量”当成“探索”。
+- **★★ 导航（决赛）两条**：① **终点不许 snap**（起点可以）—— 一个只观测 1 次的目标落在可通行空间外，
+  终点被 snap 到**脚边 0.24 m**，“路径”成了短线，导航以 0.24 m 半径**绕了 674 s、
+  158.65 m 只前进 5.78 m（效率 0.04）**，**而状态机全程认为自己健康**；现在不可达 ⇒ `unreachable`。
+  ② **`stuck` 期限**：`_best_d` 在 N 帧内没再缩短就报 `stuck` ——
+  **判据是“是否更接近”，不是“是否在动”**（绕圈也在动）。
+  **“反投影自检”和“地图看着对”都抓不到这个错。**
+- 真值对照（`/state_estimation`）**位置 p50 0.20 m** ⇒ 位姿可信，“停在 3 m 盒子里”是真的，不是里程计坏。
 
 ## 复赛：感知（"能否检出人物"＝ **能**）
 - 检测器 `vendor/detector/tiny-yolov3-11.onnx`（35.5 MB，COCO **80 类**，person=0）+ **onnxruntime**；
@@ -157,12 +161,10 @@
 - **每个会话开头先补 PATH**：`export PATH="/c/Users/ZhuanZ/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:$PATH"`
   （Bash 工具本机缺 coreutils，`dirname`/`tail` 都会 command not found）。
 - **含中文的路径**：存在性判断一律用 Python `os.path.exists`，不要用 Git Bash 的 ls/cd/find。
-- **调远端 / 传文件前先** `export MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1` —— 否则 Git Bash 会把远端
-  POSIX 路径改写成 Windows 路径，SFTP 报 **ENOENT「No such file」而远端明明存在**。
 - 其余硬规则已固化在技能里，不在这里重复：`remote-job-and-snapshot`（Windows↔远端四坑、长任务脱 channel、
   快照、**§7.1 第三方节点+对照组**、**§9.1 任何库的线程池都要限 / §9.2 别在饱和机器上优化 / §9.3 落盘→复算 /
   §9.4 后台线程要上报失败**）、`gazebo-classic-headless-container`（pkill 自杀、`set +u`、`check_world_models.py`、
-  只认 `sim_time`、`stdbuf`、catkin 0 字节 CMakeLists、**驱动三要求 + frontier 六要点**）、
+  只认 `sim_time`、`stdbuf`、catkin 0 字节 CMakeLists、**驱动三要求 + frontier 八要点**）、
   `competition-submission-final-audit`（"新的一件+旧的三件"、近似公式先怀疑公式）、
   `lidar-map-forensics`（RTK 只取 `status==2`、平滑"改正量"陷阱）。
 - **同一文件多处修改必须串行发 Edit**（并行会互相覆盖）；`Write` 覆盖前先 `Read`。

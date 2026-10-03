@@ -65,12 +65,76 @@ class FrontierExplorer:
                  reach_dist: float = 0.7, min_target_range: float = 1.0,
                  stagnate_frames: int = 300, stagnate_eps: float = 0.5,
                  barren_targets: int = 8,
-                 robot_radius: float = 0.22, replan_every: int = 12):
+                 robot_radius: float = 0.22, replan_every: int = 12,
+                 arc_scale: float = 0.40, arc_max_deg: float = 90.0,
+                 arc_probe_deg: float = 40.0,
+                 sweep: bool = True, sweep_radius: float = 0.60,
+                 sweep_min_m2: float = 3.0, sweep_min_dist: float = 0.50,
+                 sweep_commit_frames: int = 300):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
         self.front_stop = float(front_stop)
         self.turn_only_deg = float(turn_only_deg)
+        # --- "turn then drive" vs "steer while driving" ---------------------
+        # The first version zeroed the throttle whenever the heading error
+        # exceeded `turn_only_deg`, i.e. it always turned on the spot first.
+        # On the simulator that produced a robot which spent 56% of its frames
+        # turning: |w| > 0.1 in 96% of frames, a 2.7 x 3.6 m position bounding
+        # box, and 25.97 m of wheel travel for 1.74 m of net displacement
+        # (ratio 14.9).  Nothing about that is wrong *physically* -- it is the
+        # textbook skid-steer behaviour -- but on a base whose scanner does not
+        # rotate with it, turning in place is also the one manoeuvre that
+        # generates no information at all, so the video shows a robot pirouetting
+        # in the middle of a room.
+        #
+        # So: turning is only forced when the direction the robot is about to
+        # move into is actually blocked.  If the *steered* heading is clear, the
+        # base arcs -- slow enough that the arc radius stays under the robot's
+        # own footprint (v*w^-1 = 0.22/0.9 = 0.24 m at the defaults), which is
+        # the conservative end of what a differential base can do.
+        self.arc_scale = float(arc_scale)          # throttle fraction while arcing
+        self.arc_max_deg = float(arc_max_deg)      # beyond this, turn on the spot
+        self.arc_probe_deg = float(arc_probe_deg)  # how far ahead to look, rotated
+
+        # --- go and *stand* somewhere new -----------------------------------
+        # The frontier heuristic answers "where does the map end?" and that is
+        # the right question for a short-range scanner.  This simulator's 40 m
+        # scanner makes it the wrong one: measured on a full run, the robot
+        # covered 1.7 x 4.3 m of floor while the map reported 148.8 m2 of
+        # traversable ground, because the scanner sees through the whole house
+        # from one viewpoint.  Of the 100.4 m2 it could actually walk to, **95.4
+        # m2 was never approached** (median distance 4.57 m) -- while every
+        # frontier cell it was offered sat within a metre or two of itself, at
+        # the edge of the furniture shadows.  So the map was measured, not
+        # explored.
+        #
+        # `sweep` adds the missing motive: prefer a reachable patch of floor the
+        # robot has never been near.  Frontier remains the fallback, so nothing
+        # is lost when there is genuinely unexplored space at the rim.
+        self.sweep = bool(sweep)
+        self.sweep_radius = float(sweep_radius)    # "has been near" radius
+        self.sweep_min_m2 = float(sweep_min_m2)    # smallest patch worth a trip
+        # How far *inside* untouched ground a candidate has to be, in metres.
+        # It is a depth, not a distance from the robot: see `_fresh_depth`.
+        self.sweep_min_dist = float(sweep_min_dist)
+        self._dt = None
+        self._dt_key = None
+        # A sweep target is a *trip*, not a nudge, and it needs a commitment to
+        # match.  `commit_frames = 25` (5 s at 5 Hz, 2.75 m at v_max) is right
+        # for frontier cells a metre away and wrong for a target ten metres
+        # away: measured, the robot re-chose its goal every 5 s and never
+        # reached one, walking 35.75 m for 4.21 m of net displacement while
+        # "heading for" somewhere it never arrived at.  Arrival, or the patch
+        # stopping being new, ends a sweep target -- the frame count is only a
+        # backstop against a goal that turns out to be unreachable.
+        self.sweep_commit_frames = int(sweep_commit_frames)
+        self.n_sweep_targets = 0
+        self.n_picks = 0                # times a new target was chosen at all
+        self._target_kind = "frontier"
+        self._start_xy = None          # where the run began: sweep grows outward
+        self._visited_key = None
+        self._visited = None
         self.min_cluster = int(min_cluster)
         self.centre_tol = float(centre_tol)
         self.clearance_step = float(clearance_step)
@@ -180,6 +244,7 @@ class FrontierExplorer:
         self.n_plan_failures = 0
         self.n_straight = 0            # frames the direct line was usable
         self.n_routed = 0              # frames spent following a planned path
+        self.n_arc_frames = 0          # frames that steered AND drove at once
         # A search costs a flood fill in the worst case, so only the head of the
         # candidate list is tried.  Measured on the house: the winner is almost
         # always the first or second candidate, because the score already
@@ -348,6 +413,27 @@ class FrontierExplorer:
         counts = np.bincount(lab.ravel(), minlength=n_lab)
         return bool(counts[1:].max() >= self.min_frontier_cells)
 
+    def _has_big_fresh(self, wmap, reach) -> bool:
+        """Is there still a patch of never-visited floor worth a trip?
+
+        The barren-trip guard needs this.  Arriving somewhere new does not
+        necessarily enlarge `traversable` -- on this simulator the scanner saw
+        the whole house from its first pose -- so without it the guard would end
+        a sweep *because* it was sweeping.  Same size floor as the target
+        chooser, so the two cannot disagree about whether work is left.
+        """
+        vis = self._visited_mask(wmap)
+        fresh = reach & ~vis
+        if not fresh.any():
+            return False
+        n_lab, lab = cv2.connectedComponents(fresh.astype(np.uint8),
+                                             connectivity=8)
+        if n_lab <= 1:
+            return False
+        counts = np.bincount(lab.ravel(), minlength=n_lab)
+        need = self.sweep_min_m2 / wmap.resolution ** 2
+        return bool(counts[1:].max() >= need)
+
     def _usable_frontier(self, wmap, free, unknown, reach, exterior):
         """Frontier cells the robot could actually stand at and act on.
 
@@ -413,6 +499,136 @@ class FrontierExplorer:
         if y1 <= y0 or x1 <= x0:
             return False
         return bool(front[y0:y1, x0:x1].any())
+
+    # -------------------------------------------------------------- sweeping
+    def _visited_mask(self, wmap) -> np.ndarray:
+        """Cells the robot has been within `sweep_radius` of.
+
+        Rebuilt from the recorded poses, cached on the trajectory length so it
+        costs one pass over the run rather than one per frame.  Stamping a disc
+        per pose is the cheap way to say "near here"; the alternative -- growing
+        a corridor along the polyline -- is the same picture with more code.
+        """
+        key = len(wmap.traj)
+        if key == self._visited_key and self._visited is not None:
+            return self._visited
+        n = wmap.ground.shape[0]
+        m = np.zeros((n, n), np.uint8)
+        k = max(1, int(round(self.sweep_radius / wmap.resolution)))
+        for p in wmap.traj:
+            c = wmap.cell_of(p[0], p[1])
+            cv2.circle(m, (int(c[0]), int(c[1])), k, 1, -1)
+        self._visited_key, self._visited = key, (m > 0)
+        return self._visited
+
+    def _fresh_area(self, wmap, reach, x0, y0) -> float:
+        """Walkable floor the robot has never been near, in m2.
+
+        This -- not `ground.sum()` -- is what "how much is left" means once the
+        motive is "go somewhere you have not been".  See the note at the guard.
+        """
+        vis = self._visited_mask(wmap)
+        fresh = reach & ~vis
+        if fresh.any():
+            # the robot's own footprint counts as visited even on frame one
+            fresh = fresh.copy()
+            k = max(1, int(round(self.sweep_radius / wmap.resolution)))
+            c = wmap.cell_of(x0, y0)
+            cv2.circle(fresh.view(np.uint8), (int(c[0]), int(c[1])), k, 0, -1)
+        return float(fresh.sum()) * wmap.resolution ** 2
+
+    def _fresh_depth(self, wmap) -> np.ndarray:
+        """Distance from every cell to the nearest *visited* cell, in cells.
+
+        This is what "how untouched is this spot" means, and it is the right
+        score for a sweep target.  Aiming at the cell furthest *from the robot*
+        keeps re-selecting the same side of the corridor: measured, coverage
+        stalled at 58% of a 6x3 m corridor and the third goal went back to the
+        end it had already visited.  Aiming at the cell furthest *from anywhere
+        the robot has been* walks the untouched ground outward instead.
+        """
+        vis = self._visited_mask(wmap)
+        key = (self._visited_key, "dt")
+        if key == self._dt_key and self._dt is not None:
+            return self._dt
+        self._dt = cv2.distanceTransform((~vis).astype(np.uint8),
+                                        cv2.DIST_L2, 5)
+        self._dt_key = key
+        return self._dt
+
+    def _pick_sweep_target(self, wmap, reach, x0, y0):
+        """Nearest sizeable reachable patch of floor the robot has never been near.
+
+        Nearest first, so the walk grows outward instead of leapfrogging to the
+        far corner.  Each candidate is checked with the *planner* before it is
+        accepted: a patch can sit inside the robot's own connected free space and
+        still need a route this map cannot yet express.  `max_plans_per_pick`
+        caps the search so a pathological map cannot stall the control loop.
+        """
+        vis = self._visited_mask(wmap)
+        fresh = reach & ~vis
+        # On frame one `traj` is empty, so *every* walkable cell looks
+        # never-visited -- including the one under the robot.  Without this the
+        # nearest cell of every cluster is the robot's own footprint, the
+        # distance gate rejects all of them, and the sweep finds nothing to do
+        # on the one frame where there is most to do.  Stamped rather than
+        # folded into `_visited_mask` so the cache key stays the trajectory.
+        if fresh.any():
+            fresh = fresh.copy()
+            k = max(1, int(round(self.sweep_radius / wmap.resolution)))
+            c = wmap.cell_of(x0, y0)
+            cv2.circle(fresh.view(np.uint8), (int(c[0]), int(c[1])), k, 0, -1)
+        if not fresh.any():
+            return None
+        n, lab = cv2.connectedComponents(fresh.astype(np.uint8), connectivity=8)
+        if n <= 1:
+            return None
+        sz = np.bincount(lab.ravel(), minlength=n)
+        cell = wmap.resolution ** 2
+        sx, sy = self._start_xy if self._start_xy is not None else (x0, y0)
+        depth = self._fresh_depth(wmap)
+        min_depth = self.sweep_min_dist / wmap.resolution
+        cands = []
+        for L in range(1, n):
+            if sz[L] * cell < self.sweep_min_m2:
+                continue
+            ys, xs = np.nonzero(lab == L)
+            wx = (xs + 0.5) * wmap.resolution - wmap.extent
+            wy = (ys + 0.5) * wmap.resolution - wmap.extent
+            d_start = np.hypot(wx - sx, wy - sy)
+            # Aim *deep* inside the patch -- the cell furthest from anywhere the
+            # robot has been -- rather than at the rim of the visited disc or at
+            # whatever happens to be furthest from the robot right now.  Rank
+            # the patches by how far they are from where the run began, so the
+            # walk grows outward instead of ping-ponging between two patches
+            # that are equidistant from the robot (measured: 214 frames, 0.61 m
+            # of net displacement, in the first version of this).
+            dep = depth[ys, xs]
+            j = int(np.argmax(dep))
+            if dep[j] < min_depth:
+                continue                      # too small or already well covered
+            cands.append((float(d_start.min()), float(wx[j]), float(wy[j]),
+                          int(sz[L])))
+        cands.sort(key=lambda c: c[0])
+        for _d, tx, ty, ncell in cands[:self.max_plans_per_pick]:
+            path = self.planner.plan(wmap, (x0, y0), (tx, ty))
+            if path:
+                self.n_plans += 1
+                return tx, ty, path, ncell
+            self.n_plan_failures += 1
+        return None
+
+    def _still_unvisited(self, wmap, tx, ty) -> bool:
+        """Is a committed sweep target still somewhere new?"""
+        vis = self._visited_mask(wmap)
+        cx, cy = wmap.cell_of(tx, ty)
+        cx, cy = int(cx), int(cy)
+        k = max(2, int(round(self.sweep_radius / wmap.resolution)))
+        ys, ye = max(cy - k, 0), min(cy + k + 1, wmap.n)
+        xs, xe = max(cx - k, 0), min(cx + k + 1, wmap.n)
+        if ye <= ys or xe <= xs:
+            return False
+        return bool((~vis[ys:ye, xs:xe]).any())
 
     def _plan(self, wmap, pose, goal) -> Optional[List[Tuple[float, float]]]:
         """A* to `goal`, throttled exactly like the navigator throttles its own.
@@ -580,28 +796,47 @@ class FrontierExplorer:
         # translated, and the guard needs that many of them.
         area = float(wmap.ground.sum()) * wmap.resolution ** 2
         x0, y0 = float(pose_xy[0]), float(pose_xy[1])
+        if self._start_xy is None:
+            self._start_xy = (x0, y0)          # sweep grows outward from here
         moved = (0.0 if self._last_pose is None
                  else float(np.hypot(x0 - self._last_pose[0],
                                      y0 - self._last_pose[1])))
         self._last_pose = (x0, y0)
-        if self._last_area is None or area > self._last_area + self.stagnate_eps:
-            self._last_area = area
-            self._stagnant = 0
-        elif moved >= 0.03:                     # driving, and learning nothing
-            self._last_area = max(self._last_area, area)
-            self._stagnant += 1
-        if self._stagnant >= self.stagnate_frames:
-            self.state = "done"
-            self.n_done_reason = ("drove without adding area for %d frames "
-                                  "(%.1f m2 known, %g m2 per frame min)"
-                                  % (self.stagnate_frames, area,
-                                     self.stagnate_eps))
-            return 0.0, 0.0, {"state": "done", "nf": 0,
-                              "why": self.n_done_reason,
-                              "area_m2": round(area, 1)}
 
         free, unknown = self._free_unknown(wmap)
         reach, exterior = self._masks(wmap, (x0, y0))
+
+        # What counts as "learning nothing"?  With `sweep` on, the honest answer
+        # is *unvisited walkable floor*, not *seen floor*.  Driving over ground
+        # the scanner has already mapped adds no `ground` cells, so the old
+        # measure declared a robot that was walking across the house "stagnant"
+        # after 300 driven frames: measured, it stopped at 96 s having got near
+        # 16 m2 of the 118.8 m2 it could reach.  Every "nothing is happening"
+        # guard has to name the quantity it watches, and this one had named the
+        # wrong one -- for the third time in this policy (frames instead of
+        # metres, ray instead of connectivity, seen instead of visited).
+        if self.sweep:
+            knowledge = self._fresh_area(wmap, reach, x0, y0)
+        else:
+            knowledge = area
+        if (self._last_area is None
+                or knowledge > self._last_area + self.stagnate_eps):
+            self._last_area = knowledge
+            self._stagnant = 0
+        elif moved >= 0.03:                     # driving, and learning nothing
+            self._last_area = max(self._last_area, knowledge)
+            self._stagnant += 1
+        if self._stagnant >= self.stagnate_frames:
+            self.state = "done"
+            self.n_done_reason = ("drove without progress for %d frames "
+                                  "(%.1f m2 mapped, %.1f m2 never walked, "
+                                  "%g m2 per frame min)"
+                                  % (self.stagnate_frames, area, knowledge,
+                                     self.stagnate_eps))
+            return 0.0, 0.0, {"state": "done", "nf": 0,
+                              "why": self.n_done_reason,
+                              "area_m2": round(area, 1),
+                              "fresh_m2": round(knowledge, 1)}
         inside, facing_out, front = self._usable_frontier(wmap, free, unknown,
                                                          reach, exterior)
         # Prefer frontier that opens onto the house; fall back to the wall ring
@@ -609,6 +844,9 @@ class FrontierExplorer:
         # than declaring victory while an unexplored room sits next door.
         frontier_used, which = self._choose_frontier_mask(inside, facing_out)
         has_big = self._has_big_cluster(frontier_used)
+        if not has_big and self.sweep:
+            # never-visited floor counts as outstanding work too
+            has_big = self._has_big_fresh(wmap, reach)
         n_inside = int(inside.sum()) if inside is not None else 0
         n_out = int(facing_out.sum()) if facing_out is not None else 0
         x0, y0 = float(pose_xy[0]), float(pose_xy[1])
@@ -632,16 +870,23 @@ class FrontierExplorer:
             info["why"] = self.n_done_reason
             return 0.0, 0.0, info
 
-        if frontier_used is None or not frontier_used.any():
-            # Nothing reachable left anywhere: this, not a frame counter, is the
-            # honest end of an exploration run.
+        if (frontier_used is None or not frontier_used.any()) and not has_big:
+            # Nothing reachable left anywhere -- no frontier to open AND no
+            # floor the robot has never stood on.  This, not a frame counter,
+            # is the honest end of an exploration run.  (On a map whose scanner
+            # has already seen everything, `frontier_used` is empty from frame
+            # one while the floor is untouched; the `has_big` half of the
+            # condition is what keeps that from ending the run immediately.)
             self.state = "done"
-            self.n_done_reason = ("no reachable frontier left (%d reachable, "
-                                  "%d facing the outside, %.1f m2 known)"
-                                  % (n_inside, n_out, area))
+            self.n_done_reason = ("no reachable frontier left and no unvisited "
+                                  "floor (%d reachable, %d facing the outside, "
+                                  "%.1f m2 known)" % (n_inside, n_out, area))
             info["state"] = "done"
             info["why"] = self.n_done_reason
             return 0.0, 0.0, info
+
+        if frontier_used is None:                  # a complete map: no candidates
+            frontier_used = np.zeros_like(front)
 
         ys, xs = np.nonzero(frontier_used)
         # cells -> world metres (cell centre)
@@ -665,7 +910,9 @@ class FrontierExplorer:
         prev_target = self._target          # for the switch counter below: the
         # commitment block clears `_target` on arrival, so comparing against it
         # inside the branch would compare against None and count nothing
-        if self._target is not None and self._target_age < self.commit_frames:
+        if self._target is not None and self._target_age < (
+                self.sweep_commit_frames if self._target_kind == "sweep"
+                else self.commit_frames):
             tx, ty = self._target
             d = float(np.hypot(tx - x0, ty - y0))
             if d <= self.reach_dist:
@@ -678,7 +925,9 @@ class FrontierExplorer:
                     self.n_barren_targets += 1
                 self._area_at_target = area
                 self._target = None
-            elif self._target_still_frontier(wmap, tx, ty):
+            elif (self._still_unvisited(wmap, tx, ty)
+                  if self._target_kind == "sweep"
+                  else self._target_still_frontier(wmap, tx, ty)):
                 reuse = True
             else:
                 self._target = None
@@ -689,16 +938,31 @@ class FrontierExplorer:
             tx, ty = self._target
             route = self._path if self._path else None
         else:
-            pick, route, n_cand = self._pick_target(
-                wmap, x0, y0, yaw, (x0, y0), wx, wy, dist, fsize,
-                in_range, xs, ys, front, frontier_used)
-            if pick is None:
-                target_res = None
+            self.n_picks += 1
+            # Sweep first: go and stand somewhere the robot has never been.
+            # Frontier answers "where does the map end", which on this
+            # 40 m world-aligned scanner is always a furniture shadow two
+            # metres away -- see the note on `sweep` in __init__.
+            sw = (self._pick_sweep_target(wmap, reach, x0, y0)
+                  if self.sweep else None)
+            if sw is not None:
+                target_res = (sw[0], sw[1])
+                route = sw[2]
+                self._target_kind = "sweep"
+                self.n_sweep_targets += 1
+                n_cand = sw[3]
             else:
-                i = pick
-                # stabilise on the centroid of the chosen cluster
-                sel = np.hypot(wx - wx[i], wy - wy[i]) <= 1.0
-                target_res = (float(wx[sel].mean()), float(wy[sel].mean()))
+                self._target_kind = "frontier"
+                pick, route, n_cand = self._pick_target(
+                    wmap, x0, y0, yaw, (x0, y0), wx, wy, dist, fsize,
+                    in_range, xs, ys, front, frontier_used)
+                target_res = None
+                if pick is not None:
+                    i = pick
+                    # stabilise on the centroid of the chosen cluster
+                    sel = np.hypot(wx - wx[i], wy - wy[i]) <= 1.0
+                    target_res = (float(wx[sel].mean()),
+                                  float(wy[sel].mean()))
             if target_res is None:
                 self._target = None
                 self._path = []
@@ -764,16 +1028,35 @@ class FrontierExplorer:
 
         err = float(np.arctan2(aim[1] - y0, aim[0] - x0) - yaw)
         err = float(np.arctan2(np.sin(err), np.cos(err)))     # wrap to +-pi
+        err_deg = abs(float(np.degrees(err)))
         w = float(np.clip(1.6 * err, -self.w_max, self.w_max))
-        ahead = self._ahead_clear(wmap, x0, y0, yaw)
-        blocked = abs(np.degrees(err)) > self.turn_only_deg or not ahead
         # slow down near the target so it does not overshoot into the unknown
         scale = min(1.0, max(float(np.hypot(tx - x0, ty - y0)) / 1.5, 0.35))
-        v = 0.0 if blocked else self.v_max * scale
 
-        self.state = "turn" if blocked else "drive"
+        # --- throttle: three cases, not two --------------------------------
+        # `turn` is now reserved for "the way I am pointing is blocked".  When
+        # the heading is merely *wrong* and the direction being turned towards
+        # is clear, the base arcs instead of stopping -- see `arc_scale`.
+        ahead = self._ahead_clear(wmap, x0, y0, yaw)
+        turn_sign = 1.0 if err > 0 else -1.0
+        if not ahead:
+            mode, v = "turn", 0.0
+        elif err_deg <= self.turn_only_deg:
+            mode, v = "drive", self.v_max * scale
+        elif err_deg <= self.arc_max_deg and self._ahead_clear(
+                wmap, x0, y0,
+                yaw + turn_sign * np.radians(min(err_deg, self.arc_probe_deg))):
+            mode, v = "arc", self.v_max * self.arc_scale * scale
+        else:
+            mode, v = "turn", 0.0
+        blocked = (mode == "turn")
+        if mode == "arc":
+            self.n_arc_frames += 1
+
+        self.state = mode
         self.n_targets += 1
         info.update({"state": self.state,
+                     "mode": mode,
                      "candidates": len(self.last_candidates),
                      "target": (round(tx, 2), round(ty, 2)),
                      "dist": round(float(np.hypot(tx - x0, ty - y0)), 2),
