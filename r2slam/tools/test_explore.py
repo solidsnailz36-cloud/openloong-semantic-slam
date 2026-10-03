@@ -527,13 +527,35 @@ def main():
         fails.append("sweep never arrived anywhere: it re-chose goals instead of "
                      "committing to a trip")
 
+    # ---- 14. a sweep target that is never approached must be abandoned -----
+    # The same failure the navigator had, and the same test: **am I getting
+    # closer**, not "am I moving".  Reproduced by holding the robot still -- it
+    # is commanded, it does not move, and a goal that is never approached has to
+    # be given up rather than driven at for the rest of the run.  Measured on
+    # the simulator: of 5 targets picked only 3 were ever reached, and the final
+    # 300 frames (60 s) went nowhere new.
+    e14 = FrontierExplorer(stagnate_frames=10 ** 9,
+                           sweep_stuck_frames=120)   # off by default: see __init__
+    w14 = seen_all()
+    for _ in range(260):
+        _v, _om, _i = e14.command(w14, (0.0, 0.0), 0.0)
+        w14.traj.append((0.0, 0.0))          # the robot never actually moves
+    print("14) sweep target never approached (robot held still, 260 frames)")
+    print("    picked %d, sweep %d, abandoned as unreachable %d"
+          % (e14.n_picks, e14.n_sweep_targets, e14.n_sweep_abandoned))
+    if e14.n_sweep_targets == 0:
+        fails.append("case 14 lost its meaning: no sweep target was chosen")
+    elif e14.n_sweep_abandoned == 0:
+        fails.append("drove at an unreachable sweep target for 260 frames "
+                     "without giving up on it")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (13 checks)")
+    print("verdict: PASS (14 checks)")
     return 0
 
 

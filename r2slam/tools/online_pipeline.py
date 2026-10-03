@@ -738,6 +738,7 @@ def main():
                      "frames_routed": explorer.n_routed,
                      "frames_arc": explorer.n_arc_frames,
                      "sweep_targets": explorer.n_sweep_targets,
+                     "sweep_abandoned": explorer.n_sweep_abandoned,
                      "targets_picked": explorer.n_picks,
                      "frames_pose_off_map": explorer.n_pose_off_map,
                      "arrivals": explorer.n_arrivals,
@@ -903,9 +904,10 @@ def main():
         print("  steering          %d frames arcing (driving while turning)"
               % explorer.n_arc_frames)
         print("  targets picked    %d  (%d sweep = never-visited floor, "
-              "%d frontier)"
+              "%d frontier, %d sweep abandoned as unreachable)"
               % (explorer.n_picks, explorer.n_sweep_targets,
-                 explorer.n_picks - explorer.n_sweep_targets))
+                 explorer.n_picks - explorer.n_sweep_targets,
+                 explorer.n_sweep_abandoned))
         print("  arrivals          %d  (of which %d in a row learned nothing)"
               % (explorer.n_arrivals, explorer.n_barren_targets))
         print("  trajectory        %.2f m over %.1f s" %

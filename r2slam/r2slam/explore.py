@@ -70,7 +70,9 @@ class FrontierExplorer:
                  arc_probe_deg: float = 40.0,
                  sweep: bool = True, sweep_radius: float = 0.60,
                  sweep_min_m2: float = 3.0, sweep_min_dist: float = 0.50,
-                 sweep_commit_frames: int = 300):
+                 sweep_commit_frames: int = 300,
+                 sweep_stuck_frames: int = 0,
+                 sweep_stuck_improve_m: float = 0.50):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
@@ -129,6 +131,22 @@ class FrontierExplorer:
         # stopping being new, ends a sweep target -- the frame count is only a
         # backstop against a goal that turns out to be unreachable.
         self.sweep_commit_frames = int(sweep_commit_frames)
+        # --- the "give up on a goal I cannot reach" timer: OFF by default ----
+        # It is the navigator's progress test applied to a sweep target, and the
+        # reasoning was sound (5 targets picked, 3 reached, the last 60 s went
+        # nowhere).  **Measured, it makes things worse**: 33.5% -> 27.5% of the
+        # walkable floor covered, with 41.9 m of travel falling to 35.7 m over a
+        # *longer* run.  Abandoning a goal costs a reversal, and a reversal
+        # covers no new ground -- whereas grinding toward a distant patch at
+        # least keeps the robot moving through space it has not crossed yet.
+        # Kept, off, because "cannot reach it" is a real failure mode and the
+        # trade-off may not hold on a map with genuine dead ends.  Set
+        # `sweep_stuck_frames > 0` to enable; `test_explore` case 14 does.
+        self.sweep_stuck_frames = int(sweep_stuck_frames)
+        self.sweep_stuck_improve_m = float(sweep_stuck_improve_m)
+        self.n_sweep_abandoned = 0
+        self._sw_best = float("inf")
+        self._sw_since = 0
         self.n_sweep_targets = 0
         self.n_picks = 0                # times a new target was chosen at all
         self._target_kind = "frontier"
@@ -630,6 +648,24 @@ class FrontierExplorer:
             return False
         return bool((~vis[ys:ye, xs:xe]).any())
 
+    def _sweep_target_stuck(self, d: float) -> bool:
+        """Has this sweep target stopped being approached?
+
+        Same test as the navigator's stuck check, and for the same reason: a
+        goal is making progress only if the distance to it keeps falling.
+        Circling a 0.24 m arc moves a great deal and approaches nothing.
+
+        Disabled unless `sweep_stuck_frames > 0` -- see the note in __init__:
+        measured, giving up on a target costs more coverage than grinding at it.
+        """
+        if self.sweep_stuck_frames <= 0:
+            return False
+        if d < self._sw_best - self.sweep_stuck_improve_m:
+            self._sw_best = d
+            self._sw_since = self._target_age
+            return False
+        return (self._target_age - self._sw_since) > self.sweep_stuck_frames
+
     def _plan(self, wmap, pose, goal) -> Optional[List[Tuple[float, float]]]:
         """A* to `goal`, throttled exactly like the navigator throttles its own.
 
@@ -925,6 +961,13 @@ class FrontierExplorer:
                     self.n_barren_targets += 1
                 self._area_at_target = area
                 self._target = None
+            elif (self._target_kind == "sweep"
+                  and self._sweep_target_stuck(d)):
+                # A patch can be reachable on paper and still be somewhere the
+                # base cannot actually get to.  Give up and choose again rather
+                # than spend the rest of the run driving at it.
+                self.n_sweep_abandoned += 1
+                self._target = None
             elif (self._still_unvisited(wmap, tx, ty)
                   if self._target_kind == "sweep"
                   else self._target_still_frontier(wmap, tx, ty)):
@@ -950,6 +993,8 @@ class FrontierExplorer:
                 route = sw[2]
                 self._target_kind = "sweep"
                 self.n_sweep_targets += 1
+                self._sw_best = float("inf")       # fresh progress clock
+                self._sw_since = 0
                 n_cand = sw[3]
             else:
                 self._target_kind = "frontier"
