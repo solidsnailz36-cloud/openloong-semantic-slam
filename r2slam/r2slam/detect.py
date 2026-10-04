@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """COCO object detection, shared by both data sources.
 
-Model: `tiny-yolov3-11.onnx` from the ONNX model zoo.  Two properties make it
-the right choice here rather than an ultralytics stack:
+Model: **YOLO11n**, exported to ONNX at 640x640 by
+`vendor/detector/_export/export_yolo11n.py`.  It replaced the ONNX-zoo
+`tiny-yolov3-11` on 2026-10-03 for a measured reason, not a fashion one: on the
+simulator's own camera frames the old model reported 25 person instances where
+`/gazebo/model_states` says there are **three**, and it reported the same wrong
+place up to 42 times, so the "seen at least twice" gate could not filter them.
+The object it was most persistent about is the `youbot` parked at (4.32, -6.16),
+an orange-and-white mobile manipulator.  A stronger backbone fixes the cause.
 
-  * **no PyTorch.** It runs on onnxruntime (~7 MB of wheels) or OpenCV.  The
+Two properties still matter and both still hold:
+
+  * **no PyTorch at run time.**  onnxruntime (~15 MB of wheels) or OpenCV.  The
     brief asks for something that fits an embedded platform, and dragging a
-    2 GB torch install onto the target is the opposite of that.
-  * **NMS is inside the graph.** The outputs are already `boxes / scores /
-    indices`, so there is no anchor/stride decoding to get subtly wrong --
-    which matters because a wrong decoder fails silently and produces
-    plausible-but-mislocated boxes.
+    2 GB torch install onto the target is the opposite of that.  torch is used
+    once, offline, only to *produce* the .onnx -- it never enters the pipeline,
+    the delivery environment or the container.
+  * **the decode is checked against the reference implementation.**  Dropping
+    tiny-yolov3 means we now own the anchor decode (YOLO11's ONNX output is the
+    raw `[1, 84, 8400]`: 4 box + 80 class, no objectness, no NMS).  A wrong
+    decoder fails silently and yields plausible-but-mislocated boxes, so
+    `tools/check_onnx_parity.py` runs ultralytics' own predictor and this
+    decoder over the same frames and asserts the boxes agree to a fraction of a
+    pixel.  That script is the reason this file is allowed to do arithmetic on
+    raw tensors.
 
 The network is a **COCO-80** detector and is used as-is: nothing here is
 trained or fine-tuned.  Which of the 80 classes end up in the map is decided by
@@ -20,7 +34,7 @@ never has to know about COCO.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -31,6 +45,10 @@ except ImportError:                     # run as a loose script
 
 PERSON_CLASS = 0
 COCO80 = None
+
+# Letterbox padding colour.  Must match ultralytics' `LetterBox.padding_value`,
+# because a different border changes the model's input and therefore its boxes.
+PAD_VALUE = 114
 
 
 def _iou(a, b) -> float:
@@ -46,6 +64,37 @@ def _iou(a, b) -> float:
     return float(inter / max(ar + br - inter, 1e-9))
 
 
+def nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> List[int]:
+    """Greedy NMS over (N,4) xyxy boxes.  Returns kept indices, best first.
+
+    Written out rather than taken from a library because the two runtimes this
+    file supports disagree about whether they have one, and because the graph's
+    own suppression layer has already been caught returning an empty index
+    tensor while a 0.82 person sat in the frame.  Never trust an in-graph
+    post-process that has not been shown to fire.
+    """
+    xy = np.asarray(boxes, dtype=np.float64)
+    sc = np.asarray(scores, dtype=np.float64)
+    order = np.argsort(-sc)
+    keep: List[int] = []
+    while order.size:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        a, b = xy[i], xy[rest]
+        ix1, iy1 = np.maximum(a[0], b[:, 0]), np.maximum(a[1], b[:, 1])
+        ix2, iy2 = np.minimum(a[2], b[:, 2]), np.minimum(a[3], b[:, 3])
+        inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+        ar = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        br = (np.clip(b[:, 2] - b[:, 0], 0, None)
+              * np.clip(b[:, 3] - b[:, 1], 0, None))
+        iou = inter / np.maximum(ar + br - inter, 1e-9)
+        order = rest[iou <= iou_thr]
+    return keep
+
+
 def load_names(path: str) -> List[str]:
     global COCO80
     with open(path, encoding="utf-8") as fh:
@@ -54,23 +103,41 @@ def load_names(path: str) -> List[str]:
 
 
 class OnnxYoloDetector:
-    """tiny-yolov3 with a fused (but unusable) NMS layer.
+    """One ONNX COCO detector, two graph dialects.
 
-    Two runtimes are supported because neither one is available everywhere:
+    `kind` is decided from the graph's own output signature, never from the
+    filename, because a mis-named file is exactly the sort of thing that would
+    otherwise be discovered as "zero detections, no error":
 
-      * `onnxruntime`  -- the standard, but it has no wheel for Python 3.13 yet
-                          (the local dev machine) and OpenCV 4.8 on the cloud box
-                          cannot even parse this graph (it contains a BOOL
-                          constant).
-      * `cv2.dnn`      -- needs OpenCV >= 5, which is what the local machine has
-                          and what OpenCV 4.8 on the cloud box lacks.
+      * ``"v8"`` -- YOLOv8/v11.  A single raw tensor `[1, 84, 8400]`.  Boxes are
+        **cx, cy, w, h in letterboxed input pixels**, classes follow with no
+        objectness term.  Decoding, letterbox removal and NMS are ours.
+      * ``"v3"`` -- tiny-yolov3 from the ONNX model zoo.  Two tensors, the box
+        tuple is **(y1, x1, y2, x2) already in original pixels**, and scores
+        arrive either as (80, N) or (N, 80) depending on the runtime.  Kept
+        because it is a useful cross-check and because `--model` can still
+        point at it; it is no longer the default.
+
+    Both runtimes are still supported, for the reason they always were: neither
+    is available everywhere.
+
+      * `onnxruntime`  -- the standard, and now the only one that can run the
+                          v11 graph here (it uses SiLU and friends that the
+                          local OpenCV 4.8 cannot parse).
+      * `cv2.dnn`      -- kept as a fallback and for the v3 graph.
 
     `backend="auto"` picks whichever works, so the same file runs on both.
     """
 
-    def __init__(self, model: str, conf: float = 0.30, size: int = 416,
+    def __init__(self, model: str, conf: float = 0.30, size: Optional[int] = None,
                  backend: str = "auto", num_threads: int = 2):
-        self.conf = conf
+        self.conf = float(conf)
+        # Prefilter for the raw anchor tensor.  It must be **no higher than the
+        # lowest per-class floor in the label table**, otherwise a box that
+        # clears its own class floor could be thrown away before any per-class
+        # gate ever sees it.  Derived rather than configured so the two cannot
+        # drift apart.
+        self.prefilter = min(self.conf, float(min(L.LABEL_MIN_CONF.values())))
         self.size = size
         self.backend = None
         self.sess = None
@@ -78,6 +145,8 @@ class OnnxYoloDetector:
         self.in_names: List[str] = []
         self.num_threads = int(num_threads)
         self.threads_applied = None
+        self.kind = None
+        self.last_shapes = None
         # bookkeeping for detect_mapped: how many candidate boxes the network's
         # top-1 class was one we have no name for (see its docstring)
         self.n_unmapped = 0
@@ -127,10 +196,8 @@ class OnnxYoloDetector:
                     self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                     self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                     self.threads_applied = max(1, self.num_threads)
-                    got_in = self.net.getLayerNames()
                     self.in_names = ["input_1", "image_shape"]
                     self.out_names = list(self.net.getUnconnectedOutLayersNames())
-                    del got_in
                 self.backend = b
                 break
             except Exception as exc:            # noqa: BLE001  - try the next one
@@ -138,84 +205,193 @@ class OnnxYoloDetector:
         if self.backend is None:
             raise RuntimeError("no usable ONNX runtime -- " + " | ".join(errs))
 
-        self._shape_name = self.in_names[1] if len(self.in_names) > 1 else None
+        # ---- graph dialect, from the output signature -----------------------
+        # (1, 84, 8400) is v8/v11; anything with two outputs is the v3 zoo
+        # graph.  Read the *shape* rather than the name so a renamed file does
+        # not silently take the wrong decoder.
+        if len(self.out_names) >= 2:
+            self.kind = "v3"
+        else:
+            self.kind = "v8"
+        if self.size is None:
+            self.size = 640 if self.kind == "v8" else 416
+        # v3 needs the (h, w) tensor as a second input; v8 has a single input
+        self._shape_name = (self.in_names[1]
+                            if self.kind == "v3" and len(self.in_names) > 1 else None)
+
+    # ------------------------------------------------------------------ input
+    @staticmethod
+    def letterbox_meta(h: int, w: int, size: int) -> Tuple[float, int, int, int, int]:
+        """(ratio, new_w, new_h, pad_x, pad_y) for an aspect-preserving pad.
+
+        Same arithmetic as ultralytics' `LetterBox` with `auto=False`: scale by
+        `r = min(size/h, size/w)`, centre the result on a `size x size` canvas,
+        pad with 114.  Plain `cv2.resize` to a square would stretch 16:9 by a
+        factor of 1.78 in y -- a person becomes a tall thin smear, which is a
+        plausible reason the old detector hallucinated people in the first
+        place.
+        """
+        r = min(size / float(h), size / float(w))
+        nw, nh = int(round(w * r)), int(round(h * r))
+        px, py = (size - nw) // 2, (size - nh) // 2
+        return r, nw, nh, px, py
 
     def preprocess(self, bgr: np.ndarray):
+        """BGR frame -> (blob, meta).  `meta` undoes the letterbox."""
         import cv2
         h, w = bgr.shape[:2]
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        blob = cv2.resize(rgb, (self.size, self.size)).astype(np.float32) / 255.0
-        blob = np.transpose(blob, (2, 0, 1))[None]
-        return blob, np.array([[h, w]], dtype=np.float32)
+        r, nw, nh, px, py = self.letterbox_meta(h, w, self.size)
+        resized = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.size, self.size, 3), PAD_VALUE, np.uint8)
+        canvas[py:py + nh, px:px + nw] = resized
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        blob = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))[None]
+        meta = {"r": r, "pad_x": px, "pad_y": py, "h": h, "w": w}
+        return blob, meta
 
-    def _run(self, blob, ishape):
+    # ----------------------------------------------------------------- output
+    def _run(self, blob, meta):
+        """Run the graph, return its raw outputs as a list of ndarrays."""
         if self.backend == "onnxruntime":
             feed = {self.in_names[0]: blob}
             if self._shape_name:
-                feed[self._shape_name] = ishape                 # (1, 2)
-            return self.sess.run(None, feed)[:2]
+                # v3 only: the zoo graph takes the original (h, w) as (1, 2)
+                feed[self._shape_name] = np.array([[meta["h"], meta["w"]]],
+                                                  dtype=np.float32)
+            return list(self.sess.run(None, feed))
         self.net.setInput(blob, self.in_names[0])
         if self._shape_name:
             # cv2.dnn wants the shape as (1, 1, 2); passing (1, 2) trips
             # "buf.shape() == m.shape()" inside forwardGraph.
+            ishape = np.array([[meta["h"], meta["w"]]], dtype=np.float32)
             self.net.setInput(ishape.reshape(1, 1, 2), self._shape_name)
-        outs = self.net.forward(self.out_names)
-        return outs[0], outs[1]
+        return list(self.net.forward(self.out_names))
 
-    def detect(self, bgr: np.ndarray, want_class: Optional[int] = PERSON_CLASS,
-               iou: float = 0.45) -> List[Tuple[int, int, int, int, float, int]]:
-        """Returns [(x1, y1, x2, y2, score, class_id)] in ORIGINAL pixels.
+    def raw_candidates(self, bgr: np.ndarray):
+        """(boxes, scores) -- every anchor the graph is even slightly sure of.
 
-        Two things had to be measured rather than assumed:
+        `boxes` is (N, 4) **xyxy in ORIGINAL image pixels**, `scores` is
+        (80, N) -- always the same convention for both dialects, so nothing
+        downstream of this method has to know which graph it is talking to.
+        Anchors whose best class is below `self.prefilter` are dropped here,
+        which is what keeps the (80, N) array small (8400 x 80 floats would
+        otherwise be built every frame).  `prefilter` is derived from the label
+        table, never higher than the lowest per-class floor, so no box can be
+        lost before its own gate runs.
 
-        * the box tuple is **(y1, x1, y2, x2)** and is **already in original
-          image pixels**.  The first version multiplied by (w, h) as if the
-          values were normalised, which turned a 444 px-tall person into a
-          -687,832 px-tall one.  Multiply nothing; just reorder.
-        * the graph's fused NMS (`yolonms_layer_1:2`) returns an **empty index
-          tensor** even when a 0.82 person is present, so the suppression is
-          done here instead.  Never trust an in-graph post-process that has not
-          been shown to fire.
+        The axis convention for `scores` is normalised to (80, N) on purpose:
+        onnxruntime hands back (80, N) and cv2.dnn (N, 80) for the v3 graph, and
+        reading the wrong axis yields **zero detections instead of an error**.
         """
         h, w = bgr.shape[:2]
-        blob, ishape = self.preprocess(bgr)
-        boxes, scores = self._run(blob, ishape)
-        boxes = boxes[0]
-        scores = scores[0]
-        # The two runtimes disagree on the score tensor layout: onnxruntime
-        # hands back (80, N), cv2.dnn hands back (N, 80).  Normalise to (80, N)
-        # -- reading the wrong axis silently yields zero detections instead of
-        # an error, which is exactly the kind of bug that costs an afternoon.
+        blob, meta = self.preprocess(bgr)
+        outs = self._run(blob, meta)
+        if self.kind == "v8":
+            return self._decode_v8(outs[0], meta)
+        return self._decode_v3(outs, h, w)
+
+    def _decode_v8(self, raw: np.ndarray, meta: Dict):
+        p = np.asarray(raw)
+        if p.ndim == 3:
+            p = p[0]
+        # (84, 8400) -> (8400, 84).  Decided by which axis is the class axis,
+        # not by a hard-coded 84: a different export (e.g. with objectness, or a
+        # 91-class set) must not silently decode as garbage.
+        if p.shape[0] < p.shape[1]:
+            p = p.T
+        n_ch = p.shape[1]
+        boxes_in = p[:, :4].astype(np.float32)         # cx, cy, w, h (input px)
+        if n_ch == 85:                                 # v5/v7-style objectness
+            cls = p[:, 5:].T * p[:, 4]
+        else:
+            cls = p[:, 4:].T
+        best = cls.max(axis=0)
+        keep = best >= self.prefilter
+        if not np.any(keep):
+            return np.zeros((0, 4), np.float32), np.zeros((80, 0), np.float32)
+        b = boxes_in[keep]
+        cls = cls[:, keep]
+
+        r, px, py = meta["r"], meta["pad_x"], meta["pad_y"]
+        cx, cy, bw, bh = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+        x1 = (cx - bw / 2.0 - px) / r
+        y1 = (cy - bh / 2.0 - py) / r
+        x2 = (cx + bw / 2.0 - px) / r
+        y2 = (cy + bh / 2.0 - py) / r
+        xyxy = np.stack([x1, y1, x2, y2], axis=1)
+        np.clip(xyxy[:, [0, 2]], 0.0, meta["w"], out=xyxy[:, [0, 2]])
+        np.clip(xyxy[:, [1, 3]], 0.0, meta["h"], out=xyxy[:, [1, 3]])
+        return xyxy.astype(np.float32), cls.astype(np.float32)
+
+    @staticmethod
+    def _decode_v3(outs, h: int, w: int):
+        boxes = np.asarray(outs[0])[0]
+        scores = np.asarray(outs[1])[0]
         if scores.ndim == 2 and scores.shape[0] != 80 and scores.shape[1] == 80:
             scores = scores.T
-        self.last_shapes = (boxes.shape, scores.shape)
+        if boxes.shape[0] == 0:
+            return np.zeros((0, 4), np.float32), np.zeros((80, 0), np.float32)
+        n = min(boxes.shape[0], scores.shape[1])
+        boxes, scores = boxes[:n], scores[:, :n]
+        # (y1, x1, y2, x2), already in original pixels -- multiply nothing.
+        xyxy = np.stack([boxes[:, 1], boxes[:, 0], boxes[:, 3], boxes[:, 2]],
+                        axis=1).astype(np.float32)
+        np.clip(xyxy[:, [0, 2]], 0.0, w, out=xyxy[:, [0, 2]])
+        np.clip(xyxy[:, [1, 3]], 0.0, h, out=xyxy[:, [1, 3]])
+        return xyxy, scores.astype(np.float32)
 
-        if want_class is None:
-            cand = [(j, int(np.argmax(scores[:, j])), float(scores[:, j].max()))
-                    for j in range(boxes.shape[0])]
-        else:
-            cand = [(j, want_class, float(scores[want_class, j]))
-                    for j in range(boxes.shape[0])]
-        cand = [c for c in cand if c[2] >= self.conf]
-        if not cand:
-            return []
-        cand.sort(key=lambda c: -c[2])
-
-        keep: List[Tuple[int, int, int, int, float, int]] = []
-        for j, cid, s in cand:
-            y1, x1, y2, x2 = boxes[j]
-            cand_box = (max(0.0, x1), max(0.0, y1),
-                        min(float(w), x2), min(float(h), y2))
-            if cand_box[2] <= cand_box[0] or cand_box[3] <= cand_box[1]:
-                continue
-            if any(_iou(cand_box, (k[0], k[1], k[2], k[3])) > iou for k in keep):
-                continue
-            keep.append((int(cand_box[0]), int(cand_box[1]),
-                         int(cand_box[2]), int(cand_box[3]), s, cid))
-        return keep
+    # ------------------------------------------------------------- public API
+    def detect(self, bgr: np.ndarray, want_class: Optional[int] = PERSON_CLASS,
+               iou: float = 0.45) -> List[Tuple[int, int, int, int, float, int]]:
+        """Returns [(x1, y1, x2, y2, score, class_id)] in ORIGINAL pixels."""
+        return self._select(bgr, want_class, iou, self.conf)
 
     def detect_all(self, bgr: np.ndarray) -> List[Tuple[int, int, int, int, float, int]]:
-        return self.detect(bgr, want_class=None)
+        return self._select(bgr, None, 0.45, self.conf)
+
+    def _select(self, bgr, want_class, iou, floor,
+                classes_of_interest: Optional[Dict[int, int]] = None):
+        """Shared tail of every public detect*: score -> gate -> NMS."""
+        boxes, scores = self.raw_candidates(bgr)
+        self.last_shapes = (boxes.shape, scores.shape)
+        n = boxes.shape[0]
+        if n == 0:
+            return []
+        if want_class is None:
+            top = np.argmax(scores, axis=0)
+            s = scores[top, np.arange(n)]
+            cid = top
+        else:
+            cid = np.full(n, want_class, np.int64)
+            s = scores[want_class] if want_class < scores.shape[0] \
+                else np.zeros(n, np.float32)
+        if classes_of_interest is None:
+            m = s >= floor
+        else:
+            # one floor per class, from the label table
+            fl = np.array([classes_of_interest.get(int(c), floor) for c in cid],
+                          np.float32)
+            m = s >= fl
+        idx = np.nonzero(m)[0]
+        if len(idx) == 0:
+            return []
+        # Clipping to the image can collapse a box that lay entirely outside it
+        # (x1 == x2 after the clamp).  Those carry no information and, worse,
+        # survive NMS unscathed -- IoU with everything is zero.
+        bx = boxes[idx]
+        good = (bx[:, 2] > bx[:, 0]) & (bx[:, 3] > bx[:, 1])
+        idx = idx[good]
+        if len(idx) == 0:
+            return []
+        idx = idx[np.argsort(-s[idx])]
+        keep = nms(boxes[idx], s[idx], iou)
+        out = []
+        for k in keep:
+            j = idx[k]
+            bx = boxes[j]
+            out.append((int(bx[0]), int(bx[1]), int(bx[2]), int(bx[3]),
+                        float(s[j]), int(cid[j])))
+        return out
 
     def detect_mapped(self, bgr: np.ndarray, iou: float = 0.45,
                       min_frac: Optional[dict] = None
@@ -231,7 +407,9 @@ class OnnxYoloDetector:
           class the network did not prefer;
         * keep it only if the project has a name for that COCO class;
         * apply that class's own confidence floor and minimum box size from the
-          label table.
+          label table, and finally suppress overlapping boxes **within the
+          surviving set** (two classes can both be right about one object, but
+          the map wants one marker).
 
         The tempting alternative -- take the best *mapped* class regardless of
         what top-1 was -- recovers objects the network confused with an unmapped
@@ -240,22 +418,18 @@ class OnnxYoloDetector:
         labels.  `self.n_unmapped` counts what this rule discarded, so the
         trade-off is visible in the run report instead of being a silent choice.
         """
-        h, w = bgr.shape[:2]
-        blob, ishape = self.preprocess(bgr)
-        boxes, scores = self._run(blob, ishape)
-        boxes = boxes[0]
-        scores = scores[0]
-        # onnxruntime hands back (80, N), cv2.dnn (N, 80) -- see detect()
-        if scores.ndim == 2 and scores.shape[0] != 80 and scores.shape[1] == 80:
-            scores = scores.T
+        h = bgr.shape[0]
+        boxes, scores = self.raw_candidates(bgr)
+        self.last_shapes = (boxes.shape, scores.shape)
         n = boxes.shape[0]
         if n == 0:
+            self.n_unmapped = 0
             return []
         top = np.argmax(scores, axis=0)
         top_s = scores[top, np.arange(n)]
 
         frac = min_frac or {}
-        cand = []                       # (j, label, score)
+        cand = []                       # (box, label, score)
         self.n_unmapped = 0
         for j in range(n):
             coco = int(top[j])
@@ -272,25 +446,27 @@ class OnnxYoloDetector:
             s = float(top_s[j])
             if s < L.LABEL_MIN_CONF.get(lab, self.conf):
                 continue
-            y1, x1, y2, x2 = boxes[j]
-            bx = (max(0.0, x1), max(0.0, y1), min(float(w), x2), min(float(h), y2))
+            bx = boxes[j]
             if bx[2] <= bx[0] or bx[3] <= bx[1]:
                 continue
             # the box has to be a sane fraction of the frame height -- this is
             # what rejects confident speculation on distant clutter
             if (bx[3] - bx[1]) < frac.get(lab, L.LABEL_MIN_BOX_FRAC[lab]) * h:
                 continue
-            cand.append((j, lab, s, bx))
+            cand.append((bx, lab, s))
         if not cand:
             return []
-        cand.sort(key=lambda c: -c[2])
 
-        keep: List[Tuple[int, int, int, int, float, int]] = []
-        for _j, lab, s, bx in cand:
-            if any(_iou(bx, (k[0], k[1], k[2], k[3])) > iou for k in keep):
-                continue
-            keep.append((int(bx[0]), int(bx[1]), int(bx[2]), int(bx[3]), s, lab))
-        return keep
+        # Suppress across classes as well.  The round-2 code did NMS inside
+        # `detect()` only, so `detect_mapped` could hand the same object to the
+        # registry twice under two labels (a table reported as both
+        # "dining table" and "chair"), and each copy then got its own instance.
+        cand.sort(key=lambda c: -c[2])
+        arr = np.array([c[0] for c in cand], np.float32)
+        sc = np.array([c[2] for c in cand], np.float32)
+        keep = nms(arr, sc, iou)
+        return [(int(arr[k][0]), int(arr[k][1]), int(arr[k][2]), int(arr[k][3]),
+                 float(sc[k]), int(cand[k][1])) for k in keep]
 
 
 def box_colour(label_id: int):
@@ -337,18 +513,24 @@ if __name__ == "__main__":
 
     import cv2
 
+    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="tiny-yolov3-11.onnx")
-    ap.add_argument("--names", default="coco.names")
+    ap.add_argument("--model", default=os.path.join(here, "..", "..", "vendor",
+                                                    "detector", "yolo11n.onnx"))
+    ap.add_argument("--names", default=os.path.join(here, "..", "..", "vendor",
+                                                    "detector", "coco.names"))
     ap.add_argument("--glob", required=True)
     ap.add_argument("--out", default="")
     ap.add_argument("--scale", type=int, default=1)
     ap.add_argument("--conf", type=float, default=0.30)
+    ap.add_argument("--size", type=int, default=0, help="0 = graph default")
     ap.add_argument("--all-classes", action="store_true")
     a = ap.parse_args()
 
     names = load_names(a.names) if os.path.exists(a.names) else None
-    det = OnnxYoloDetector(a.model, conf=a.conf)
+    det = OnnxYoloDetector(a.model, conf=a.conf, size=a.size or None)
+    print("backend %s  kind %s  size %d  outputs %s"
+          % (det.backend, det.kind, det.size, det.out_names))
     files = sorted(glob.glob(a.glob))
     if not files:
         raise SystemExit("no files matched %r" % a.glob)

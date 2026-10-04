@@ -22,8 +22,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def load_env():
+    """Read SSH_HOST/PORT/USER/PASS from ssh_env.sh.
+
+    Credentials are deliberately NOT kept next to this script: `vendor/` is a
+    versioned payload that gets shipped around, and `.workbuddy/tmp/` is the one
+    place they live.  This script used to look only beside itself, which worked
+    while it was run from `.workbuddy/tmp/` -- after it moved into `vendor/`
+    every `put` failed with "no ssh_env.sh found" (the same fallback `rr.sh`
+    has had all along).  Look beside, then fall back upward.
+    """
+    cands = [
+        os.path.join(HERE, "ssh_env.sh"),
+        os.path.join(HERE, "..", "..", ".workbuddy", "tmp", "ssh_env.sh"),
+        os.path.join(HERE, "..", ".workbuddy", "tmp", "ssh_env.sh"),
+    ]
+    path = next((c for c in cands if os.path.exists(c)), None)
+    if path is None:
+        raise SystemExit("rmt.py: no ssh_env.sh found; looked in:\n  "
+                         + "\n  ".join(os.path.abspath(c) for c in cands))
     env = {}
-    with open(os.path.join(HERE, "ssh_env.sh"), encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         for line in fh:
             m = re.match(r"\s*export\s+([A-Z_]+)=(.*?)\s*$", line)
             if m:

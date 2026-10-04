@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import zipfile
 
@@ -210,7 +211,59 @@ def audit_source(key, label, out_root, checks):
                            % (tag, ins.get("by_class")), ""))
     else:
         checks.append(("FAIL", "%s summary.json missing" % tag, ""))
-    return {"video": mp4, "pcd": pcd, "summary": smy, "table": tab}
+
+    # ---- TF --------------------------------------------------------------
+    # FAQ #6: "we need the built map pcd AND tf; no ground truth is provided."
+    # Checked here rather than trusted, because a tf that exists but is empty,
+    # short, out of order or under the wrong message type is exactly the kind of
+    # thing that passes a glance and fails a judge.
+    tf_state = {}
+    if os.path.exists(smy):
+        tf_state = (json.load(open(smy, encoding="utf-8")).get("tf") or {})
+    if not tf_state.get("enabled"):
+        checks.append(("FAIL", "%s TF absent from summary (FAQ #6 requires tf)"
+                       % tag, smy))
+    else:
+        n_want = int(tf_state.get("samples") or 0)
+        tfcsv = os.path.join(d, "tf.csv")
+        if not os.path.exists(tfcsv):
+            checks.append(("FAIL", "%s tf.csv missing" % tag, tfcsv))
+        else:
+            n_rows = 0
+            with open(tfcsv, encoding="utf-8") as fh:
+                for ln in fh:
+                    if ln and not ln.startswith("#") and not ln.startswith("stamp,"):
+                        n_rows += 1
+            checks.append(("PASS" if n_rows == n_want else "FAIL",
+                           "%s tf.csv rows %d (summary says %d poses)"
+                           % (tag, n_rows, n_want), ""))
+        # Read the bag with plain sqlite3 -- no rosbags needed to audit it, and
+        # the container/table names are the ones the organisers' own bags use.
+        tfdir = os.path.join(d, "tf")
+        db = os.path.join(tfdir, "tf_0.db3")
+        if not os.path.exists(os.path.join(tfdir, "metadata.yaml")) \
+                or not os.path.exists(db):
+            checks.append(("FAIL", "%s tf bag incomplete (want metadata.yaml + "
+                           "*_0.db3)" % tag, tfdir))
+        else:
+            try:
+                con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+                n_msg = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                row = con.execute("SELECT name, type FROM topics").fetchone()
+                con.close()
+                topic, msgtype = (row if row else (None, None))
+            except Exception as exc:                          # noqa: BLE001
+                n_msg, topic, msgtype = -1, None, "unreadable: %s" % exc
+            checks.append(("PASS" if msgtype == "tf2_msgs/msg/TFMessage" else "FAIL",
+                           "%s tf bag topic %s type %s" % (tag, topic, msgtype), ""))
+            checks.append(("PASS" if n_msg == n_want else "FAIL",
+                           "%s tf bag messages %d (summary says %d poses)"
+                           % (tag, n_msg, n_want), ""))
+            checks.append(("PASS" if tf_state.get("monotonic") else "FAIL",
+                           "%s tf stamps monotonic=%s"
+                           % (tag, tf_state.get("monotonic")), ""))
+    return {"video": mp4, "pcd": pcd, "summary": smy, "table": tab,
+            "tf_csv": os.path.join(d, "tf.csv"), "tf_bag": os.path.join(d, "tf")}
 
 
 def unpaired_note(have) -> str:
@@ -266,6 +319,11 @@ def write_readme(dest, have, cfg_name):
             lines.append("| `%s/summary.json` | 本次运行的完整量化报告（逐阶段耗时、地图统计、目标关联实例） |"
                          % sub)
             lines.append("| `%s/frames.csv` | 逐帧记录（位姿、指令、目标、耗时），可复算 |" % sub)
+            lines.append("| `%s/tf.csv` | **轨迹**（每帧 stamp + 位置 + 四元数）：答疑第 6 条要求"
+                         "\"建图 pcd 以及 tf\" |" % sub)
+            lines.append("| `%s/tf/` | 同一条轨迹的标准 ROS 2 bag（topic `/tf`，类型 "
+                         "`tf2_msgs/msg/TFMessage`），`ros2 bag play` + `tf2_echo map base_link` "
+                         "可直接验证 |" % sub)
     lines += [
         "| `README.md` | 本文件 |",
         "",
@@ -288,8 +346,12 @@ def write_readme(dest, have, cfg_name):
         "",
         "## 5. 如实说明（边界与已知限制）",
         "",
-        "* 真实数据集**没有提供真值轨迹**，轨迹的可信度来自三条内部判据（逐帧步长中位数 0.085 m、",
-        "  帧间隔均匀到 ±1 ms、隐含速度 0.87 m/s 与步行一致）。**绝对精度需要组委会真值才能断言。**",
+        "* 真实数据集**没有提供真值轨迹**（答疑第 6 条原话\"真值不提供\"）。轨迹可信度来自两侧：",
+        "  ① **内部判据** —— 逐帧步长中位数、帧间隔均匀度、隐含速度是否与步行一致；",
+        "  ② **与厂商自己的 400 Hz 里程计做对照**（`/odin1/odometry_highfreq`），数字见随包的",
+        "  `vendor_check.json`。**它不是真值**（室内无 GNSS，它是厂商 SLAM 的输出），也**没有",
+        "  作为输入使用** —— 答疑第 4 条的输入白名单只有 点云/图像/IMU；这里只是把两套**独立实现**",
+        "  的轨迹放在一起做量级核对。**绝对精度仍需要组委会真值才能断言。**",
         "* 真实数据集有 %s 帧在 0.1 s 内没有可配对的图像，这些帧只做几何建图，不做检测。"
         % unpaired_note(have),
         "* 实时性数字来自 Xeon + 8 核配额的容器，**不代表嵌入式平台**；在线栈本体不含出图。",
@@ -301,7 +363,7 @@ def write_readme(dest, have, cfg_name):
         "```",
         "bash run_online.sh sim_house   --out <dir> --explore --dump <cap>   # 仿真：探索并落盘",
         "bash run_online.sh sim_house   --out <dir> --npz <cap> --encode      # 仿真：复算并编码",
-        "bash run_online.sh real_corridor --out <dir> --encode --speed 1.25   # 真实数据集",
+        "bash run_online.sh real_r2     --out <dir> --encode --speed 1.4      # 真实数据集(r2, 139 s -> 99 s)",
         "```",
         "",
     ]
@@ -335,12 +397,24 @@ def main():
         dst = os.path.join(pkg, sub)
         os.makedirs(dst, exist_ok=True)
         h = have[key]
+        src_dir = os.path.dirname(h["pcd"])
         for src, nm in ((h["pcd"], "map.pcd"), (h["summary"], "summary.json"),
                         (h["table"], "label_table.yaml"),
-                        (os.path.join(os.path.dirname(h["pcd"]), "frames.csv"),
-                         "frames.csv")):
+                        (os.path.join(src_dir, "frames.csv"), "frames.csv"),
+                        # FAQ #6 asks for "the map pcd AND tf" -- a tf that is
+                        # audited but not shipped would be a strange kind of
+                        # diligence.
+                        (os.path.join(src_dir, "tf.csv"), "tf.csv"),
+                        # Present only for the real source (the simulator has no
+                        # vendor odometry); `exists` handles that.
+                        (os.path.join(src_dir, "vendor_check.json"),
+                         "vendor_check.json")):
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dst, nm))
+        tf_dir = os.path.join(src_dir, "tf")
+        if os.path.isdir(tf_dir):
+            shutil.copytree(tf_dir, os.path.join(dst, "tf"),
+                            dirs_exist_ok=True)
     write_readme(os.path.join(pkg, "README.md"), have, a.root)
 
     # videos are copied last: they are the large ones and the least likely to

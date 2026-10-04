@@ -36,9 +36,47 @@ from . import labels as L
 
 
 # ---------------------------------------------------------------- instances
+# Tuning for the static/dynamic split.  These are not free parameters to sweep:
+# each one answers a specific failure seen in the round-2 output.
+CONFIRM_MIN_OBS = 2         # an instance seen once is not an object yet
+DYNAMIC_RADIUS_M = 1.5      # association gate for things that MOVE
+DYNAMIC_STALE_S = 8.0       # a person not seen for this long is gone
+# Two instances of *different* classes this close together are one object.
+#
+# Why this exists: the association gate above is per-label, so a detector that
+# flip-flops between two classes for the same physical thing grows TWO
+# instances.  Measured on the 2026-10-03 simulator run -- the male pedestrian was
+# reported as `person` (41 sightings) and as `bench` (1 sighting) at positions
+# 0.19 m apart, and two of the folke chairs were each reported as both `chair`
+# and `tv`.  The map then shows two markers on one chair, which reads as a
+# broken detector when it is really a missing decision.
+#
+# 0.8 m on purpose, and deliberately smaller than any association radius: this
+# is for *coincident* duplicates, not for tidying up a room.  Merging a real
+# person with a real chair 0.5 m away would be a worse error than the duplicate
+# it removes, so on a tie the dynamic class (the thing that can walk away and is
+# the headline class) is kept.
+CROSS_LABEL_MERGE_M = 0.8
+
+
 @dataclass
 class Instance:
-    """One object on the map, after merging its repeated sightings."""
+    """One object on the map, after merging its repeated sightings.
+
+    Two update rules live here, and which one applies is decided by
+    `is_dynamic` -- a property of the class, not of the run:
+
+      * **still objects** (chair, sofa, fridge...) are averaged over every
+        sighting.  Averaging is right for them: the object does not move, so
+        each sighting is an independent measurement of the same thing and the
+        mean is more accurate than any single frame.
+      * **things that move** (person) take an exponential moving average
+        instead.  This was a real defect: with a running mean, an instance
+        tracking a walking person sits at the centroid of the whole path, i.e.
+        permanently lagging behind and never on the person.  Round-2's
+        `summary.json` shows the symptom -- a walking person fractured into
+        dozens of instances, each frozen at the average of a short stretch.
+    """
     id: int
     label: int
     x: float
@@ -52,12 +90,42 @@ class Instance:
     def name(self) -> str:
         return L.name(self.label)
 
+    @property
+    def is_dynamic(self) -> bool:
+        """Classes that move under their own power.  Currently only `person`.
+
+        Read from the label table rather than hard-coded to person so adding a
+        second dynamic class later is a one-line change there.
+        """
+        return int(self.label) in L.DYNAMIC_LABELS
+
+    @property
+    def confirmed(self) -> bool:
+        """Has this been seen often enough to be believed?
+
+        A single sighting is how a weak detector's false positive becomes a
+        permanent object on the map.  Measured on the round-2 simulator run:
+        12 of 48 person instances had exactly one observation, and every one of
+        them was drawn as a real person for the rest of the run.
+
+        The bar is per class, and only `person` raises it -- see
+        `labels.LABEL_MIN_OBSERVATIONS` for the measurement behind the number.
+        """
+        return self.n >= L.LABEL_MIN_OBSERVATIONS.get(int(self.label),
+                                                      CONFIRM_MIN_OBS)
+
+    def is_stale(self, stamp: float) -> bool:
+        """Dynamic instance not seen for a while -> it walked away."""
+        return self.is_dynamic and (float(stamp) - self.last_t) > DYNAMIC_STALE_S
+
     def as_dict(self) -> dict:
         return {"id": self.id, "label": self.label, "name": self.name,
                 "x": round(self.x, 2), "y": round(self.y, 2),
                 "z": round(self.z, 2), "n_obs": self.n,
                 "first_t": round(self.first_t, 2),
-                "last_t": round(self.last_t, 2)}
+                "last_t": round(self.last_t, 2),
+                "dynamic": self.is_dynamic,
+                "confirmed": self.confirmed}
 
 
 class ObjectRegistry:
@@ -79,10 +147,43 @@ class ObjectRegistry:
         self._next_id = 1
         self.n_merged = 0
         self.n_created = 0
+        # ids hidden because another instance of a different class occupies the
+        # same place -- see `_recompute_superseded`
+        self.superseded: set = set()
+
+    def _recompute_superseded(self) -> None:
+        """Decide which instances are duplicates of a better-supported one.
+
+        Recomputed from scratch after every frame rather than latched, so it
+        follows the evidence: if the class that wins changes as sightings
+        accumulate, the map changes with it, and nothing is permanently lost.
+        Ordered by (sightings desc, id asc) so the decision is deterministic and
+        the better-evidenced label wins.
+        """
+        self.superseded = set()
+        order = sorted(self.items, key=lambda it: (-it.n, it.id))
+        for i, a in enumerate(order):
+            if a.id in self.superseded:
+                continue
+            for b in order[i + 1:]:
+                if b.id in self.superseded or b.label == a.label:
+                    continue
+                if float(np.hypot(a.x - b.x, a.y - b.y)) <= CROSS_LABEL_MERGE_M:
+                    self.superseded.add(b.id)
+
+    def visible(self) -> List[Instance]:
+        """Instances the map should show: everything not superseded."""
+        return [it for it in self.items if it.id not in self.superseded]
 
     def radius_for(self, label: int) -> float:
-        if int(label) == L.PERSON:
-            return 0.9 * self.radius_scale      # people move; keep the gate wide
+        if int(label) in L.DYNAMIC_LABELS:
+            # Wide on purpose.  At 0.9 m a walking person kept "escaping" the
+            # instance that described it and spawning a new one -- measured on
+            # the round-2 run, one walking person became a trail of nine
+            # instances and the map showed a smear of red dots instead of one
+            # person.  The EMA update below is what stops this wide gate from
+            # merging two people who happen to stand close together.
+            return DYNAMIC_RADIUS_M * self.radius_scale
         pts = L.LABEL_MIN_POINTS.get(int(label), 5)
         base = 0.5 if pts <= 4 else (0.8 if pts <= 8 else 1.2)
         return base * self.radius_scale
@@ -114,18 +215,72 @@ class ObjectRegistry:
                 self.n_created += 1
             else:
                 n = best.n
-                best.x = (best.x * n + float(x)) / (n + 1)
-                best.y = (best.y * n + float(y)) / (n + 1)
-                best.z = (best.z * n + float(z)) / (n + 1)
+                if best.is_dynamic:
+                    # Snap to the latest sighting -- do NOT smooth.
+                    #
+                    # An EMA seems nicer (a walking target's marker jitters
+                    # less) and it is what this did first, but it does not work:
+                    # with weight `a` the smoothed position lags a constant-
+                    # velocity target by `step * (1-a)/a`.  At a=0.5 and one
+                    # sighting per 1.5 m that lag is 1.5 m, so the distance from
+                    # the stored position to the NEXT sighting is 2.25 m -- more
+                    # than the gate -- and the person is split into a trail
+                    # again, which is the very bug this is meant to fix.
+                    #
+                    # Association needs a lag-free position; the jitter that
+                    # smoothing would remove has already been taken out
+                    # upstream, because `object_3d` averages the LiDAR returns
+                    # inside the box rather than using a single point.
+                    best.x = float(x)
+                    best.y = float(y)
+                    best.z = float(z)
+                else:
+                    best.x = (best.x * n + float(x)) / (n + 1)
+                    best.y = (best.y * n + float(y)) / (n + 1)
+                    best.z = (best.z * n + float(z)) / (n + 1)
                 best.n = n + 1
                 best.last_t = float(stamp)
                 self.n_merged += 1
                 it = best
             touched.append(it)
+        self._recompute_superseded()
         return touched
 
+    def live(self, stamp: float, confirmed_only: bool = True
+             ) -> Tuple[List[Instance], List[Instance]]:
+        """(still, moving) instances worth drawing at `stamp`.
+
+        Returned apart rather than merged because the map draws them by
+        different rules: a still object keeps its colour for the whole run,
+        while a moving one fades with age and eventually drops off.  Keeping
+        the classification here means the renderer does not have to know which
+        classes move.
+        """
+        still: List[Instance] = []
+        moving: List[Instance] = []
+        for it in self.items:
+            if it.id in self.superseded:
+                continue                      # a better-labelled twin covers it
+            if confirmed_only and not it.confirmed:
+                continue
+            if it.is_dynamic:
+                if not it.is_stale(stamp):
+                    moving.append(it)
+            else:
+                still.append(it)
+        return still, moving
+
     def query(self, label: int) -> List[Instance]:
-        return [it for it in self.items if it.label == int(label)]
+        """Live instances of one class, superseded duplicates excluded.
+
+        Excluded here rather than at the call sites so that *everything* built
+        on the registry -- the map, the run report, and the finals' "go to the
+        sofa" -- agrees about what exists.  A navigation goal that happens to be
+        a discarded duplicate is a bug that would only show up as the robot
+        driving to a spot with nothing on it.
+        """
+        return [it for it in self.items
+                if it.label == int(label) and it.id not in self.superseded]
 
     def best(self, label: int, from_xy: Tuple[float, float],
              min_obs: int = 1) -> Optional[Instance]:
@@ -141,9 +296,18 @@ class ObjectRegistry:
         return min(cands, key=lambda it: (it.x - from_xy[0]) ** 2
                    + (it.y - from_xy[1]) ** 2)
 
-    def summary(self) -> Dict[str, int]:
+    def summary(self, visible_only: bool = True) -> Dict[str, int]:
+        """Instances per class name.
+
+        Defaults to what the map actually shows.  Counting superseded
+        duplicates would report clusters that were deliberately removed and
+        make the map look busier than it is -- the two numbers are both
+        available (see the `instances` block in `summary.json`) so neither has
+        to be guessed at.
+        """
+        src = self.visible() if visible_only else self.items
         out: Dict[str, int] = {}
-        for it in self.items:
+        for it in src:
             out[it.name] = out.get(it.name, 0) + 1
         return out
 
@@ -301,7 +465,24 @@ class PathPlanner:
                float(self.robot_radius), int(self.close_px))
         if key == self._cache_key and self._cache_free is not None:
             return self._cache_free
-        free = wmap.ground.copy()          # already `&= ~obstacle` upstream
+        # `ground` already had the *confirmed* obstacle layer removed upstream
+        # (`&= ~obstacle`, two frames of evidence), and that is all the planner
+        # uses.
+        #
+        # It briefly also removed **this frame's** returns.  That was a mistake
+        # with a clear signature and it is worth writing down: the planned route
+        # then changes every time a chair leg enters or leaves the current scan,
+        # the next waypoint jumps, the commanded heading jumps with it, and the
+        # robot **spins instead of driving**.  Measured on the simulator house,
+        # same duration: `turn` 182 -> 468 frames (12% -> 39% of the run),
+        # |omega| median 0.12 -> 0.90 rad/s, forward motion in 83% -> 58% of
+        # frames, distance driven 109 -> 52 m, mapped floor 229 -> 184 m2.
+        #
+        # Safety does not depend on this: the look-ahead (`_ahead_clear`) reads
+        # `blocked()`, which includes the current frame, so a wall seen once
+        # still stops the robot from the very next command.  What it must not do
+        # is *route* around evidence that will be gone next frame.
+        free = wmap.ground.copy()
         if self.close_px > 1:
             # Closing fills gaps in the floor mask -- and it will equally fill
             # the single-cell gap that a wall appears as, which is how a
@@ -324,6 +505,56 @@ class PathPlanner:
             free = free & (bad == 0)
         self._cache_key, self._cache_free = key, free
         return free
+
+    def reachable_from(self, wmap, pose_xy, poses=None):
+        """(free, reach) -- drivable mask, and the part the robot can get to.
+
+        `reach` is the 4-connected component of `free_space` that contains the
+        robot.  Everything else on the map is, from the robot's point of view,
+        not there -- and on the simulator house that is **half the building**:
+        measured, 229.1 m2 of floor is marked walkable but only 115.1 m2 is in
+        the robot's component, because every room's doorway comes out as a band
+        that is not walkable (wall + never-resolved threshold).
+
+        That is why the explorer could circle the living room believing nothing
+        was left, while four rooms sat unexplored: its remaining-work measure is
+        `reach & ~visited`, and the rooms are not in `reach`.  The measure was
+        right; the set it was measured against was not the whole map.
+        Reported by the pipeline so the number we quote can be defended.
+        """
+        import cv2
+        free = self.free_space(wmap)
+        _n, lab = cv2.connectedComponents(free.astype(np.uint8), connectivity=4)
+        n = free.shape[0]
+
+        def comp_of(px, py):
+            cx, cy = (int(v) for v in wmap.cell_of(px, py))
+            if 0 <= cx < n and 0 <= cy < n and free[cy, cx]:
+                return int(lab[cy, cx])
+            sx, sy = self._nearest_free(free, cx, cy)
+            return int(lab[sy, sx]) if sx is not None else 0
+
+        # Which component counts as "reachable"?  Taking the one containing the
+        # pose at the END of the run is the obvious choice and it is wrong: the
+        # robot ends where it ends, and if the corridor behind it has since been
+        # pinched to one cell by the inflation, the answer is a 1.3 m2 pocket --
+        # measured, on the real corridor, against 364.8 m2 of traversable map.
+        # The useful question is "how much of the green could the robot get to
+        # while it was operating", so the component is the one that contains the
+        # most of its trajectory.
+        seed = 0
+        if poses is not None and len(poses):
+            step = max(1, len(poses) // 200)
+            tally = {}
+            for p in poses[::step]:
+                c = comp_of(p[0], p[1])
+                if c:
+                    tally[c] = tally.get(c, 0) + 1
+            if tally:
+                seed = max(tally, key=lambda k: tally[k])
+        if not seed:
+            seed = comp_of(pose_xy[0], pose_xy[1])
+        return free, ((lab == seed) if seed else np.zeros_like(free))
 
     @staticmethod
     def _nearest_free(free, cx, cy, max_r: int = 15):

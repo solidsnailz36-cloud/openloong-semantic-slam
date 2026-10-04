@@ -69,6 +69,8 @@ class FrontierExplorer:
                  arc_scale: float = 0.40, arc_max_deg: float = 90.0,
                  arc_probe_deg: float = 40.0,
                  sweep: bool = True, sweep_radius: float = 0.60,
+                 island_link_m: float = 1.5, island_probe_limit: int = 12,
+                 island_min_m2: float = 0.5, island_trigger_m2: float = 4.0,
                  sweep_min_m2: float = 3.0, sweep_min_dist: float = 0.50,
                  sweep_commit_frames: int = 300,
                  sweep_stuck_frames: int = 0,
@@ -216,6 +218,24 @@ class FrontierExplorer:
         self.reach_dist = float(reach_dist)
         self._target: Optional[Tuple[float, float]] = None
         self._target_age = 0
+        # Progress-toward-target tracker, for the stagnation guard above.  Holds
+        # the target it was measuring and the closest it has been to it; both
+        # reset by themselves when `_target` changes, so nothing else has to
+        # remember to clear them.
+        self._close_tgt: Optional[Tuple[float, float]] = None
+        self._close_best = float("inf")
+        self.n_closing_frames = 0
+        # Thin-link islands: walkable patches that come within `island_link_m` of
+        # the robot's own component are counted as outstanding work, and probed
+        # (bounded) as targets.  See `_masks` for the measurement that motivated
+        # this -- half the house was invisible to the remaining-work budget.
+        self.island_link_m = float(island_link_m)
+        self.island_probe_limit = int(island_probe_limit)
+        self.island_min_m2 = float(island_min_m2)
+        # do not go chasing doorways over a scrap of floor
+        self.island_trigger_m2 = float(island_trigger_m2)
+        self.n_island_probes = 0
+        self.n_island_linked_m2 = 0.0
         self.n_committed = 0
         self.n_switches = 0
         # Stuck recovery.  "Turn in place until the front is clear" has no exit
@@ -253,6 +273,8 @@ class FrontierExplorer:
         self.replan_every = int(replan_every)
         self._mask_key = None
         self._reach = None             # walkable component holding the robot
+        self._linked = None            # ... plus the green islands within a link
+        self._probe = None             # the beachhead of those islands (targets)
         self._exterior = None          # unknown connected to the map border
         self._frontier_raw = None
         self._path: List[Tuple[float, float]] = []
@@ -292,6 +314,8 @@ class FrontierExplorer:
 
     # ------------------------------------------------------------------ core
     def _free_unknown(self, wmap):
+        # Same definition of "drivable" as the planner's, and for the same
+        # reason it is the confirmed layer only (see `nav.free_space`).
         free = wmap.ground & ~wmap.obstacle
         unknown = ~wmap.seen
         return free, unknown
@@ -338,6 +362,81 @@ class FrontierExplorer:
                 self.n_pose_off_map += 1
         reach = (lab == seed) if seed else np.zeros_like(walk)
 
+        # --- green floor the robot cannot *reach*, but can *see* ---------------
+        #
+        # Symptom (reported 2026-10-04): the house has three rooms, the robot
+        # never drives into any of them, the video never shows their interiors,
+        # yet their floors are green -- and the robot circles the living room as
+        # if nothing were left to do.
+        #
+        # The remaining-work measure was not the problem: it is `reach & ~visited`
+        # -- "walkable floor never driven over", which is the honest quantity.
+        # The set it was measured against was the problem.  `reach` is one
+        # connected component of the *drivable* grid, and a doorway comes out of
+        # `free_space` as a band that is not drivable (the wall, plus the
+        # threshold strip that was never resolved because nothing ever drove
+        # close enough to see it).  Every room was therefore its own component.
+        # Measured on the simulator run: 229.1 m2 marked walkable, 115.1 m2 in
+        # the robot's component, so **114.1 m2 of green floor -- half the house
+        # -- was invisible to the budget**, and the explorer reported 27.9 m2 of
+        # work left while 96.5 m2 sat untouched.
+        #
+        # The fix is a **thin island link**, and it is deliberately narrow:
+        # walkable patches that come within `island_link_m` of the robot's own
+        # component count as reachable for *deciding whether there is work left*,
+        # and the swarm of targets is confined to the beachhead next to the
+        # crossing.  So the robot drives to the doorway and looks -- which is the
+        # only thing that can resolve the threshold, since the connection cannot
+        # appear until something drives up to it.  A band wider than
+        # `island_link_m` is not linked at all: that is a wall, and driving at it
+        # would be a guess.
+        # Coarse pass on the *walkable* grid (not the eroded one) so a doorway
+        # sealed only by the inflation shell is treated the same as any other.
+        raw = wmap.ground
+        n_raw, lab_raw = cv2.connectedComponents(raw.astype(np.uint8),
+                                                connectivity=4)
+        rseed = 0
+        if 0 <= cx < n and 0 <= cy < n and raw[cy, cx]:
+            rseed = int(lab_raw[cy, cx])
+        elif 0 <= cx < n and 0 <= cy < n:
+            nr = PathPlanner._nearest_free(raw, cx, cy)
+            if nr[0] is not None:
+                rseed = int(lab_raw[nr[1], nr[0]])
+        # Walkable patches that are connected to the robot's own component
+        # **without crossing a known obstacle** are a different animal from
+        # patches behind a wall.  The first kind is a doorway we simply never
+        # resolved (its threshold is unknown, not blocked); the second kind is
+        # architecture, and no amount of driving will join it up.
+        #
+        # The first attempt used "within `island_link_m` of the robot's
+        # component" as the criterion and it was wrong in a way only the run
+        # could show: it fired 12 probes over 400 s and the connectivity never
+        # changed, because the *nearest* green cell of a room is usually across
+        # its wall, so the robot drove at walls.  Being near is not the question;
+        # **is anything known to be in the way** is the question, and one
+        # connected-components pass on `~obstacle` answers it exactly.
+        link_px = max(1, int(round(self.island_link_m / wmap.resolution)))
+        passable = ~wmap.obstacle
+        _n_p, lz = cv2.connectedComponents(passable.astype(np.uint8),
+                                          connectivity=4)
+        pseed = 0
+        if 0 <= cx < n and 0 <= cy < n and passable[cy, cx]:
+            pseed = int(lz[cy, cx])
+        else:
+            nr = PathPlanner._nearest_free(passable, cx, cy)
+            if nr[0] is not None:
+                pseed = int(lz[nr[1], nr[0]])
+        linked = reach.copy()
+        probe = np.zeros_like(reach)
+        if rseed and pseed:
+            other = raw & (lab_raw != rseed) & (lz == pseed)
+            if other.any():
+                linked = reach | other
+                grown = cv2.dilate(
+                    reach.astype(np.uint8),
+                    np.ones((2 * link_px + 1, 2 * link_px + 1), np.uint8)) > 0
+                probe = other & grown
+
         # --- the irreducible part ------------------------------------------
         # Any unknown region that touches the map border is the world outside;
         # the robot cannot walk there and no amount of driving will observe it.
@@ -354,6 +453,7 @@ class FrontierExplorer:
         else:
             exterior = np.zeros_like(unk, bool)
         self._mask_key, self._reach, self._exterior = key, reach, exterior
+        self._linked, self._probe = linked, probe
         return reach, exterior
 
     def _frontier(self, wmap, free, unknown) -> np.ndarray:
@@ -441,7 +541,7 @@ class FrontierExplorer:
         chooser, so the two cannot disagree about whether work is left.
         """
         vis = self._visited_mask(wmap)
-        fresh = reach & ~vis
+        fresh = (self._linked if self._linked is not None else reach) & ~vis
         if not fresh.any():
             return False
         n_lab, lab = cv2.connectedComponents(fresh.astype(np.uint8),
@@ -574,6 +674,55 @@ class FrontierExplorer:
         self._dt_key = key
         return self._dt
 
+    def _stranded_fresh(self, wmap) -> float:
+        """Walkable floor the robot can neither reach nor has been near, in m2.
+
+        The companion of `_fresh_area`: that one is the work inside the robot's
+        component, this one is the work outside it.  Comparing the two is what
+        decides whether a doorway is a better use of the next minute than
+        another sweep target.
+        """
+        if self._linked is None:
+            return 0.0
+        vis = self._visited_mask(wmap)
+        stranded = self._linked & ~(self._reach if self._reach is not None
+                                    else self._linked) & ~vis
+        return float(stranded.sum()) * wmap.resolution ** 2
+
+    def _pick_island_probe(self, wmap, x0, y0):
+        """Nearest unresolved doorway, as a target the planner can actually reach.
+
+        The aim point is a cell just **inside** the stranded patch and just next
+        to the robot's own component -- so `plan()` (which snaps its goal to the
+        nearest drivable cell) routes the robot up to the doorway rather than
+        into a wall.  Arriving there is the only thing that can resolve the
+        threshold, because the connection cannot appear until something drives
+        close enough to see it.
+
+        Bounded by `island_probe_limit`: a band that is genuinely a wall will
+        never resolve, and without a cap the robot would keep going back to it.
+        """
+        if self._linked is None or self._probe is None:
+            return None
+        if self.n_island_probes >= self.island_probe_limit:
+            return None
+        probe = self._probe & ~self._visited_mask(wmap)
+        if not probe.any():
+            return None
+        ys, xs = np.nonzero(probe)
+        cell = wmap.resolution ** 2
+        if len(ys) * cell < self.island_min_m2:
+            return None
+        wx = (xs + 0.5) * wmap.resolution - wmap.extent
+        wy = (ys + 0.5) * wmap.resolution - wmap.extent
+        order = np.argsort(np.hypot(wx - x0, wy - y0))
+        for i in order[:self.max_plans_per_pick]:
+            path = self.planner.plan(wmap, (x0, y0), (float(wx[i]), float(wy[i])))
+            if path:
+                self.n_plans += 1
+                return float(wx[i]), float(wy[i]), path, int(len(ys))
+        return None
+
     def _pick_sweep_target(self, wmap, reach, x0, y0):
         """Nearest sizeable reachable patch of floor the robot has never been near.
 
@@ -647,6 +796,33 @@ class FrontierExplorer:
         if ye <= ys or xe <= xs:
             return False
         return bool((~vis[ys:ye, xs:xe]).any())
+
+    def _closing_on_target(self, x0: float, y0: float) -> bool:
+        """Is the robot measurably nearer its committed target than before?
+
+        Used by the stagnation guard to tell "nothing is happening" apart from
+        "a long drive is happening".  Distance-only on purpose: this is not a
+        controller, it is the one bit of evidence the guard was missing.
+
+        Self-resetting -- if `_target` changed (or was cleared on arrival) the
+        tracker starts over, so a new journey is never credited with an old
+        journey's progress.  That resetting is the part that matters: without
+        it, a robot that once came within 1 m of a target and then picked a
+        different one 20 m away would be "closing" for the next 19 m.
+        """
+        if self._target is None:
+            return False
+        if self._close_tgt != self._target:
+            self._close_tgt = self._target
+            self._close_best = float(np.hypot(self._target[0] - x0,
+                                              self._target[1] - y0))
+            return False
+        d = float(np.hypot(self._target[0] - x0, self._target[1] - y0))
+        if d < self._close_best - self.sweep_stuck_improve_m:
+            self._close_best = d
+            self.n_closing_frames += 1
+            return True
+        return False
 
     def _sweep_target_stuck(self, d: float) -> bool:
         """Has this sweep target stopped being approached?
@@ -799,7 +975,7 @@ class FrontierExplorer:
         ok = wmap._in(cx, cy)
         if not ok.all():
             return False
-        return not bool(wmap.obstacle[cy[ok], cx[ok]].any())
+        return not bool(wmap.blocked()[cy[ok], cx[ok]].any())
 
     def _ahead_clear(self, wmap, x, y, yaw) -> bool:
         """Is the corridor straight ahead free for `front_stop` metres?"""
@@ -813,7 +989,9 @@ class FrontierExplorer:
             # off the edge of the map: treat unobserved as "not yet proven
             # blocked", which is the same convention the frontier search uses
             return True
-        return not bool(wmap.obstacle[cy[known], cx[known]].any())
+        # `blocked()`, not `obstacle`: the map layer needs two frames before it
+        # believes a cell is blocked, and "I can see it right now" must not wait.
+        return not bool(wmap.blocked()[cy[known], cx[known]].any())
 
     def command(self, wmap, pose_xy: Tuple[float, float],
                 yaw: float) -> Tuple[float, float, Dict]:
@@ -855,9 +1033,30 @@ class FrontierExplorer:
             knowledge = self._fresh_area(wmap, reach, x0, y0)
         else:
             knowledge = area
+        # ... and the quantity has to be watched **while the robot is closing on
+        # a target**, not only while it is learning.
+        #
+        # Second measurement, same day: with the quantity fixed, the guard still
+        # ended runs early -- "drove without progress for 300 frames" fired at
+        # 202.1 m2 mapped with **80.1 m2 of reachable floor never walked**, three
+        # runs in a row.  Reading the numbers, the robot was not idle: it had
+        # picked one distant sweep target and was 300 frames into driving there
+        # across ground it had already mapped.  That is a *journey*, and the
+        # sensor reading "no new floor" during a journey is not evidence of
+        # stagnation.
+        #
+        # So a frame also counts as progress when the robot gets measurably
+        # closer to the target it has committed to.  Same idea as the
+        # navigator's stuck test (`_best_d`), and for the same reason: the
+        # question is "is anything happening", and closing a gap is something
+        # happening.
+        closing = self._closing_on_target(x0, y0)
         if (self._last_area is None
                 or knowledge > self._last_area + self.stagnate_eps):
             self._last_area = knowledge
+            self._stagnant = 0
+        elif closing:
+            self._last_area = max(self._last_area, knowledge)
             self._stagnant = 0
         elif moved >= 0.03:                     # driving, and learning nothing
             self._last_area = max(self._last_area, knowledge)
@@ -988,10 +1187,32 @@ class FrontierExplorer:
             # metres away -- see the note on `sweep` in __init__.
             sw = (self._pick_sweep_target(wmap, reach, x0, y0)
                   if self.sweep else None)
+            # ... unless there is more floor we *cannot* reach than floor we can.
+            #
+            # The first version of the island probe only ran when the sweep had
+            # nothing left, and measured on the simulator run it therefore never
+            # ran at all: the sweep found 13 targets over 400 s and 101.8 m of
+            # driving while 101.0 m2 of green floor sat stranded outside the
+            # robot's component.  A last resort that never arrives is not a fix.
+            #
+            # The trigger is now the comparison that matters: **if the
+            # unreachable-but-walkable floor outweighs the reachable-and-unvisited
+            # floor, the doorways are the bigger win**, whatever the sweep thinks.
+            # Both quantities are known and both are reported.
+            used_probe = False
+            if sw is not None:
+                fresh_in = float(self._fresh_area(wmap, reach, x0, y0))
+                stranded = self._stranded_fresh(wmap)
+                if stranded > max(self.island_trigger_m2, fresh_in):
+                    probe = self._pick_island_probe(wmap, x0, y0)
+                    if probe is not None:
+                        sw = probe
+                        used_probe = True
+                        self.n_island_probes += 1
             if sw is not None:
                 target_res = (sw[0], sw[1])
                 route = sw[2]
-                self._target_kind = "sweep"
+                self._target_kind = "island" if used_probe else "sweep"
                 self.n_sweep_targets += 1
                 self._sw_best = float("inf")       # fresh progress clock
                 self._sw_since = 0
@@ -1008,6 +1229,26 @@ class FrontierExplorer:
                     sel = np.hypot(wx - wx[i], wy - wy[i]) <= 1.0
                     target_res = (float(wx[sel].mean()),
                                   float(wy[sel].mean()))
+            if target_res is None and self._linked is not None:
+                # Last resort before giving up / searching: go and look at a
+                # doorway we never resolved.
+                #
+                # Deliberately LAST.  Putting it before the frontier fallback
+                # was tried and it hijacked the synthetic-map tests: any separate
+                # walkable speck within a link of the robot became a target and
+                # the robot turned toward it instead of the unexplored region it
+                # was supposed to be driving at.  This is the case the run of
+                # 2026-10-04 was stuck in -- the sweep had nothing left (every
+                # room was outside `reach`) and the robot orbited the living room
+                # for the rest of the run while four rooms' worth of floor sat
+                # untouched behind their doors.
+                sw = self._pick_island_probe(wmap, x0, y0)
+                if sw is not None:
+                    target_res = (sw[0], sw[1])
+                    route = sw[2]
+                    self._target_kind = "island"
+                    self.n_island_probes += 1
+                    n_cand = sw[3]
             if target_res is None:
                 self._target = None
                 self._path = []

@@ -112,16 +112,41 @@ def corridor(block_x=None, observed_to=4.0):
             by = np.arange(lo, hi, PITCH)
         else:
             bx, by = block_x, ys
-        parts.append(np.column_stack([np.full(len(by), bx), by,
-                                      np.full(len(by), WALL_Z)]))
-        kinds.append(np.zeros(len(by), bool))
+        # Three rows, not one.  The map's obstacle cleanup removes structures
+        # thinner than `worldmap.OBSTACLE_OPEN_PX` cells (0.3 m), and it should:
+        # at 0.1 m resolution a one-cell line is what noise looks like, and the
+        # pose error of a real run (0.1-0.3 m) is wider than the line itself.  A
+        # wall the map *can* represent is therefore 3+ cells thick, so the
+        # fixture has to be too, or the cases below would be asserting something
+        # about a wall the map is entitled to throw away.  The assertions
+        # themselves are unchanged.
+        # 0.10 and not 0.12: the rows must land in *consecutive* grid cells
+        # (0.1 m resolution), or the "wall" is really two thin structures with
+        # a gap between them and the map is right to drop both.
+        for bxx in (bx - 0.10, bx, bx + 0.10):
+            parts.append(np.column_stack([np.full(len(by), bxx), by,
+                                          np.full(len(by), WALL_Z)]))
+            kinds.append(np.zeros(len(by), bool))
     return np.vstack(parts), np.concatenate(kinds)
 
 
 def world(block_x=None, observed_to=4.0, extent=12.0):
+    """The test world, built the way the map says the world is built.
+
+    **Fed in twice, and that is not a workaround.**  The map requires two frames
+    of evidence before a cell counts as blocked (`worldmap.OBSTACLE_MIN_VOTES`) --
+    a rule that was added because on the real corridor 16% of the obstacle cells
+    had exactly one frame behind them and inflating that layer by the robot
+    radius erased 50% of the known walkable floor.  A fixture that hands the map
+    a wall in a single frame is therefore describing a world with no wall in it,
+    and the assertions built on it would be testing the fixture rather than the
+    explorer.  Feeding the same scan twice says "this wall has been observed",
+    which is what the cases below are about.
+    """
     pts, ground = corridor(block_x, observed_to)
     w = WorldMap(resolution=0.1, extent=extent)
     w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.0)
+    w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.1)
     return w
 
 
@@ -136,6 +161,7 @@ def world_with_specks():
     pts, ground = corridor(observed_to=4.0)
     w = WorldMap(resolution=0.1, extent=12.0)
     w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.0)
+    w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.1)
     for (sx, sy) in ((0.8, 0.35), (-0.7, -0.35), (0.3, -0.8)):
         cs = w.cell_of(sx, sy)
         w.seen[int(cs[1]), int(cs[0])] = False      # carve the speck out

@@ -149,8 +149,11 @@ LiDAR 被搬到车体位置，但**朝向恒为世界对齐**。实测：我们�
 ```bash
 # ---- 仿真：两阶段，唯一能拿到干净数字的流程 ----
 # 阶段一：Gazebo 在跑，探索驱动 + 每帧落盘 + 落下最终栅格（不检测、不渲染）
-bash run_online.sh sim_house --duration 110 --explore --no-detect --no-render \
-     --dump /tmp/sim_capture --dump-grids /tmp/grids
+#   `--out` 是 argparse 的必填参数，即使这一阶段不出交付物也必须给：少了它会在
+#   **参数解析阶段**就退出，而这一阶段本来就不写交付物，于是"什么都没做"和
+#   "做完了"长得一模一样 —— 实测踩过一次（脚本一路跑到 DONE，map.pcd 186 字节）。
+bash run_online.sh sim_house --out /tmp/sim_cap_out --duration 110 --explore \
+     --no-detect --no-render --dump /tmp/sim_capture --dump-grids /tmp/grids
 # 阶段二：停掉 Gazebo，用同一批帧复算（检测 + 渲染 + 编码）
 bash /root/sim/kill_sim.sh
 bash run_online.sh sim_house --npz /tmp/sim_capture --panel-h 540 --encode
@@ -222,6 +225,20 @@ Gazebo 软渲染 + RViz 就能把它吃满，所有墙钟数字被放大数倍�
     为一个源上恒为零的字段破坏它不划算。
   - FAQ 不提供类别表 ⇒ 交付物必须自带。`package_submission.py` 会检查
     "pcd 里出现过的每一个 label 是否都在表里"，不满足就 FAIL。
+- **TF（答疑 #6 原话："建图 pcd 文件以及 tf"）**：出三份，各回答不同的问题。
+  - `tf.csv`：每帧 `stamp,parent,child,x,y,z,qx,qy,qz,qw`，零依赖，人能直接读。
+  - `tf/`：标准 ROS 2 bag（sqlite3，metadata v5），topic `/tf`，类型
+    `tf2_msgs/msg/TFMessage`。**手写而不是由 ROS 2 产出**：云端是 ROS 1 Noetic、
+    没有 `rosbag2_py`，而 `rosbags` 库只读。建表的 DDL 是**照抄组委会自己的 bag**
+    而不是按规范重建，所以格式已知兼容。验证方式 `ros2 bag play tf/` +
+    `tf2_echo map base_link`。
+  - **视频里叠加同一组数字**：评委实际看的是视频，数字不上屏等于没交。
+  - **父坐标系 `map` = 我们自己的建图坐标系**（自家 LiDAR 里程计的起始帧），
+    不是测量坐标系、更不是真值；`base_link` 与 LiDAR 原点重合（二者之间的偏移
+    没有标定过，所以不说谎地声明它们同点）。
+  - **时间戳是数据集时钟（秒），不是 Unix 时间**：`messages.timestamp` 和
+    `header.stamp` 取同一值，好让 tf2 查询与 bag 重放互相自洽。硬凑一个 Unix
+    偏移会让"事情发生在什么时候"变成一句假话。
 
 ### 类别表（机制）
 

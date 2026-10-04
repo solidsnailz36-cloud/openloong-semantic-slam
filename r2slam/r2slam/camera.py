@@ -43,6 +43,21 @@ def to_camera_frame(xyz: np.ndarray, Tcl: np.ndarray,
     return (Tcl[:3, :3] @ xyz.T).T + Tcl[:3, 3]
 
 
+def vertical_scale(cam: CameraModel) -> float:
+    """Pixels per radian vertically -- the number that turns a box's pixel
+    height into an angular height (`dtheta ~= box_h_px / scale`).
+
+    Needed by the cross-sensor gate in `fusion.object_3d`: multiplying the
+    LiDAR-measured range by that angle gives **how tall the thing inside the box
+    must be**.  For an equidistant fisheye the radial scale `A11` is the same in
+    every direction (that is what equidistant means), so a single number is
+    correct rather than a simplification.
+    """
+    if cam.model == "pinhole":
+        return float(cam.fy)
+    return float(cam.a22 or cam.a11)
+
+
 def project(xyz_cam: np.ndarray, cam: CameraModel) -> Tuple[np.ndarray, np.ndarray]:
     """Camera-frame points -> pixel coordinates.  Returns (u, v).
 

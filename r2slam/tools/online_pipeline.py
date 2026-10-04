@@ -20,8 +20,10 @@ tail can be attributed instead of guessed at.
     python tools/online_pipeline.py --config config/real_corridor.yaml \\
            --npz out/real_frames --out out/online_real --encode
 
-`--npz` replays frames dumped by `tools/dump_frames.py`; that path exists because
-the detector needs onnxruntime, which has no wheel for the dev machine's 3.13.
+`--npz` replays frames dumped by `tools/dump_frames.py`.  That path exists so a
+capture can be re-scored without re-driving the robot -- it is how the detector
+and fusion changes of 2026-10-03 were compared against the old ones on
+byte-identical input frames.
 
 NOTHING in here may look at `ground_truth_topic`.  Ground truth is for scoring,
 and using it to produce the output would be cheating -- so the live source is
@@ -48,24 +50,49 @@ from r2slam.deskew import Deskewer                                   # noqa: E40
 from r2slam.detect import OnnxYoloDetector, load_names                 # noqa: E402
 from r2slam.explore import FrontierExplorer, VelocitySender           # noqa: E402
 from r2slam.frames import Frame                                      # noqa: E402
-from r2slam.fusion import object_3d, points_in_box, project_person_back  # noqa: E402
+from r2slam.fusion import object_3d, project_person_back              # noqa: E402
 from r2slam.heading import CommandedHeading                          # noqa: E402
 from r2slam.nav import (ObjectRegistry, SemanticNavigator,           # noqa: E402
                         path_length)
 from r2slam.odometry import apply_thread_limits, make_odometry, register  # noqa: E402
-from r2slam.traversable import fit_ground                            # noqa: E402
+from r2slam.traversable import (fit_ground, ground_tolerance,        # noqa: E402
+                                OBSTACLE_LO, OBSTACLE_HI,
+                                GROUND_TOL_BASE, GROUND_TOL_SLOPE)
 from r2slam import sysinfo                                           # noqa: E402
 from r2slam.worldmap import WorldMap                                 # noqa: E402
+from r2slam import tf_out                                            # noqa: E402
 
-# The playbook's traversability rule, in one place.  These are the SAME numbers
-# for both sources -- that is the whole point of the geometric approach, and the
-# reason the acceptance figures (57% real / 63% sim) are comparable.
-OBSTACLE_LO = 0.35          # metres above the fitted ground: "tall enough to block"
-OBSTACLE_HI = 2.00          # ... but not the ceiling, which is 2.5 m+ and would
-                            # otherwise block every cell in the grid
-GROUND_TOL_BASE = 0.10
-GROUND_TOL_SLOPE = 0.035    # tolerance grows with range; a 1 deg plane residual
-                            # is 0.09 m at 5 m and 0.35 m at 20 m
+# The traversability rule itself now lives in `r2slam/traversable.py`, next to
+# the plane fit and the `is_floor` predicate the fusion calls.  It used to be
+# four constants here and a second copy in the fusion's own head; "is this point
+# floor?" then had two answers, which is exactly how the fusion ended up
+# localising floor slabs as people.  One definition, imported twice.
+assert (OBSTACLE_LO, OBSTACLE_HI, GROUND_TOL_BASE, GROUND_TOL_SLOPE) == (
+    0.35, 2.00, 0.10, 0.035)
+
+
+def _resolve_vendor(explicit: str, filename: str) -> str:
+    """Find a vendor file without depending on the caller's working directory.
+
+    The default used to be one relative path, which happens to resolve to the
+    repo-root `vendor/detector` on the dev machine and to `/work/vendor/detector`
+    in the container -- two different files that both exist.  Nothing was
+    *broken*, but nothing said which one had been used either, and swapping the
+    detector model is exactly the change where reading the wrong copy is
+    invisible.  So: try the layouts that actually occur, take the first that
+    exists, and the caller prints the winner.
+    """
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, "..", "..", "vendor", "detector", filename),
+             os.path.join(here, "..", "vendor", "detector", filename),
+             os.path.join(here, "..", "detector", filename)]
+    cands = [os.path.normpath(c) for c in cands]
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return cands[0]
 
 
 def parse_args():
@@ -75,10 +102,11 @@ def parse_args():
     ap.add_argument("--config", required=True)
     ap.add_argument("--npz", default=None,
                     help="replay frames dumped by dump_frames.py instead of a live source")
-    ap.add_argument("--model", default=os.path.join(here, "..", "vendor", "detector",
-                                                    "tiny-yolov3-11.onnx"))
-    ap.add_argument("--names", default=os.path.join(here, "..", "vendor", "detector",
-                                                    "coco.names"))
+    ap.add_argument("--model", default="",
+                    help="path to the ONNX detector; default resolves the first "
+                         "vendor/detector that exists next to this package")
+    ap.add_argument("--names", default="",
+                    help="path to coco.names; resolved like --model")
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=0, help="0 = until --duration")
     ap.add_argument("--duration", type=float, default=60.0, help="wall seconds to run")
@@ -124,6 +152,20 @@ def parse_args():
     ap.add_argument("--dump-grids", default=None, metavar="DIR",
                     help="save the final occupancy grids (ground/obstacle/seen) so "
                          "coverage can be analysed offline instead of guessed at")
+    ap.add_argument("--no-tf", action="store_true",
+                    help="skip the tf.csv / tf-bag / on-screen pose stream.  The "
+                         "TF output is part of the deliverable (FAQ #6 asks for "
+                         "'the map pcd AND tf'), so it is ON by default; this "
+                         "switch exists only for pure timing runs.")
+    ap.add_argument("--tf-parent", default="map",
+                    help="parent frame of the published transform.  `map` is OUR "
+                         "map (the start frame of our own LiDAR odometry), not a "
+                         "surveyed or ground-truth frame.")
+    ap.add_argument("--tf-child", default="base_link",
+                    help="child frame.  Note this coincides with the LiDAR origin: "
+                         "our odometry is estimated from the scans themselves and "
+                         "no base_link->LiDAR offset was calibrated, so the two "
+                         "are the same point.")
     return ap.parse_args()
 
 
@@ -226,7 +268,7 @@ def camera_panel(img, target_h):
                       interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
 
 
-def annotate(img, boxes, names, target_h):
+def annotate(img, boxes, names, target_h, note=None):
     """Resize the camera view to `target_h` and draw the detections.
 
     Not `detect.draw`: that one takes an *integer* `scale` because it was
@@ -239,6 +281,12 @@ def annotate(img, boxes, names, target_h):
     carry **our** label ids: that is what makes a chair the same colour in the
     camera panel, in the map panel and in the pcd.  `names` is kept only so the
     signature stays stable for callers that still pass a COCO name list.
+
+    `note` is printed over the panel.  It carries the **detected -> fused**
+    counts, which is the one number that explains a box with no marker on the
+    map: a detection whose box contains too few LiDAR returns, or whose returns
+    are too short to be the class they claim, does not become an object, and
+    without saying so the map looks like it ignored a detection it never had.
     """
     import cv2
     out = camera_panel(img, target_h)
@@ -253,6 +301,10 @@ def annotate(img, boxes, names, target_h):
         cv2.rectangle(out, (x1, y1), (x2, y2), col, th, cv2.LINE_AA)
         cv2.putText(out, "%s %.2f" % (label, b[4]), (x1, max(12, y1 - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX, fs, col, th, cv2.LINE_AA)
+    if note:
+        cv2.putText(out, note, (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.5, 0.55 * sc), (255, 255, 255), max(1, th),
+                    cv2.LINE_AA)
     return out
 
 
@@ -272,13 +324,22 @@ def main():
     print("odometry    : KISS-ICP  voxel=%.2f range=%.1f-%.1f threads=%d"
           % (rt.voxel_size, rt.min_range, rt.max_range, rt.max_num_threads))
 
-    names = load_names(a.names) if os.path.exists(a.names) else None
+    det_model = _resolve_vendor(a.model, "yolo11n.onnx")
+    det_names = _resolve_vendor(a.names, "coco.names")
+    names = load_names(det_names) if os.path.exists(det_names) else None
     det = None
     if not a.no_detect:
-        det = OnnxYoloDetector(a.model, conf=rt.person_conf,
+        det = OnnxYoloDetector(det_model, conf=rt.person_conf,
                                num_threads=rt.detector_threads)
-        print("detector    : %s  conf %.2f  intra-op threads %s"
-              % (det.backend, rt.person_conf, det.threads_applied))
+        # Print the resolved PATH, not just the backend.  The default is
+        # relative to the package, and on 2026-10-03 that meant the dev machine
+        # and the container silently used files from different directories --
+        # an `os.path.exists` check that nobody ran.  A path that decides what
+        # the output looks like has to be in the log.
+        print("detector    : %s  graph %s  size %d  conf %.2f  intra-op threads %s"
+              % (det.backend, det.kind, det.size, rt.person_conf,
+                 det.threads_applied))
+        print("  model     : %s" % det_model)
 
     deskewer = Deskewer(enabled=bool(cfg.lidar.deskew) and not a.no_deskew,
                         sign=cfg.lidar.deskew_sign,
@@ -336,6 +397,10 @@ def main():
               "trav_mask", "map", "explore", "dump", "render", "total")
     times = {k: [] for k in STAGES}
     rows = []
+    # Every frame's full 6-DoF pose, kept apart from `rows` because a TF
+    # transform needs all of it (x, y, z and a complete quaternion) while the
+    # csv above carries only the projections a human reads.
+    tf_samples = []
     registry = ObjectRegistry()
     # Ground-truth comparison, simulator only.  The plan called for this in the
     # round-2 step 3 acceptance criteria ("用真值对照：Sim 用 /state_estimation")
@@ -362,6 +427,14 @@ def main():
     n_skipped = 0
     n_unmapped_total = 0
     n_yaw_missing = 0
+    # Why a detection that the detector reported did not become an object.  Both
+    # counts are reported at the end: a gate that silently removes things is
+    # indistinguishable from a detector that never saw them.
+    yaw_proj_max = 0.0
+    reject_stats = {}
+    n_boxes_fused = 0
+    n_boxes_detected = 0
+    n_objects_localised = 0
     prev_stamp = None
     # When the wheel is handed to the navigator, and from where.  The finals
     # score path efficiency (30%), so the number has to come from the actual
@@ -392,6 +465,11 @@ def main():
             T = register(kiss, reg_in)          # sensor -> world
             deskewer.update_pose(T, fr.stamp)
             t_odom = time.perf_counter()
+            # Recorded here, before anything can decide to `continue`: a frame
+            # that is dropped later still has a valid pose, and a TF stream with
+            # holes in it is worse than one with an extra sample.
+            if not a.no_tf:
+                tf_samples.append((float(fr.stamp), T.copy()))
 
             # ---- which yaw do we steer by, and fuse with? -------------------
             # Computed HERE, before the detector, because the projection needs it
@@ -427,12 +505,43 @@ def main():
                     # pipeline run.
                     n_yaw_missing += 1
 
+            # ------------------------------------------------------------------
+            # `yaw` above is the *vehicle heading*, and it is only a correction
+            # to the camera-LiDAR extrinsic on a scanner that does NOT turn with
+            # its base.  On such a scanner the returns are world-aligned while
+            # the camera is body-aligned, so `camera.to_camera_frame` has to
+            # pre-rotate by `-yaw`.  On a scanner that DOES turn with the base --
+            # the real rig -- the cloud is already body-aligned and applying
+            # that rotation is a pure error.
+            #
+            # It was applied anyway, to both sources, because the branch above
+            # ends in `yaw = yaw_odom` for a live run and only the *replay*
+            # branch was written with the convention in mind.  The consequence
+            # was measured on the real capture: of 390 `person` boxes in the
+            # first 400 frames, **195 contain ~0 LiDAR points** with
+            # `yaw = yaw_odom` and **382 of 390 contain 60+** with `yaw = 0`.
+            # Every projected point is swept away from its box by the heading,
+            # so as the robot turns the fusion stops localising anything --
+            # "people are detected in the video and never marked on the map, at
+            # any distance", and the few boxes that do keep a point or two are
+            # localised from returns that came from somewhere else, which is how
+            # markers end up on walls.
+            #
+            # Kept as a separate variable rather than overwriting `yaw`, because
+            # `yaw` is still the right thing to report and to write into the
+            # frames csv.  `summary.projection_yaw_deg_max` records the largest
+            # value actually applied to a projection, so the invariant "this is
+            # 0 whenever the scanner turns with the base" is auditable.
+            yaw_proj = 0.0 if cfg.lidar.rotates_with_base else yaw
+            yaw_proj_max = max(yaw_proj_max, abs(float(yaw_proj)))
+
             # ---------------- detect ----------------
             # `detect_mapped` returns OUR label ids (see r2slam/labels.py), not
             # COCO indices, so nothing downstream has to know about COCO.
             boxes = []
             if det is not None and fr.image is not None:
                 boxes = det.detect_mapped(fr.image)
+                n_boxes_detected += len(boxes)
                 # accumulate: n_unmapped is per-call, and the run report needs a
                 # total, not whatever the last frame happened to contain
                 n_unmapped_total += det.n_unmapped
@@ -441,32 +550,45 @@ def main():
             t_detect = time.perf_counter()
 
             # ---------------- fuse (box -> 3D, in the LiDAR frame) ----------------
+            # The ground plane is fitted BEFORE the fusion, not after, because
+            # the fusion needs it: a box that reaches below a person's feet
+            # encloses nearer floor, and without this the "first depth gap" split
+            # hands the localisation to a slab of floor.  See `fusion.object_3d`
+            # step 0 for the measurement.  It is the same plane the occupancy
+            # grid uses, fitted once per frame -- the reordering costs nothing.
+            plane = fit_ground(cloud)
+            t_fit = time.perf_counter()
             objects = []
             obj_mask = np.zeros(len(cloud), bool)
             obj_label = np.zeros(len(cloud), np.uint8)
             for b in boxes:
-                p = object_3d(cloud, cfg, b[:4], b[4], label=b[5], yaw=yaw)
+                n_boxes_fused += 1
+                p = object_3d(cloud, cfg, b[:4], b[4], label=b[5],
+                              yaw=yaw_proj, plane=plane, stats=reject_stats)
                 if p is None:
                     continue
-                u, v = project_person_back(cfg, p, yaw)
+                u, v = project_person_back(cfg, p, yaw_proj)
                 x1, y1, x2, y2 = b[:4]
                 p["reproj"] = (round(u, 1), round(v, 1))
                 p["reproj_ok"] = bool(x1 <= u <= x2 and y1 <= v <= y2)
                 objects.append(p)
-                idx = points_in_box(cloud, cfg, p["box"], pad=2.0, yaw=yaw)
-                obj_mask[idx] = True
-                obj_label[idx] = int(b[5])
+                # Mark only the points that were actually selected as the object
+                # (`_idx`), not everything that fell inside the box.  Marking the
+                # whole box said "the wall behind the sofa is part of the sofa",
+                # which then removed that wall from the obstacle layer.
+                obj_mask[p["_idx"]] = True
+                obj_label[p["_idx"]] = int(b[5])
+            n_objects_localised += len(objects)
             t_fuse = time.perf_counter()
 
             # ---------------- traversable (geometric, per frame) ----------------
-            # Split into fit vs masks: on a busy box the two behave very
-            # differently, and a single lumped number cannot tell "RANSAC is
-            # expensive" from "the machine is being stolen from us".
-            plane = fit_ground(cloud)
-            t_fit = time.perf_counter()
+            # The plane was fitted above (the fusion needs it).  Split the timing
+            # into fit vs masks: on a busy box the two behave very differently,
+            # and a single lumped number cannot tell "RANSAC is expensive" from
+            # "the machine is being stolen from us".
             h = plane.height_above(cloud)
             rng_xy = np.hypot(cloud[:, 0], cloud[:, 1])
-            tol = GROUND_TOL_BASE + GROUND_TOL_SLOPE * rng_xy
+            tol = ground_tolerance(rng_xy)
             ground_mask = np.abs(h) < tol
             obstacle_mask = (h > OBSTACLE_LO) & (h <= OBSTACLE_HI) & ~obj_mask
             t_trav = time.perf_counter()
@@ -483,10 +605,16 @@ def main():
                 objects_world.append((pw[0], pw[1], p["label"]))
                 if p["label"] == L.PERSON:
                     persons_world.append((pw[0], pw[1]))
+            # "Seen" only where a return told us something about the floor.
+            # A ceiling hit is a real measurement of the ceiling and says
+            # nothing about what is under it; letting it mark the cell is what
+            # put grey speckle in the middle of the walkable floor.
+            informative = (h <= OBSTACLE_HI) & (h >= -0.60)
             wmap.add(world_pts, ground_mask, obstacle_mask, obj_mask,
                      pose_xy=(t[0], t[1]), stamp=float(fr.stamp),
                      persons_xy=persons_world,
-                     obj_labels=obj_label, objects_xy=objects_world)
+                     obj_labels=obj_label, objects_xy=objects_world,
+                     seen_mask=informative)
             st = wmap.stats()
             # Instance association runs on the same loop as the map: a named
             # instance is what the finals' "navigate to the sofa" needs, and it
@@ -495,6 +623,14 @@ def main():
                 registry.update([(float(p["world"][0]), float(p["world"][1]),
                                   float(p["world"][2]), int(p["label"]))
                                  for p in objects], float(fr.stamp))
+            # Hand the CONFIRMED instances to the map, after association.  Two
+            # things depend on this ordering:
+            #   * the picture shows one marker per object, not one per sighting
+            #     (round 2 drew 333 markers for a single walking person);
+            #   * unconfirmed single-sighting detections never reach the map,
+            #     which is where the phantom "persons" came from.
+            _still, _moving = registry.live(float(fr.stamp))
+            wmap.set_instances(_still, _moving)
             t_map = time.perf_counter()
 
             # ---------------- ground truth (simulator only; FOR SCORING) ----
@@ -571,7 +707,9 @@ def main():
             # ---------------- render ----------------
             if (not a.no_render) and (n - 1) % max(a.every, 1) == 0:
                 if fr.image is not None:
-                    left = annotate(fr.image, boxes, names, a.panel_h)
+                    left = annotate(fr.image, boxes, names, a.panel_h,
+                                    note="detected %d -> localised %d"
+                                         % (len(boxes), len(objects)))
                 else:
                     left = viz.topdown(cloud, size=a.panel_h)
                 right = wmap.render(size=left.shape[0], zoom=a.zoom)
@@ -596,6 +734,16 @@ def main():
                     % (len(objects), len({p["label"] for p in objects}),
                        st["traversable_area_m2"], st["points"] / 1e3),
                 ]
+                if not a.no_tf:
+                    # FAQ #6 wants tf in the deliverable, and the video is what
+                    # actually gets watched -- so the live pose goes on screen
+                    # rather than only into a file nobody opens.  yaw is taken
+                    # from the odometry rotation (the same `T` the map is built
+                    # from), not from the commanded heading.
+                    lines.append(
+                        "TF %s->%s   x %+.2f  y %+.2f  z %+.2f   yaw %+.1f deg"
+                        % (a.tf_parent, a.tf_child, T[0, 3], T[1, 3], T[2, 3],
+                           float(np.degrees(np.arctan2(T[1, 0], T[0, 0])))))
                 if cmd is not None:
                     lines.append("%s %s  v=%.2f m/s  w=%+.2f rad/s%s"
                                  % (cmd.get("mode", "drive"), cmd["state"],
@@ -626,6 +774,12 @@ def main():
                 "points": int(len(cloud)),
                 "registered": int(len(reg_in)),
                 "objects": len(objects),
+                # Raw detector output, next to the number that survived the
+                # fusion gates.  Two frames can show the same detection and only
+                # one of them can put a marker on the map, so "the map ignored
+                # it" and "the box had no LiDAR support" have to be separable
+                # from the record rather than from an argument.
+                "boxes": len(boxes),
                 "object_classes": sorted({L.name(p["label"]) for p in objects}),
                 "persons": sum(1 for p in objects if p["label"] == L.PERSON),
                 "obj_reproj_ok": sum(1 for p in objects if p.get("reproj_ok")),
@@ -641,10 +795,18 @@ def main():
                 # not moving" has two completely different causes -- never
                 # commanded, or commanded but physically stuck -- and only
                 # these two fields tell them apart after the fact.
-                "yaw_deg": (round(float(np.degrees(yaw)), 1)
-                            if sender is not None else None),
-                "yaw_odom_deg": (round(float(np.degrees(yaw_odom)), 1)
-                                 if sender is not None else None),
+                # Written unconditionally.  They used to be gated on
+                # `sender is not None` -- true only when the pipeline is
+                # publishing commands, i.e. never on the real side, which is run
+                # against a bag with no robot to drive.  The result was a
+                # frames.csv whose whole yaw column was empty exactly where the
+                # yaw mattered most, and a projection bug that rotated the point
+                # cloud by the vehicle heading went unnoticed for a round
+                # because of it.  `yaw_proj_deg` is the value actually handed to
+                # the camera projection, which is the one to look at.
+                "yaw_deg": round(float(np.degrees(yaw)), 1),
+                "yaw_odom_deg": round(float(np.degrees(yaw_odom)), 1),
+                "yaw_proj_deg": round(float(np.degrees(yaw_proj)), 1),
                 "truth_x": (round(float(truth["pos"][0] - truth0["pos"][0]), 3)
                             if truth is not None else None),
                 "truth_y": (round(float(truth["pos"][1] - truth0["pos"][1]), 3)
@@ -658,9 +820,23 @@ def main():
                                 if err_yaw is not None else None),
                 "heading_err_deg": (cmd or {}).get("heading_err_deg"),
                 "ahead_clear": (cmd or {}).get("ahead_clear"),
+                # `height_m` (the cluster's own vertical extent) and
+                # `box_height_m` (what the box + the range say the thing must be)
+                # are the two halves of the cross-sensor consistency test, and
+                # they were missing from this file -- which meant the question
+                # "is this object physically a person" could not be answered
+                # from the delivered frames.csv at all, only by re-running.
+                # `n_after_floor` says how much of the box survived the floor
+                # rejection, which is where the largest single loss used to be.
                 "objects_3d": [{k: p[k] for k in ("x", "y", "z", "depth_m",
-                                                  "n_points", "score",
-                                                  "reproj_ok")}
+                                                  "n_points", "n_used",
+                                                  "n_after_floor", "height_m",
+                                                  "box_height_m", "extent_xy",
+                                                  "width_lat_m",
+                                                  "n_groups", "n_components",
+                                                  "score", "reproj_ok",
+                                                  "z_min", "z_max", "box_h",
+                                                  "world")}
                                for p in objects],
                 "object_names": [p["name"] for p in objects],
                 **{("ms_" + k): round(v[-1], 2) for k, v in times.items() if v},
@@ -685,6 +861,42 @@ def main():
             ctx.close()
 
     # ---------------------------------------------------------------- outputs
+    # Resolve the final 3D store ONCE, here, so the pcd, the point counts in the
+    # summary and the label histogram are all reporting the same map.  They used
+    # to read three different views of it: the pcd had every voxel repeated
+    # (once per frame that saw it, with that frame's label), `stats()` counted
+    # those repeats as if they were points, and the histogram agreed with
+    # neither.  Doing it here rather than per frame keeps it out of the control
+    # loop, where a full sort would cost more than the odometry.
+    wmap.finalize()
+
+    # ---- how much of the green the robot could actually get to ---------------
+    # Reporting only; nothing below uses it.  `traversable_area_m2` counts every
+    # cell the map calls walkable, including the ones with no drivable route to
+    # them -- on the simulator house that was 229.1 m2 against 115.1 m2 actually
+    # reachable, i.e. quoting the first number as "area covered" overstates the
+    # run by a factor of two.  Both are reported so the claim can be checked.
+    reach_note = None
+    reach_radius = 0.22            # FrontierExplorer's default robot radius
+    try:
+        from r2slam.nav import PathPlanner as _PP
+        _pl = _PP(robot_radius=reach_radius, close_px=5)
+        _free, _reach = _pl.reachable_from(wmap, wmap.traj[-1], poses=wmap.traj)
+        _cell = wmap.resolution ** 2
+        reach_note = {
+            "robot_radius_m": reach_radius,
+            "drivable_area_m2": round(float(_free.sum()) * _cell, 1),
+            "reachable_area_m2": round(float(_reach.sum()) * _cell, 1),
+            "stranded_green_m2": round(
+                float((wmap.ground & ~_reach).sum()) * _cell, 1),
+            "note": "reachable = the connected component of the drivable grid "
+                    "containing the robot.  Green floor outside it cannot be "
+                    "driven to, so it is not covered no matter how much the map "
+                    "shows it.  See tools/diagnose_reachability.py.",
+        }
+    except Exception as exc:                      # noqa: BLE001
+        reach_note = {"error": str(exc)}
+
     def pct(v, p):
         return round(float(np.percentile(v, p)), 2) if v else 0.0
 
@@ -703,10 +915,52 @@ def main():
                                           seg[-1, 1] - nav_start_xy[1])), 2)
         nav_eff = round(nav_direct / max(nav_travel, 1e-6), 3)
 
+    # ---- TF ---------------------------------------------------------------
+    # FAQ #6: "we need the built map pcd AND tf; no ground truth is provided."
+    # Written here, before the summary, so the summary can report what actually
+    # landed on disk rather than what we intended to write.
+    tf_info = {"enabled": bool(not a.no_tf and tf_samples)}
+    if not a.no_tf and tf_samples:
+        tf_csv = tf_out.write_tf_csv(a.out, tf_samples, a.tf_parent, a.tf_child)
+        tf_bag = tf_out.write_tf_bag(a.out, tf_samples, parent=a.tf_parent,
+                                     child=a.tf_child)
+        chk = tf_out.verify_tf_bag(tf_bag)
+        conns = chk["connections"]
+        tf_info.update(samples=len(tf_samples),
+                       csv=os.path.basename(tf_csv),
+                       bag=os.path.basename(tf_bag),
+                       topic=conns[0][0] if conns else None,
+                       msgtype=conns[0][1] if conns else None,
+                       messages=chk["n"],
+                       monotonic=bool(chk["monotonic"]),
+                       parent=a.tf_parent, child=a.tf_child,
+                       clock="dataset seconds (NOT Unix time)",
+                       note="parent frame is OUR SLAM start frame; base_link "
+                            "coincides with the LiDAR origin (no offset calibrated)")
+        if chk["n"] != len(tf_samples):
+            print("  *** tf bag holds %d messages for %d poses ***"
+                  % (chk["n"], len(tf_samples)))
+        if not chk.get("monotonic"):
+            print("  *** tf stamps are NOT monotonic -- the bag would play out "
+                  "of order ***")
+        print("  tf: %d poses -> %s + %s (%s, monotonic=%s)"
+              % (len(tf_samples), tf_info["csv"], tf_info["bag"],
+                 tf_info["topic"], tf_info["monotonic"]))
+
     summary = {
         "config": a.config,
         "name": cfg.name,
         "kind": cfg.kind,
+        # Which model produced these numbers.  Added after a model swap: the
+        # summary recorded the *threads* the detector got but not what the
+        # detector was, so two deliverable folders built with different models
+        # were indistinguishable from their own reports.
+        "detector": ({"model": det_model, "names": det_names,
+                      "graph": det.kind, "input_px": int(det.size),
+                      "backend": det.backend, "conf": rt.person_conf,
+                      "prefilter": det.prefilter,
+                      "unmapped_boxes": int(n_unmapped_total)}
+                     if det is not None else None),
         "machine": {"before": t0_snap, "after": t1_snap,
                     "throttling_during_run": throttled},
         "thread_caps": apply_thread_limits(rt, verbose=False),
@@ -714,6 +968,20 @@ def main():
         "frames_recorded": n_rec,
         "frames_skipped_nonmonotonic": n_skipped,
         "frames_missing_control_yaw": n_yaw_missing,
+        # Largest yaw applied to a camera projection over the whole run.  Must be
+        # 0 whenever `lidar.rotates_with_base`; non-zero means the vehicle
+        # heading is being (correctly) folded into the extrinsic.
+        "projection_yaw_deg_max": round(float(np.degrees(yaw_proj_max)), 3),
+        "projection_yaw_zeroed": bool(cfg.lidar.rotates_with_base),
+        "fusion_rejects": dict(reject_stats),
+        "detections": {"boxes": n_boxes_detected,
+                       "localised": n_objects_localised,
+                       "rejected": sum(reject_stats.values()),
+                       "note": "a box in the camera panel with no marker on the "
+                               "map is one of these: it had too few LiDAR "
+                               "returns, or its returns were too short for the "
+                               "class it claimed.  The camera panel prints the "
+                               "same two counts every frame."},
         "source_stamps": ({"from_header": ctx.n_header_stamp,
                            "from_bag_write_time": ctx.n_bag_time,
                            "paired_with_image": ctx.n_paired,
@@ -738,6 +1006,7 @@ def main():
                      "frames_routed": explorer.n_routed,
                      "frames_arc": explorer.n_arc_frames,
                      "sweep_targets": explorer.n_sweep_targets,
+                     "island_probes": explorer.n_island_probes,
                      "sweep_abandoned": explorer.n_sweep_abandoned,
                      "targets_picked": explorer.n_picks,
                      "frames_pose_off_map": explorer.n_pose_off_map,
@@ -765,10 +1034,20 @@ def main():
                         "arrived": bool(navigator.state == "arrived")}
                        if navigator is not None
                        else {"enabled": False, "try": a.goto}),
-        "instances": {"n": len(registry.items), "created": registry.n_created,
+        "instances": {"n": len(registry.visible()),
+                      "created": registry.n_created,
                       "merged": registry.n_merged,
+                      "n_superseded": len(registry.superseded),
                       "by_class": registry.summary(),
-                      "list": [it.as_dict() for it in registry.items]},
+                      "list": [it.as_dict() for it in registry.visible()],
+                      # Kept, not dropped: a duplicate that was merged away is
+                      # evidence about the detector, and deleting it from the
+                      # record would make the run look cleaner than it was.
+                      "superseded": [it.as_dict() for it in registry.items
+                                     if it.id in registry.superseded],
+                      "superseded_note": "same place, different class, fewer "
+                                         "sightings -- see CROSS_LABEL_MERGE_M "
+                                         "in r2slam/nav.py"},
         "runtime": {"threads": rt.max_num_threads, "voxel_size": rt.voxel_size,
                     "min_range": rt.min_range, "max_range": rt.max_range,
                     "lidar_rotates_with_base": bool(cfg.lidar.rotates_with_base)},
@@ -777,7 +1056,8 @@ def main():
         "per_stage_ms": {k: {"p50": pct(v, 50), "p90": pct(v, 90),
                              "p99": pct(v, 99), "max": pct(v, 100)}
                          for k, v in times.items() if v},
-        "map": wmap.stats(),
+        "map": {**wmap.stats(), "reachability": reach_note},
+        "tf": tf_info,
         "accuracy_vs_truth": ({"n": len(truth_err_xy),
                                "err_xy_m": {"p50": pct(truth_err_xy, 50),
                                             "p90": pct(truth_err_xy, 90),
@@ -856,6 +1136,11 @@ def main():
     print("\n=== source health ===")
     print("  frames processed          %d" % n)
     print("  skipped (non-monotonic)   %d" % n_skipped)
+    if reject_stats:
+        print("  fusion gates              %d of %d detector boxes did not become "
+              "objects (%s); see labels.py min_height"
+              % (sum(reject_stats.values()), n_boxes_fused,
+                 ", ".join("%s %d" % kv for kv in sorted(reject_stats.items()))))
     if n_yaw_missing:
         print("  *** %d/%d frames had NO recorded control yaw, but this source's "
               "scanner does not rotate with the base: their fused objects are at "
@@ -944,10 +1229,15 @@ def main():
               % (h["turned_deg"], h["updates"], h["clamped_dt"]))
 
     print("\n=== object instances (the 'target association' step) ===")
-    print("  instances %d  (created %d, merged %d detections)"
-          % (len(registry.items), registry.n_created, registry.n_merged))
+    print("  instances %d  (created %d, merged %d detections, %d merged away as "
+          "same-place duplicates)" % (len(registry.visible()), registry.n_created,
+                                      registry.n_merged, len(registry.superseded)))
     for name, k in sorted(registry.summary().items(), key=lambda kv: -kv[1]):
         print("    %-16s %d" % (name, k))
+    for it in registry.items:
+        if it.id in registry.superseded:
+            print("    (superseded) id=%d %s at (%.2f,%.2f) n=%d"
+                  % (it.id, it.name, it.x, it.y, it.n))
 
     if navigator is not None:
         stm = wmap.stats()

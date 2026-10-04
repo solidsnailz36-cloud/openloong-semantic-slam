@@ -1,179 +1,83 @@
 # SLAM 大师赛 — 项目长期记忆
 
-> 只放**跨会话必须记住的决策与坑**。数字细节与完整链路在各文档里，按下面的索引去找，不要往这里搬。
+> 只放**跨会话必须记住的决策与坑**；数字与推导在文档里，按索引去找。目标 ~6 KB。
 
-## 细节索引（先读这些）
-- **`docs/复赛实施方案.md`＝主文档**：§10–§17 = 五轮实施记录。**`docs/复赛自评与决赛差距.md`＝状态与差距**（含 §8 更新，判断"能不能进决赛"先读它）。
-- `docs/HANDOFF_项目交接.md`（链路/不变量/回退链）、`docs/评审意见归因与修正方案.md`（初赛根因）、`docs/灾备与恢复清单.md`（"东西是不是丢了"先读它）、`docs/复盘_踩坑手册_小白向.md`（改前先备份到 `docs/_bak/`）、对外说明 `out/run5_keepdeg/`。
-- 技能：`gazebo-classic-headless-container` / `remote-job-and-snapshot` / `camera-lidar-person-fusion` /
-  `headless-rviz-recording` / `lidar-map-forensics` / `competition-dataset-triage` / `competition-submission-final-audit`。
+## 索引
+- **★★ `docs/交接_20261004_复赛感知精修.md` = 当前进度交接，新会话第一份读它**（历史版本 `docs/_bak/`）。
+- `docs/复赛实施方案.md`（主文档 §10–§18）；`docs/复赛自评与决赛差距.md`（状态/差距）；
+  `docs/HANDOFF_项目交接.md`、`docs/评审意见归因与修正方案.md`、`docs/灾备与恢复清单.md`、`docs/复盘_踩坑手册_小白向.md`（**改前备份到 `docs/_bak/`**）。
+- 技能：`gazebo-classic-headless-container` / `remote-job-and-snapshot` / `camera-lidar-person-fusion` / `headless-rviz-recording` / `lidar-map-forensics` / `competition-dataset-triage` / `competition-submission-final-audit`。
 
-## 家底 / 赛事现状（2026-09-28 清点，别重复清点）
-- **唯一"丢了不可再得"的是 `D:\E-Downd\data.bag`**（初赛原始 2,532 MB / `/livox/lidar` 6,522 帧）。
-  复赛数据集、官方仿真包、代码、成品、权重**全在本地**；云端独占的只有 `run/scans/`（恰好不需要）。
-- 本机：GPU RTX 2060 / CPU 16 线程；`wsl.exe`·`wmic.exe` 被安全策略拦截。**交付三项都不需要 GPU**。
-- 初赛 = **81 分**（点云分类不错 / **轨迹平滑度欠缺** / **RTK 置信度偏高**）。根因**不是**"最近邻"，
-  是 **RTK 降级段的水平位置回退到里程计**（`docs/评审意见归因与修正方案.md` §5–§6）；修复包未提交。
-  赛事邮箱 `open@openloong.org.cn`，抄送 `luqinghua@openloong.net`。
+## 家底 / 赛事硬约束
+- 唯一"丢了不可再得"的只有 `D:\E-Downd\data.bag`（初赛 2,532 MB）。
+- 初赛 **81 分**，根因＝ RTK 降级段水平位置回退到里程计。邮箱 `open@openloong.org.cn` 抄送 `luqinghua@openloong.net`。
+- **★ 官方答疑＝交付形态硬约束**：实时运行 + **整个数据集的视频** + 自建图 pcd；官方 pcd 只作提示；仿真 LiDAR yaw 按"**不修**"；输入只允许 **点云/图像/IMU**（`/state_estimation`·`/registered_scan` 只能事后评估）；**要输出建图 pcd + TF**；**建图 50% / 感知 50%**。
 
-## 复赛：仿真环境（Gazebo Classic + ROS 1 Noetic）
-- 官方包 `gazebo_models.zip` / `src.zip`；`roslaunch vehicle_simulator house_vehicle.launch`。
-  **场景 20×15 m 单层住宅（凹形）**；**行人模型是静态道具**（`<actor>` 出现 0 次）。
-- 传感器：**VLP-16 `/velodyne_points` 5 Hz / 5,600 点**（**量程 40 m**）；相机 **HFOV 114.6° / 320×180 / 零畸变**。
-  真值 **`/state_estimation` 200 Hz**（**只用于评分，绝不进产物**）+ `/registered_scan`；
-  控制 **`/cmd_vel`（TwistStamped）**；**仿真器不提供规划器** ⇒ "场景探索"要自己写 frontier。
-- **cam↔LiDAR 外参不是单位阵** + **LiDAR 不随车体旋转** → 见下面 ★★ 节。
-- 云端 T4 `gpufree-container`：Ubuntu 20.04 + ROS Noetic + Gazebo 11.15.1 预装；llvmpipe + `Xvfb :99`。
-- **版本化副本 `vendor/sim_scripts/`**：**唯一入口 `run_online.sh`**；探针 `probe_cpu.py` /
-  `probe_kiss_rotation.py` / `probe_coverage.py`；传输 `put_pkg.sh` / `rmt.py` / `rr.sh`·`rr_proxy.sh`；
-  诊断 `t4_diag.sh` / `t4_state.sh`；清场 `kill_sim.sh` / `sim_up.sh`。
-  **凭据只放 `.workbuddy/tmp/ssh_env.sh`，不进 vendor。** 补件模型 `vendor/gazebo_models_patch/hokuyo/`（务必保留）。
-- **容器重启会重置 `/etc/hosts`** ⇒ `models.gazebosim.org` 黑洞化**每次开机后要补一遍**，不补就是经典卡死
-  （世界加载永久阻塞、`sim_time` 恒 0、**零报错**）。这是容器里唯一会丢的东西。
+## 环境
+- **仿真 = 本机 Docker 容器 `r2sim`**（`devrt/simulator-robot`：ROS Noetic + Gazebo 11.15.1）；挂载 `D:/E-Downd/sim_official -> /work`；容器内代码 `/work/r2slam_ws`（**改完本机必须 `docker cp` 过去**）。`docker start r2sim`，`sim_up.sh` 起仿真（`Xvfb :99`）。**Docker Desktop 必须开着**。
+- **真实侧在本机 `.venv` 跑**（1427 帧 ≈5.7 min）。云端 T4 已废弃（校园网到不了）。`wsl.exe`/`wmic.exe` 被安全策略拦截。
 
-### 连不上远端时（2026-09-24 定型；细节见技能 `remote-job-and-snapshot` §7.1）
-- **先跑 `bash vendor/sim_scripts/t4_diag.sh`**：一条命令出判决（本机 TCP → 平台主站 → **第三方节点带对照组**）。
-- **TIMEOUT 有两种**：外面也连不上＝实例没起来；**外面连得上＝是我们这条路径到不了它** ⇒ 改地址/重启是**朝错方向使劲**。
-- **2026-09-29 定性**：手机流量能开 Jupyter ⇒ 实例正常、**只有校园网这条路径到不了**（CERNET↔移动回程）。
-  通道：① 手机热点；② 本机 v2rayN SOCKS `127.0.0.1:10808`（**必须全局模式**）⇒ `bash vendor/sim_scripts/rr_proxy.sh '<cmd>'`。
+## ★★ 官方仿真器两条最贵的坑
+1. **LiDAR 不随车体旋转**（`vehicleSimulator.cpp` 把 LiDAR yaw 写死 0）⇒ **航向不可观测**，`heading.py` 用上一帧指令角速度×实测 dt 死推（p50 1.85°）；**转圈不产生新信息**。
+2. **相机—LiDAR 外参只在 yaw≈0 成立** ⇒ 正解 `p_cam = Rz(-yaw) @ Tcl @ p_lidar`，按 `LidarSpec.rotates_with_base` 配置化（仿真 false，真实 true）。
+- ⚠️ **"反投影回原框"自检抓不到这两条**（往返自消，实测 98.9% 通过）。有效判据是**与 `/gazebo/model_states` 比对**。
+- **★ 仿真硬精度上界**：无 IMU、无里程计话题（只有 `/state_estimation`=真值），航向只能死推，`err_yaw` p50 **0.46°–12.05°** ⇒ **单跑之间不能比分数**，要比就**同一份采集重放**。
 
-## 复赛：算法栈 `r2slam/`（一套代码两个数据源）
-- **纪律**：`config.py` + `sources/` 是全项目**唯一**允许知道"仿真/真实"的地方，分支写在 `config/*.yaml`；
-  下游只认 `Frame`。**下游出现 `if sim` = 设计失败。** 唯一例外是 bag **路径**（属机器不属数据集）⇒ `R2SLAM_BAG_PATH`。
-- 模块清单与职责见 `r2slam/README.md`（别在这里重复）。要点：**`labels.py` 是类别表的唯一定义源**
-  （25 类 = 2 几何 + 23 类室内物体），导出 `label_table.yaml` 随 pcd 交付（FAQ 不提供 ⇒ **交付物必须自带**）。
-- **`tools/online_pipeline.py` 是产出交付物的主程序**（一条循环里出两个视频 + pcd）：
-  `--explore` / `--goto` / `--dump` / `--dump-grids` / `--npz` / `--encode` / `--person-only`。
-  **入口 `vendor/sim_scripts/run_online.sh`（唯一入口）**。
-- **`tools/package_submission.py` = 终审脚本**：逐条核对（视频≤2min / pcd 字段与字节自洽 /
-  **pcd 里每个 label 都在表里** / 两源同表 / 包≤500MB），**任一条 FAIL 就非零退出**。
-- **`nav.py` = 决赛半场**：`ObjectRegistry` + `find_label`（中英同义词/模糊）+ `PathPlanner`（A*，按半径膨胀）
-  + `SemanticNavigator`（与 FrontierExplorer **同接口**）。**`explore.py` 用的是同一个 `PathPlanner`。**
-- **交付三项**：仿真视频 + 真实视频 + **建图 pcd**（视频取更严口径 **≤2 min + 含可视化界面**）。
-  四处换轨＝离线→在线、RTK→室内、19 类→**人物/可通行/物体**、新增**相机-LiDAR 融合**。
-  **不搬 SFPNet** —— **放弃初赛资产本身就是泛化能力的论证**。
-- **交付物与提交包**：`r2slam/out/{online_sim,online_real}/`（各 run.mp4 + map.pcd + label_table.yaml +
-  summary.json + frames.csv）。包 = `提交包/…—【固态蜗牛队】—【张煜晨】—【156****6887】.zip`
-  = **129,691,886 B / md5 `83f8173cf665b532eda3818d4e9d125b`**（第六轮重出，终审 0 FAIL / 0 WARN；
-  更早的 `96e1953e…` 归档在 `提交包/_backup/`，`70ae5a09…` 已作废）。
-  真实侧 pcd md5 `0580cc1c…`（未动）。**pcd 字段 `x y z label rgb`（17 B/点，不导 intensity）**。
-- **★ 交付链每一环都要能自我核对**（两次真实事故换来的，详见今日日志）：
-  ① **终审 FAIL 时绝不许写 zip**（它曾用一个坏包覆盖掉最后一份好包）；
-  ② **传输完要比对远端/本地 md5** —— `get ok` 也可能留下截断文件，而且
-     **"字节数已到位、内容还在变"是真的**（连续三次 md5 不同而 size 恒定）⇒ **尺寸不算证据**。
-- **bag 的记录时刻 ≠ 传感器时间** ⇒ **必须用 header.stamp**（否则 dt 成 0/0.5 s 交替，里程计发散，130 s 跑出 9,573 m）。
-  **`offset_time` 从帧戳倒推** ⇒ `time_offsets_from: end`；猜错是把畸变**翻倍**。
-- **远端 python 环境**：`slam_comp/venv`（`include-system-site-packages` 要改 `true` 才有 `rospy`；
-  **`/root/sim/pylibs` 已废弃**——自带 numpy/cv2 会顶掉 venv 的版本）。
-- **改完管线必须先两源各跑 5 帧冒烟；改函数签名后必须真跑一次，不能只编译**：
-  一个"只在首帧有检出才触发"的 `UnboundLocalError` 让仿真连跑三次没报错、真实走廊第一帧就炸；
-  另两次运行时错（`yaw` 未定义、`has_big` 用在定义前）`compileall` 都是绿的。
+## 感知（定论）
+- 检测器 = **YOLO11n ONNX**（`vendor/detector/yolo11n.onnx`，640，COCO80；运行时只用 onnxruntime/cv2，**无 torch**）。旧 tiny-yolov3 退役（把 youbot/椅子认成人）。
+- YOLO11 输出裸 `[1,84,8400]`（cxcywh+letterbox，**无自带 NMS**）⇒ 解码自写 ⇒ **必须 `tools/check_onnx_parity.py` 对 ultralytics 逐帧比对**（偏差 ≤1 px、0 漏、0 类错）。
+- `labels.py` = 类别表唯一定义源（`min_points`/`min_box_frac`/`min_height`）。
+- `fusion.py`：深度用**相机中心距离**（原 `p[:,0]` 是 LiDAR 前向分量，斜视时全错）→ 按**深度间隙切近组**→ **体素连通域取大簇**；返回 `_idx` 供 `obj_mask`。
+- **A/B（同 332 帧只换感知）**：person 实例 25→5（3 真人全中，误差 0.20–0.25 m）；残差 median 0.43→0.33 m。
 
-## 探索策略（五条硬规则；详见方案 §17/§18 与 `r2slam/README.md`）
-1. **候选只按距离排 ⇒ 极限环** → 前沿簇连通分量 + `score = 簇大小/(1+距离)` + `min_target_range`（≥1 m）。
-2. **★ 可达性是"连通分量"，不是"直线射线"**。射线＝假设机器人能飞（门在侧面时门后**永远**被否掉，
-   症状＝看得见门口、进不去）。正解：机器人所在可走连通域 + 直线不通就 **A\* 规划 + 前视跟随**
-   （复用 `nav.PathPlanner`，**探索与导航只差目标从哪来**）。**边界**：门口若从未被观测成地面 ⇒ 判为走不到。
-3. **★★ 地面掩码是"一层点"** ⇒ 谈"塞不塞得下机器人"前**必须先闭运算**
-   （146.7 m² 分 57 块；**第一帧 0.00 m²** ⇒ 策略在第 1 帧宣布"探索完成"），
-   但**不能穿过已知障碍** ⇒ `close(free) & ~dilate(obstacle,3×3)`。
-4. **航向差不是停车的理由 —— 该画弧**：三档油门（前挡 ⇒ 原地转；≤25° ⇒ 直行；
-   **中间且"转过去之后的方向"为空 ⇒ 走弧**，半径 `v/w ≈ 0.24 m`，比机器人本体还小）。
-   旧版"先转到位再走"实测 **56% 的帧在原地转**、25.97 m 只挪 1.74 m。近 180° 掉头仍原地转。
-5. **★ 大视场传感器上 frontier 不够用**：40 m 世界对齐扫描器**一个视点看完屋子** ⇒ 前沿都在身边一两米，
-   而**真能走到**的 100.4 m² 里 **94 m² 从没靠近过**（中位 4.57 m）。⇒ 新增 `sweep`：去"从没靠近过的可达地面"
-   （用 `wmap.traj` 标访问过的位置），frontier 兜底。价值是**把目标放远、从而逼出 A\* 绕行**：
-   同场景对照 —— **关 sweep：`0 帧在规划路径上` / 138.5 m² / 24.6 m；开 sweep：`456 帧` / **165.9 m²（+19.8%）** / 36.3 m**。
-   配套：目标指向**块的深处**（指最近格＝每 0.6 m 换目标的蠕行）；块按**离起点**排序
-   （否则左右等距时横跳，214 帧只挪 0.61 m）。
-   ⚠️ **给它加"进度期限"实测更差**（覆盖 33.5% → 27.5%）：**折返不覆盖新地面** ⇒ 默认关闭
-   （`sweep_stuck_frames=0`），断言显式打开。
-- **★ 判据三次盯错量**（症状每次相同：机器人停下，而理由听起来很合理）：
-  停条件盯“**过了多少帧**”（原地转一帧也不产生信息）→ 改“到过目标却没学到东西”；
-  可达性盯“**直线**”（机器人不能飞）→ 改连通分量；
-  停滞盯“**看到的地面**”（走过新地方不长这个量）→ 改“**没走过的地面**”。
-  **每个“什么都没发生”的判据，都要说清它盯的是哪个量。**
-- **`barren_targets` 只在“剩下的都是小簇”时才允许停**（第一版无条件 ⇒ 270 帧就停、
-  还剩 772 格可用前沿，**比它取代的旧判据更差**）。探索报 done 后管线 **break**，否则视频后段是定格画面。
-- **覆盖率口径**：`vendor/sim_scripts/probe_coverage.py` 读回 `--dump-grids` 的栅格 + 出一张图。
-  **“146.7/~280≈52%”是错的分母**（280 是地皮、房子是凹的）。
-  ⚠️ **`traversable_area_m2` 衡量的是"看到"不是"走过"。**
-- **★★ 导航（决赛）两条**：① **终点不许 snap**（起点可以）—— 一个只观测 1 次的目标落在可通行空间外，
-  终点被 snap 到**脚边 0.24 m**，“路径”成了短线，导航以 0.24 m 半径**绕了 674 s、
-  158.65 m 只前进 5.78 m（效率 0.04）**，**而状态机全程认为自己健康**；现在不可达 ⇒ `unreachable`。
-  ② **`stuck` 期限**：`_best_d` 在 N 帧内没再缩短就报 `stuck` ——
-  **判据是“是否更接近”，不是“是否在动”**（绕圈也在动）。
-  **“反投影自检”和“地图看着对”都抓不到这个错。**
-- 真值对照（`/state_estimation`）**位置 p50 0.20 m** ⇒ 位姿可信。
+## 交付文件本身"不报错的错"（第三轮，全部已修）
+① pcd **从没跨帧去重** ⇒ 同体素每帧各追加，实测重复 **28–59 倍**；② 标签"先到先得" ⇒ 单帧误检**永久污染整面墙** ⇒ 改**按体素投票 ≥2 票**（⚠️ **一帧一体素只投一票**，按点计则单帧自己能凑够）；③ 加 **`max_height`**（墙本来就高）；④ **跨标签实例合并** `CROSS_LABEL_MERGE_M=0.8`；⑤ `cell_of` 必须 `np.floor`（`astype(int)` 朝零截断⇒出界点贴到边界=墙）；体素键空间**必须独立于 extent**。
+- **渲染层两坑**：折线**掩掉窗口外点再拼接**⇒连出没走过的直线（按连续段分段画）；面板固定 20 m 窗⇒远处目标画不出（改自动取景）；只画"已确认实例"会让"检出未定位"看着像"没检出"⇒加**当帧细环形标记**。
 
-## 复赛：感知（"能否检出人物"＝ **能**）
-- 检测器 `vendor/detector/tiny-yolov3-11.onnx`（35.5 MB，COCO **80 类**，person=0）+ **onnxruntime**；
-  **不用 ultralytics**（要适配嵌入式计算平台）。12–36 ms/帧（10 Hz 预算 100 ms）。**未被训练或微调过。**
-- **只取 23 类室内物体**（`labels.py` 的门限 `min_points`/`min_box_frac`/`min_conf` 都是物理量不是调参）。
-  `detect.detect_mapped()` 返回**本项目的 label id**；规则＝**取网络自己的 top-1，只有叫得出名字才保留**
-  （不"挑最好的已映射类"，否则 0.9 的 bicycle 会变成 0.2 的 chair），被丢弃的框数进 summary。
-- **解码三坑（都静默出错，详见 §12）**：① 框是 **(y1,x1,y2,x2) 且已是原图像素**；② **图内 NMS 的
-  `indices` 是空的**，必须自写；③ `onnxruntime` scores `(80,N)` vs `cv2.dnn` `(N,80)` ⇒ **解码要轴序免疫**。
-- **可通行（几何法、零训练）三个归零点**：① 障碍只取**离地 0.35–2.0 m 的带**（否则天花板把全图标成障碍）；
-  ② **先闭运算补地面圆环缝、再对障碍膨胀**；③ 地面容差**随距离增长** `0.10+0.035·d`。
-  真实地面 `z≈−1.18 m`；仿真 `z≈−0.79 m`。**两源阈值完全相同、没调参。**
-- **融合硬判据**：三维位置**反投影回图像必须落回原框内**（真实侧 6/6 OK）。
-  ⚠️ **但它抓不到"整体错一个角度"**（往返自消）；深度取框内点 **30 分位**。
-- **真实走廊加类别几乎不增产出**（400 帧只多 1 个 chair）；**仿真是主战场**。
+## 根因史（v4–v6，压缩）
+**v4**：① "标到墙上"**不是深度错**（LiDAR 深度对真人准到 0.97–1.01× 真距），错的是 **2D 框比实物高约 1.6 倍**，框吞墙点 ⇒ 加跨传感器门限 `LABEL_BOX_HEIGHT`；② 房间进不去**不是探索问题**（绿 230.7 m²，机器人只够得着 115.1 m²），**别再改探索策略**；③ 真实侧"检出人没标记"不是绘制问题 ⇒ 是**框没融合成物体**；真实数据集是**健身房**，"被认成人的机器人"其实是**白色训练器械**。
+**v5**：① 真实侧把点云**按里程计航向反向旋转**再投影（`yaw` 补偿只该给仿真用）⇒ `yaw_proj = 0 if rotates_with_base else yaw`，`localised` 46.9%→95.3%（**藏一轮因 `frames.csv` yaw 列被门控成空列** ⇒ 教训：**空列让 bug 隐身**）；② 融合把**平地板**当目标 ⇒ 融合前用 `traversable.is_floor` 剔地面点；③ `min_height=1.00` 加错了（虚多是墙本来就高）⇒ 改 **0.40**；④ "标在墙上"靠**相对**判据 `LABEL_MAX_BOX_RATIO` 压住（真人 p50 1.65 vs 墙上虚多 4.57）⚠️ 一次跑的分隔度不能当跨跑阈值；残留：同墙被标 5 个 `chair`（每类要各自标定）；⑤ **规划层绝不能用"当帧回波"**（规划图逐帧闪变⇒原地打转）；⑥ 障碍层"一帧定死"+膨胀吃掉一半绿 ⇒ `OBSTACLE_MIN_VOTES=2`，但**安全单独走 `blocked()=obstacle|obstacle_now`**；`seen` 不再被天花板污染（`seen_mask`，`h<=OBSTACLE_HI`）。
+**v6**：① **`box_h_px` 在 ~32 px 触底**（检测器 stride 下限）；`box_height_m = depth*box_h/f` 在远处失效（2.42m→74px→1.74m ✓；9.93m→32px→3.09m ✗）⇒ 旧门限在 5–9 m 外拒掉真人（258 真人框杀 118）；② 修法：**两条判据用 `or`**（各为充分条件）：`pass_width = width_lat ≤ 0.55`（任何距离成立）`or pass_box = (box_h_px ≥ 48) and (0<框推高 ≤2.40)`；`and` 会让真实侧 79% 真人框误杀。⚠️ `width_lat` **必须是相机系横向跨度**（`xc[:,0]` 极差）。效果：仿真真人被标 **35%→90%**，真实侧 **100% 保留**；③ 灰/绿/黑定义见下；④ 门口是**实体回波**（0→2.53 m 铺满），`diagnose_bottleneck.py` 量出客厅到各房间**瓶颈净宽 0.00 m**（拓扑连续，非膨胀参数）——机器人贴墙开过但墙在相机 **±57° 视场外** ⇒ 该改的是**去看**；⑤ 真实侧灰斑机制=**针孔 283/300 是障碍格**（28% 障碍块仅 1 格）；⑥ 三个"看起来在跑"的坑：同步脚本自检索引被清空表⇒`KeyError`；`| tail` 吞退出码 + `pipefail`⇒脚本打 SIM_READY 后中止（症状只有输出目录没变）；`sim_up.sh >/dev/null` 藏了 `gzserver` 僵死。**绝不静音一个允许失败的步骤；链条里别用管道接脚本。**
 
-## ★★ 官方仿真器：LiDAR **不随车体旋转** + **外参不是单位阵**（最贵的两条）
-- **`vehicleSimulator.cpp` 在移动 LiDAR 模型前把四元数 yaw 写死为 0**，而相机拿到完整姿态
-  ⇒ LiDAR 被搬到车体位置但**朝向恒为世界对齐**。实测：我们的 yaw 全程 ±1.6°，真值 yaw 扫过 359°，
-  指令累计转过 6656°。**KISS-ICP 报"没转"是对的。**
-- 后果一：**航向不可观测** ⇒ 按航向控制的策略永远转不完。解药 `heading.py`：用**上一帧指令角速度 ×
-  实测帧间隔**死推航向（轮式里程计语义），dt 上限夹住并计数。死推误差 **p50 1.85°**（原 79–89°）。
-- 后果二：**相机—LiDAR 外参只在 yaw≈0 成立** ⇒ 正解 `p_cam = Rz(-yaw) @ Tcl @ p_lidar`；
-  已按 `LidarSpec.rotates_with_base` 配置化（仿真 false / 真实 true）。外参本身的正解与消歧法
-  见 `r2slam/README.md` 与方案 §16.4（**"位置相同"≠"朝向相同"**；按单位阵投影 5,600 点里 **0 点入画**；
-  消歧必须用**机器人自己的真实位移**，"点阵看着在左边"是循环论证）。
-- 后果三（第五轮补）：**转圈不产生任何新信息** ⇒ 见"★★ 这份仿真器上探索是假的"。
-- ⚠️ **"反投影回原框"自检抓不到外参错**：往返自消（实测 98.9% 通过，yaw 90–180° 区间 100%）。
-- 诊断顺序：① 先查里程计（被自己的**弧度当度**打印坑了一次）→ ② `probe_kiss_rotation.py` 测 voxel
-  （1.0 每步短 8–15°，0.5/0.3 正常）但**换 voxel 无效** ⇒ 不是参数 → ③ 读官方源码看到那一行。
-- **★ 两阶段流程自身的坑**：`--npz` 复算**没有驱动器** ⇒ 上一帧指令恒 0 ⇒ 航向恒 0；
-  而融合用的正是航向 ⇒ **复算出的每个物体都被绕机器人转过一个错误角度，而地图看着完全正常**。
-  处置：`dump_frame(..., extra={"control_yaw": yaw})` 存进 npz 优先采用；summary 增
-  `frames_missing_control_yaw` 并**大声报**。
+## 语义地图三色定义（boss 问过）
+```
+绿 ground     = ground_ever & ~obstacle   这格确认是地板（有回波落在 |h|<容差）
+灰 seen&~ground = 看过这里但没找到地板
+黑 其它        = 从没有回波落在这里
+```
+**关键：格子只有"有回波落进去"才算 seen，射线穿过不算** ⇒ 真开着的门应画黑。
 
-## 复赛：真实数据集（`D:\E-Downd\openloong.zip` 1.97 GB）
-- **标定齐全不用自己标**：鱼眼 `FishPoly` 1600×1296；`Tcl_0` 语义已解；**等距 `r=f·θ`（f=730.6）投影已验证**。
-- **`three1` = 真机 ROS 2 bag**，130 s：`/odin1/cloud_raw`(1336) / `image/compressed`(1335 JPEG 鱼眼) / `imu`(559)。
-  点云 **49,152 点/帧**，带 `offset_time` 0–0.094 s ⇒ **必须去斜**。**IMU 基本不可用**，赛题也不要求。
-- `map_*.bin`（`MAPV0001`）厂商私有、**我方不需要解析**；**`LiDAR Map.pcd` 与仿真 house 不是同一场景**。
+## 真实数据集
+- 新 `openloong_r2.zip`(6.34 G) → `D:\E-Downd\openloong_r2_ex\`（`config/real_r2.yaml`）。
+- 相机 FishPoly 1600×1296, A11=730.56；`LiDAR2IMU_0`≈单位旋转 ⇒ **IMU 与 LiDAR 共姿态**；图像 topic `/camera/rgb`。
+- 点云 49,152 点/帧带 `offset_time` 0–0.094 s ⇒ **必须去斜**；IMU 成串到达、基本不可用。标定用**等距 `r=f·θ`（f=730.6）**已验证。
 
-## 初赛遗留口径 + 已证伪（归档；细节见 `docs/HANDOFF_项目交接.md`、`评审意见归因与修正方案.md`）
-- 类别编号用 mmdet3d SemanticKITTI 19 类 0 基（官方表 road=9，**差 1**）。
-  `path.yaml` 的 `stamp` 是 bag 原生相对秒；初赛场地是**坡地**，交付物统一 **ENU**；
-  `geo_trajectory.py` 只做 2D 水平拟合（`up` 带 0.883° 倾角）⇒ **"只改地图、轨迹不动"是错的**。
-- **组委会材料互不覆盖** ⇒ 终审两份都读、按更严的执行（录屏时长吃过亏：主页 5 min vs 文档 2 min）。
-- **地面三级细分不可恢复**（分界是到传感器的距离，不是材质）⇒ 归并是唯一诚实做法。**car = 自车**，应剔除。
-- **平滑"改正量"是陷阱**：`e = r_local − P0` 含里程计抖动的负值，滤波会把抵消一起滤掉 ⇒ 抖动原样回到位姿。
-  **改位姿一律 `PICK=1`；真要平滑就平滑位置。**
-- **最近邻的时差是常量滞后（30 ms），不是锯齿来源**；**字段存在 ≠ 字段有效**（仿真 `time` 全 0）。
-- 实时性根因**不是算法**，是**容器 CPU 配额被线程池超订**（`nproc`=80 是宿主机的，`cpu.max` 只给 8）；
-  解药＝**显式限制每个库的线程池**，限线程**不改变轨迹**（表格 → 方案 §13/§14）。
-  测量坑：循环同一批帧会让 ICP 虚快；**只看 p50/p90 会误判，要导出逐帧序列**；归因必须先做受控实验。
+## 算法栈不变量
+- `config.py` + `sources/` 是全项目**唯一**允许知道"仿真/真实"的地方；下游只认 `Frame`。**下游出现 `if sim` = 设计失败**。
+- `tools/online_pipeline.py` = 产出交付物主程序；`tools/package_submission.py` = 终审（任一 FAIL 非零退出）。**终审 FAIL 绝不许写 zip**。
+- 交付物 `r2slam/out/{online_sim,online_real}/`：run.mp4 + map.pcd + label_table.yaml + summary.json + frames.csv + tf.csv + tf/。pcd 字段 **`x y z label rgb`（17 B/点）**。
+- **★ 当前包** = `提交包/…【固态蜗牛队】…zip` = **36,204,882 B / md5 `ec8260d28de6590033be36daca247b6c`**（终审 0 FAIL / 0 WARN）。上一版 `129d3764…`(37,357,792 B) 在 `_backup/20261004_2100_v5_129d3764.zip`。**MAP 里没有 torch**。
+- **bag 记录时刻 ≠ 传感器时间** ⇒ 一律 `header.stamp`；`offset_time` 从帧戳倒推 ⇒ `time_offsets_from: end`。
+- **`--npz` 复算没有驱动器** ⇒ 上一帧指令恒 0 ⇒ 航向恒 0 ⇒ **每个物体被绕机器人转过错误角度而地图看着正常** ⇒ `dump_frame(extra={"control_yaw": yaw})` 必须存。
+- **改完管线必须两源各跑 5 帧冒烟**；改函数签名后**必须真跑一次**。
+- **传输/比对：尺寸不算证据**（曾三次 md5 不同而 size 恒定）⇒ 比 md5。
+- `voxel_size=0.5`；`pcd_voxel 0.15` 与配准 voxel 解耦。
+- ⚠️ `tools/diagnose_ground.py` 读数**不可信（差 4 倍）**，嫌疑：不应用 object mask（管线 `obstacle_mask = ... & ~obj_mask`）。**修好前不下真实侧灰斑结论**。
 
-## 硬规则（只留没别处可查的；其余见技能，避免重复）
-- **每个会话开头先补 PATH**：`export PATH="/c/Users/ZhuanZ/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:$PATH"`
-  （Bash 工具本机缺 coreutils，`dirname`/`tail` 都会 command not found）。
-- **含中文的路径**：存在性判断一律用 Python `os.path.exists`，不要用 Git Bash 的 ls/cd/find。
-- 其余硬规则已固化在技能里，不在这里重复：`remote-job-and-snapshot`（Windows↔远端四坑、长任务脱 channel、
-  快照、**§7.1 第三方节点+对照组**、**§9.1 任何库的线程池都要限 / §9.2 别在饱和机器上优化 / §9.3 落盘→复算 /
-  §9.4 后台线程要上报失败**）、`gazebo-classic-headless-container`（pkill 自杀、`set +u`、`check_world_models.py`、
-  只认 `sim_time`、`stdbuf`、catkin 0 字节 CMakeLists、**驱动三要求 + frontier 八要点**）、
-  `competition-submission-final-audit`（"新的一件+旧的三件"、近似公式先怀疑公式）、
-  `lidar-map-forensics`（RTK 只取 `status==2`、平滑"改正量"陷阱）。
-- **同一文件多处修改必须串行发 Edit**（并行会互相覆盖）；`Write` 覆盖前先 `Read`。
-- **★ 跨项目通用的两条测量纪律**：① **不要让任何库按 `nproc` 决定线程池**——超订 10 倍 ⇒ cgroup 周期性冻结
-  ⇒ **连无关的单线程 numpy 代码都被拖慢 3–5 倍**；② **不要在饱和的机器上做优化决策**
-  ——先跑 `vendor/sim_scripts/probe_cpu.py` 拿跨机可比定标。
-- **★ 最普适的一条：自检通过 ≠ 正确**。"反投影回原框"是往返自消、抓不到整体错一个角度；
-  "地图看着对"抓不到所有物体被转过一个角；两阶段复算"跑通了"抓不到它丢了航向；
-  "两源类别表语义相同"抓不到 CRLF 与 LF 的差别。**判据要落在具体量上**
-  （npz 里到底有没有那个数、同一份产物是否逐字节一致）。
+## 探索（5 条硬规则；详见方案 §17/§18）
+1. 候选只按距离排⇒**极限环** ⇒ 前沿**簇连通分量** + `score=簇大小/(1+距离)` + `min_target_range`。
+2. **可达性是"连通分量"不是直线射线**（症状=看得见门口、进不去）。
+3. **地面掩码是"一层点"** ⇒ 先闭运算，但**不能穿已知障碍** ⇒ `close(free) & ~dilate(obstacle)`。
+4. **航向差不是停车理由——该画弧**（三档油门：原地转 / ≤25° 直行 / 走弧）。
+5. 大视场传感器上 frontier 不够 ⇒ 加 `sweep`；目标指向**块的深处**。
+- **★ 每个"什么都没发生"的判据都要说清盯的是哪个量**（帧数/直线/看到的地面 都曾盯错）。
+- **★ 探索停条件改对过两次**：第一错盯"看到的地面"→改"**没走过的地面**"；第二错**赶路时误判停滞** ⇒ 加 `_closing_on_target()`，效果 帧 452→1452、路程 37.75→126 m。
+- ⚠️ 探索常被 `--duration` 截断（`done_reason: null`），**房子北半边从未靠近** ⇒ 9/19 漏检主要是**没走到**。
+- ⚠️ **仿真单跑方差极大**（路程 112/47/94/96/44/59 m，一次 300 帧没走动）⇒ **最该修的东西之一**。
+
+## 硬规则
+- **每个会话开头先补 PATH**：`export PATH="/c/Users/ZhuanZ/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:$PATH"`。
+- **含中文路径**：存在性判断一律用 Python `os.path.exists`，不要用 Git Bash 的 ls/cd/find。
+- 同一文件多处修改**串行**发 Edit；`Write` 覆盖前先 `Read`。
+- **★ 最普适：自检通过 ≠ 正确**。判据要落在**具体量**上。
+- 其余见技能：`remote-job-and-snapshot`、`gazebo-classic-headless-container`、`competition-submission-final-audit`、`lidar-map-forensics`（RTK 只取 `status==2`）。

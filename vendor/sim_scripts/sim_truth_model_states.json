@@ -1,0 +1,590 @@
+{
+ "wait_s": 6.0,
+ "models": [
+  {
+   "name": "aws_robomaker_residential_ShoeRack_01_0",
+   "xyz": [
+    -8.086,
+    -0.49,
+    0.003
+   ],
+   "quat": [
+    0.0,
+    0.0019,
+    -0.0012,
+    1.0
+   ],
+   "moved_m": 0.0059
+  },
+  {
+   "name": "aws_robomaker_residential_SofaC_01",
+   "xyz": [
+    -3.412,
+    3.612,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0001,
+    0.0069,
+    1.0
+   ],
+   "moved_m": 0.0002
+  },
+  {
+   "name": "ground_plane",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "house",
+   "xyz": [
+    -2.919,
+    -0.593,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "arm_chair",
+   "xyz": [
+    -0.721,
+    5.725,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_hospital_curtain_half_open_01",
+   "xyz": [
+    -11.24,
+    -6.568,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    -1.0,
+    0.0023
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_KitchenCabinet_01",
+   "xyz": [
+    3.567,
+    5.039,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Refrigerator_01",
+   "xyz": [
+    6.229,
+    6.306,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Wardrobe_01",
+   "xyz": [
+    -5.201,
+    5.906,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    -0.7087,
+    0.7055
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_TVCabinet_01",
+   "xyz": [
+    1.679,
+    3.839,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "citizen_extras_female_02",
+   "xyz": [
+    -2.079,
+    -5.111,
+    0.0
+   ],
+   "quat": [
+    0.0008,
+    -0.0125,
+    -0.0001,
+    0.9999
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "citizen_extras_male_03",
+   "xyz": [
+    -2.358,
+    -0.081,
+    0.011
+   ],
+   "quat": [
+    0.0063,
+    0.0012,
+    0.0001,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "cocacola",
+   "xyz": [
+    1.633,
+    2.72,
+    0.509
+   ],
+   "quat": [
+    0.0001,
+    0.0001,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "ikea_folke_chair",
+   "xyz": [
+    -4.139,
+    1.602,
+    0.001
+   ],
+   "quat": [
+    0.0001,
+    -0.0019,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "ikea_stefan_chair",
+   "xyz": [
+    -4.155,
+    0.806,
+    -0.0
+   ],
+   "quat": [
+    0.0,
+    -0.0008,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "ikea_folke_chair_0",
+   "xyz": [
+    -4.172,
+    -0.036,
+    0.001
+   ],
+   "quat": [
+    0.0001,
+    -0.0019,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "kitchen_table",
+   "xyz": [
+    4.047,
+    -4.835,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "person_walking",
+   "xyz": [
+    1.094,
+    -3.314,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    -0.0,
+    0.9185,
+    0.3953
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "ikea_stefan_chair_clone",
+   "xyz": [
+    3.646,
+    -3.594,
+    -0.0
+   ],
+   "quat": [
+    0.0,
+    -0.0008,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "ikea_stefan_chair_clone_0",
+   "xyz": [
+    3.62,
+    -4.472,
+    -0.0
+   ],
+   "quat": [
+    0.0,
+    -0.0008,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "ikea_stefan_chair_clone_1",
+   "xyz": [
+    5.384,
+    -3.66,
+    -0.0
+   ],
+   "quat": [
+    0.0008,
+    0.0,
+    0.9996,
+    0.0267
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "ikea_stefan_chair_clone_2",
+   "xyz": [
+    5.442,
+    -4.523,
+    -0.0
+   ],
+   "quat": [
+    0.0008,
+    0.0,
+    0.9999,
+    0.0139
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "saucepan",
+   "xyz": [
+    2.344,
+    3.748,
+    0.926
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    -0.0009,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "sofa",
+   "xyz": [
+    -11.897,
+    2.213,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.6971,
+    0.717
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "youbot",
+   "xyz": [
+    4.307,
+    -6.161,
+    0.084
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.004,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Bed_01",
+   "xyz": [
+    -9.02,
+    5.657,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Wardrobe_01_clone",
+   "xyz": [
+    -5.228,
+    4.828,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    -0.7087,
+    0.7055
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Wardrobe_01_clone_0",
+   "xyz": [
+    -5.24,
+    3.738,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    -0.7087,
+    0.7055
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_ChairD_01",
+   "xyz": [
+    -12.257,
+    4.548,
+    -0.0
+   ],
+   "quat": [
+    -0.0,
+    0.0005,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_FitnessEquipment_01",
+   "xyz": [
+    -11.869,
+    -2.002,
+    0.0
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_TV_01",
+   "xyz": [
+    1.831,
+    3.699,
+    0.512
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Trash_01",
+   "xyz": [
+    -1.686,
+    5.291,
+    0.001
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Trash_01_0",
+   "xyz": [
+    -12.38,
+    5.471,
+    0.001
+   ],
+   "quat": [
+    -0.0,
+    -0.0,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Trash_01_1",
+   "xyz": [
+    2.535,
+    3.02,
+    0.001
+   ],
+   "quat": [
+    -0.0,
+    -0.0,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "aws_robomaker_residential_Vase_01",
+   "xyz": [
+    1.727,
+    4.617,
+    0.51
+   ],
+   "quat": [
+    -0.0,
+    -0.0,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "cardboard_box",
+   "xyz": [
+    -11.743,
+    -0.757,
+    0.149
+   ],
+   "quat": [
+    -0.0,
+    0.0,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "camera",
+   "xyz": [
+    -0.0,
+    -0.0,
+    0.749
+   ],
+   "quat": [
+    -0.0,
+    0.0,
+    -0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "lidar",
+   "xyz": [
+    0.0,
+    0.0,
+    0.75
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  },
+  {
+   "name": "robot",
+   "xyz": [
+    0.0,
+    0.0,
+    0.75
+   ],
+   "quat": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ],
+   "moved_m": 0.0
+  }
+ ]
+}

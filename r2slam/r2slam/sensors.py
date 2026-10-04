@@ -93,6 +93,21 @@ def decode_compressed(msg) -> np.ndarray:
     return np.asarray(Image.open(io.BytesIO(blob)).convert("RGB"))[:, :, ::-1].copy()
 
 
+def decode_image_any(msg, msgtype: str) -> np.ndarray:
+    """Decode either `sensor_msgs/Image` or `CompressedImage`, chosen by type.
+
+    The two real bags differ: `three1` publishes JPEG (`CompressedImage`),
+    `r2` publishes raw `bgr8` (6.22 MB/frame -- which is why r2's bag is 11 GB
+    where three1's is 2 GB).  The message type is the only safe discriminator:
+    BOTH type names end in "Image", so a suffix test would silently hand the
+    raw frame to `cv2.imdecode` and fail, or worse, decode something plausible.
+    """
+    carrier = str(msgtype).rsplit("/", 1)[-1]
+    if carrier == "CompressedImage":
+        return decode_compressed(msg)
+    return decode_image(msg)
+
+
 def camera_info_to_dict(msg) -> Dict:
     """K/D in the same vocabulary as our CameraModel, for cross-checking config."""
     K = list(msg.K)

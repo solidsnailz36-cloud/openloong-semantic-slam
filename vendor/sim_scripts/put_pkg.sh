@@ -29,11 +29,14 @@ r2slam/viz.py
 r2slam/sysinfo.py
 r2slam/detect.py
 r2slam/fusion.py
+r2slam/heading.py
+r2slam/nav.py
 r2slam/traversable.py
 r2slam/deskew.py
 r2slam/odometry.py
 r2slam/worldmap.py
 r2slam/explore.py
+r2slam/tf_out.py
 r2slam/sources/__init__.py
 r2slam/sources/base.py
 r2slam/sources/bag_ros2.py
@@ -45,9 +48,15 @@ tools/time_odometry.py
 tools/motion_cost_experiment.py
 tools/thread_consistency.py
 tools/test_explore.py
+tools/test_nav.py
+tools/test_instances.py
+tools/test_tf_out.py
+tools/compare_vendor.py
+tools/diag_track_scale.py
 tools/online_pipeline.py
 config/sim_house.yaml
 config/real_corridor.yaml
+config/real_r2.yaml
 README.md
 "
 

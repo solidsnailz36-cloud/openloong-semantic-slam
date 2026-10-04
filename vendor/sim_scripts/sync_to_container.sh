@@ -1,0 +1,108 @@
+#!/bin/bash
+# sync_to_container.sh -- put the current local tree into the r2sim container.
+#
+# Why this exists
+# ---------------
+# The container runs a COPY of the package at /work/r2slam_ws.  Editing the
+# local tree does nothing to a simulation that is already running, and the
+# failure is completely silent: the pipeline starts, prints its usual banner and
+# produces a plausible map from the OLD code.  That is the same shape as every
+# other trap in this project -- no error, believable output -- and on
+# 2026-10-03 it was avoided only by remembering to run `docker cp` by hand,
+# four times, in the right order.
+#
+# So: one command, and it prints what it copied.  Run it after every local edit,
+# before any container run.
+#
+# usage:
+#   bash vendor/sim_scripts/sync_to_container.sh
+#   bash vendor/sim_scripts/sync_to_container.sh --dry-run
+set -euo pipefail
+
+CONTAINER="${R2SIM_CONTAINER:-r2sim}"
+SRC="$(cd "$(dirname "$0")/../.." && pwd)"     # repo root (holds vendor/)
+PKG="$SRC/r2slam"                               # the python package (holds r2slam/ and tools/)
+DST="${R2SIM_WORKDIR:-/work/r2slam_ws}"
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+
+# Everything the container actually executes.  `config/` is included because a
+# config edit (voxel size, a topic name) is just as invisible as a code edit.
+PKG_PATHS=(
+  "r2slam/detect.py"
+  "r2slam/fusion.py"
+  "r2slam/labels.py"
+  "r2slam/explore.py"
+  "r2slam/nav.py"
+  "r2slam/worldmap.py"
+  "r2slam/traversable.py"
+  "r2slam/tf_out.py"
+  "r2slam/config.py"
+  "r2slam/heading.py"
+  "r2slam/deskew.py"
+  "r2slam/camera.py"
+  "r2slam/odometry.py"
+  "tools/online_pipeline.py"
+  "tools/eval_semantic_truth.py"
+  "tools/package_submission.py"
+)
+ROOT_PATHS=(
+  "vendor/detector/yolo11n.onnx"
+  "vendor/detector/coco.names"
+  "vendor/sim_scripts/sim_truth_model_states.json"
+)
+
+if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+  echo "!! container '$CONTAINER' is not running.  Start it with: docker start $CONTAINER" >&2
+  exit 1
+fi
+
+n=0
+copy() {          # copy <local abs path> <path relative to $DST>
+  local from="$1" rel="$2"
+  if [ ! -e "$from" ]; then echo "   skip (absent locally): $rel"; return; fi
+  if [ "$DRY" = "1" ]; then echo "   would copy $rel"; n=$((n + 1)); return; fi
+  docker cp "$from" "$CONTAINER:$DST/$rel" >/dev/null
+  echo "   copied $rel"
+  n=$((n + 1))
+}
+
+for p in "${PKG_PATHS[@]}"; do copy "$PKG/$p" "$p"; done
+for p in "${ROOT_PATHS[@]}"; do copy "$SRC/$p" "$p"; done
+
+if [ "$DRY" = "0" ]; then
+  # A stale __pycache__ is the one way this can still run old bytecode, so drop
+  # it and then prove the container can import what we just sent.
+  docker exec "$CONTAINER" bash -lc \
+    "rm -rf $DST/r2slam/__pycache__ $DST/tools/__pycache__"
+  # The self-check must not itself be a landmine.  It used to index three label
+  # tables directly; one of them (`LABEL_MAX_BOX_RATIO`) is legitimately empty
+  # now, so the check raised KeyError(2) -- and the caller pipes this script into
+  # `tail`, which hides the exit status, while `run_final.sh`'s own `pipefail`
+  # then aborted the run **after printing SIM_READY**.  The run therefore looked
+  # like it had started, and the only symptom was an output directory that never
+  # changed.  Read every table with `.get()` and print "-" when absent.
+  docker exec "$CONTAINER" bash -lc \
+    "cd $DST && python3 - <<'PY'
+import sys
+sys.path.insert(0, '.')
+import r2slam as R
+import r2slam.labels as L
+P = L.PERSON
+
+
+def g(d, fmt='%.2f'):
+    v = d.get(P)
+    return '-' if v is None else fmt % v
+
+
+print('   container import OK: person min_height=%s  min_obs=%s  width=%s  '
+      'box_min_px=%s  (pkg %s)'
+      % (g(L.LABEL_MIN_HEIGHT), g(L.LABEL_MIN_OBSERVATIONS, '%d'),
+         g(L.LABEL_MAX_WIDTH), g(L.LABEL_BOX_MIN_PX, '%d'), R.__file__))
+from r2slam.detect import OnnxYoloDetector          # noqa: E402,F401
+from r2slam.fusion import object_3d                  # noqa: E402,F401
+PY"
+fi
+
+echo "synced $n file(s) -> $CONTAINER:$DST"

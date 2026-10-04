@@ -1,0 +1,109 @@
+name: real_r2_voxel05
+kind: bag_ros2
+path: D:/E-Downd/openloong_r2_ex/bag/rosbag2_2026_09_23-14_09_45
+
+# ---------------------------------------------------------------------------
+# The organisers' SECOND real dataset (`openloong_r2.zip`, received 2026-10-03),
+# which replaces `three1`.  It is the same robot (calib.yaml header
+# `#O1-N090100110`), the same camera calibration (FishPoly 1600x1296, A11
+# 730.5554 -- identical to the digit) and the SAME BUILDING, on a different
+# route: our own map of `three1` has a 6.73 m floor-to-ceiling extent and the
+# organisers' reference pcd for this run has 6.78 m, with matching z quantiles.
+#
+# What changed relative to `three1`, and what it means for us:
+#
+#   /odin1/image              CompressedImage -> **Image, bgr8, uncompressed**
+#                             6.22 MB/frame instead of ~0.1 MB.  This is why the
+#                             bag is 11 GB rather than 2 GB.  Decoding is
+#                             dispatched on the message type in `bag_ros2.py`,
+#                             so the same source class serves both bags.
+#   /odin1/imu                559 messages with 12 gaps >1 s  ->  **55,627 at
+#                             400 Hz, no gaps**.  This is the organisers' answer
+#                             to FAQ #5 ("we will check").  Note `orientation`
+#                             is all-zero/invalid; only the gyro and accel are
+#                             usable.  FAQ #4 lists point cloud / image / IMU as
+#                             the permitted inputs, so IMU is fair game now --
+#                             we still deskew with our own odometry (the EKF is
+#                             the organiser's, not ours).
+#   /odin1/odometry_highfreq  400 Hz, frame `odom` -> child `imu`.  **NEW.**
+#   /odin1/cloud_slam         33,071 pts/frame, `x y z rgb`, frame `odom`.
+#                             **NEW.**
+#
+# THE LAST TWO ARE NOT INPUTS.  FAQ #4 permits exactly point cloud, image and
+# IMU; `odometry_highfreq` and `cloud_slam` are the VENDOR'S SLAM OUTPUT, and
+# feeding them in would be submitting someone else's answer as ours -- FAQ #2
+# says plainly that we are expected to "build the map yourself and segment it".
+# They are used ONLY as an after-the-fact benchmark: with no trajectory ground
+# truth provided (FAQ #6), the vendor odometry is the closest thing to a
+# reference we have, and comparing against it is far stronger evidence than
+# anything we could assert about ourselves.  Same for the organisers' reference
+# pcd, which is pure geometry (`x y z _`, no label).
+# ---------------------------------------------------------------------------
+camera:
+  model: fisheye_equidistant
+  width: 1600
+  height: 1296
+  a11: 730.5554054616883
+  a12: -0.24224985823987671
+  a22: 730.25912516133496
+  u0: 839.08999139227705
+  v0: 657.92171275072382
+  max_incident_angle_deg: 120
+  fishpoly_k: [0.010126610249984532, -0.071926952083687406, 0.14876251316557848,
+               -0.19907383968027517, 0.12617348728080629, -0.032004783520352624]
+
+# 48 beams x 1024 samples = 49,152 points, point_step 19, measured on this bag:
+#   fields  x@0 f32, y@4 f32, z@8 f32, intensity@12 u16, confidence@13 u8,
+#           offset_time@15 f32   -- byte-for-byte the same layout as `three1`.
+# `offset_time` 0 .. 0.094 s within a frame, so the cloud is skewed and must be
+# deskewed; the sensor stamp marks the END of the sweep (offsets count backwards
+# to it), which is why `time_offsets_from: end`.  Guessing this wrong doubles the
+# distortion instead of removing it.
+lidar:
+  topic: /odin1/cloud_raw
+  xyz_fields: [x, y, z]
+  intensity_field: intensity
+  time_field: offset_time
+  deskew: true
+  time_offsets_from: end
+  expected_points: 49152
+  nominal_hz: 10.0
+  # The real rig's LiDAR turns with the robot (unlike the official simulator,
+  # whose vehicleSimulator.cpp pins the LiDAR's yaw to zero).  FAQ #3 asked
+  # whether that simulator behaviour would be fixed and the organisers answered
+  # by describing the DATA instead -- read as "not fixed", so the simulator side
+  # keeps dead-reckoning its heading while this side keeps this `true`.
+  rotates_with_base: true
+
+image_topic: /odin1/image
+
+runtime:
+  max_num_threads: 1
+  voxel_size: 0.5
+  min_range: 0.3
+  max_range: 40.0
+  person_conf: 0.30
+  detector_threads: 2
+  map_resolution: 0.10
+  map_extent: 60.0
+  pcd_voxel: 0.15
+
+# LiDAR -> camera.  Byte-identical to `three1`'s and to r2's `Tcl_0`:
+# camera z (optical axis) <- LiDAR x (forward), camera x (right) <- -LiDAR y
+# (left), camera y (down) <- -LiDAR z (up).  Translation ~3 cm.
+Tcl: [0.00095, -0.99997, -0.00735, 0.02344,
+      -0.00365, 0.00734, -0.99997, -0.0049,
+      0.99999, 0.00098, -0.00364, -0.03012,
+      0, 0, 0, 1]
+
+# r2's calib.yaml also carries `LiDAR2IMU_0` = identity rotation + translation
+# (-0.02663, 0.03447, 0.2174) m, i.e. the IMU shares the LiDAR's attitude.  That
+# makes the IMU gyro a valid reference for the yaw rate the LiDAR sees -- useful
+# for checking our own heading, not needed to produce it.
+notes: >
+  Real machine recording, 139.00 s, indoor building.  Same robot, same camera
+  and same building as `three1`, different route (our three1 map spans 63 m in x,
+  the organisers' reference pcd for this run spans 86 m).  No RTK and no
+  trajectory ground truth; pose comes from our own LiDAR odometry.  The vendor's
+  400 Hz odometry and SLAM cloud in this bag are NOT inputs -- they are kept for
+  after-the-fact benchmarking only (see the header comment).

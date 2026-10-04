@@ -1,4 +1,10 @@
-"""ROS 2 bag source -- the real indoor corridor recording (`three1`).
+"""ROS 2 bag source -- the real recordings (`three1`, and `r2` which replaces it).
+
+The two bags differ in exactly one place this file has to care about: the image
+is a JPEG `CompressedImage` in `three1` and a **raw `bgr8` `Image` in `r2`**
+(6.22 MB/frame, which is why r2's bag is 11 GB against three1's 2 GB).  Decoding
+is dispatched on the message type through `decode_image_any`, so a single class
+serves both.  The point cloud layout is byte-for-byte identical between them.
 
 Streaming, not load-everything: the bag holds 1,336 LiDAR frames of 49,152
 points plus 1,335 JPEG fisheye frames, so materialising the whole thing would
@@ -37,17 +43,27 @@ import numpy as np
 
 from ..config import SourceConfig
 from ..frames import Frame
-from ..sensors import decode_compressed, decode_pointcloud, field_report
+from ..sensors import decode_image_any, decode_pointcloud, field_report
 from .base import FrameSource
 
-SYNC_TOL_S = 0.10          # ~one frame period at 10 Hz.  Was 0.06 and that was
-#                            too tight once the SENSOR stamps were used instead
-#                            of the bag write times: the two streams are each
-#                            ~10.3 Hz, so consecutive images are 0.097 s apart
-#                            and the nearest one can legitimately sit 0.048 s
-#                            away -- half the tolerance gone before any real
-#                            offset.  Measured effect of the tight value:
-#                            only 53 of 1336 frames got an image at all.
+SYNC_TOL_S = 0.15          # Was 0.06 and that was too tight once the SENSOR
+#                            stamps were used instead of the bag write times:
+#                            the two streams are each ~10.3 Hz, so consecutive
+#                            images are 0.097 s apart and the nearest one can
+#                            legitimately sit 0.048 s away -- half the tolerance
+#                            gone before any real offset.  Measured effect of the
+#                            tight value: only 53 of 1336 frames got an image.
+#                            Raised to 0.10 for `three1` (worst case 0.048 s),
+#                            then to 0.15 for `r2`, where the two streams run at
+#                            the same 10.27 Hz but with a phase offset of very
+#                            nearly ONE FULL PERIOD: measured, the image stream
+#                            trails the cloud stream by 0.0957 s, so frame k's
+#                            nearest image is normally frame k-1 and the
+#                            nearest-neighbour distance reaches 0.0991 s -- the
+#                            0.10 value left 0.9 ms of margin and would have
+#                            silently dropped images on the slightest jitter.
+#                            1.5 periods still cannot mis-pair, because the
+#                            nearest candidate is always the one selected.
 
 
 def _header_stamp(msg) -> Optional[float]:
@@ -182,7 +198,7 @@ class BagRos2Source(FrameSource):
                 stamp = stamp_of(m, bag_time)
                 if start_at is not None and stamp < start_at:
                     continue
-                img = decode_compressed(m)
+                img = decode_image_any(m, conn.msgtype)
                 cur = (stamp, img)
                 imgs.append(cur)
                 if pend is not None and (stamp - pend[0]) <= tol:

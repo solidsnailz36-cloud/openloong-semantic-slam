@@ -16,6 +16,33 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+# ---------------------------------------------------------------- the one rule
+# A single set of numbers, used by BOTH the occupancy grid and the camera-LiDAR
+# fusion, and deliberately identical for the simulator and the real rig.  They
+# live here rather than in the pipeline so that "is this point floor?" has one
+# answer in the codebase -- the fusion needs the same test the map uses, or a
+# point can be floor for the map and an object for the fusion in the same frame.
+OBSTACLE_LO = 0.35          # metres above the fitted ground: "tall enough to block"
+OBSTACLE_HI = 2.00          # ... but not the ceiling, which is 2.5 m+ and would
+                            # otherwise block every cell in the grid
+GROUND_TOL_BASE = 0.10
+GROUND_TOL_SLOPE = 0.035    # tolerance grows with range; a 1 deg plane residual
+                            # is 0.09 m at 5 m and 0.35 m at 20 m
+
+
+def ground_tolerance(rng_xy: np.ndarray) -> np.ndarray:
+    return GROUND_TOL_BASE + GROUND_TOL_SLOPE * np.asarray(rng_xy, dtype=np.float64)
+
+
+def is_floor(points: np.ndarray, plane: "GroundPlane") -> np.ndarray:
+    """Which of `points` (LiDAR frame) lie on the fitted ground plane.
+
+    Range-dependent tolerance because the residual of a plane fit grows with
+    distance: at 5 m a 1-degree tilt is 0.09 m, at 20 m it is 0.35 m.
+    """
+    rng = np.hypot(points[:, 0], points[:, 1])
+    return np.abs(plane.height_above(points)) < ground_tolerance(rng)
+
 
 @dataclass
 class GroundPlane:
