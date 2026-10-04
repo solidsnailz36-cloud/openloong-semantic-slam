@@ -210,27 +210,36 @@ def audit_source(key, label, out_root, checks):
             checks.append(("info", "%s instances: %s"
                            % (tag, ins.get("by_class")), ""))
         # ---- the map must not contradict its own trajectory ----------------
-        # `obstacle_on_path_cells` counts cells the robot's body occupied that
-        # the obstacle layer still calls blocked.  WARN rather than FAIL because
-        # it is a *map-quality* signal, not a contract with the brief: it does
-        # not change the delivered files, and the planner will not route through
-        # a one-cell-wide line anyway (`nav.free_space` erodes it away).  Measured
-        # on the real capture before the path exemption existed: 807 of the 998
-        # distinct cells on the route, median 2 votes each -- the grey band down
-        # the middle of the corridor in the video.  After it: 0 by construction,
-        # so a non-zero count here means the exemption is not being applied (a
-        # `--npz` replay without `WorldMap.add`, say) and the run record has to
-        # say so instead of the number quietly disappearing.
+        # `obstacle_on_path_cells` is the **invariant**, read off the delivered
+        # obstacle layer: cells the robot's body occupied that the map still
+        # calls blocked.  Determined output would be 0 -- the `_on_path`
+        # exemption guarantees it -- so a non-zero value means the exemption did
+        # not run (`--npz` replay without `WorldMap.add`, a re-serialised dump).
+        # WARN rather than FAIL because it does not change the delivered files
+        # and the planner will not route through a one-cell-wide line anyway
+        # (`nav.free_space` erodes it away).
+        #
+        # `obstacle_on_path_raw` is the upstream diagnostic and is reported
+        # separately on purpose: on the real capture it is ~91% of the path
+        # (median 2 votes per cell), i.e. returns land in the obstacle band in
+        # the cell the robot itself occupies.  A permanent WARN on that would be
+        # noise, so it stays an `info` line.
         mp = s.get("map") or {}
-        n_path, n_bad = mp.get("path_cells"), mp.get("obstacle_on_path_cells")
+        n_path = mp.get("path_cells")
+        n_bad = mp.get("obstacle_on_path_cells")
         if n_path is None or n_bad is None:
             checks.append(("info", "%s map-vs-path not reported "
                            "(pre-2026-10-04 dump)" % tag, ""))
         else:
-            frac = (100.0 * n_bad / n_path) if n_path else 0.0
-            checks.append(("PASS" if (n_bad == 0 or frac <= 2.0) else "WARN",
-                           "%s map agrees with its own path (%d/%d cells, %.1f%%)"
-                           % (tag, n_bad, n_path, frac), ""))
+            checks.append(("PASS" if n_bad == 0 else "WARN",
+                           "%s map agrees with its own path "
+                           "(%d blocked of %d path cells)" % (tag, n_bad, n_path),
+                           ""))
+            raw = mp.get("obstacle_on_path_raw")
+            if raw is not None and n_path:
+                checks.append(("info", "%s obstacle evidence ON the path: "
+                               "%d/%d cells (%.0f%%) -- upstream, exempted"
+                               % (tag, raw, n_path, 100.0 * raw / n_path), ""))
     else:
         checks.append(("FAIL", "%s summary.json missing" % tag, ""))
 

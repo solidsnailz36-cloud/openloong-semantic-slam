@@ -244,6 +244,13 @@ def main():
     check("... and it is drivable", w.ground[pc])
     check("a cell off the path with the same evidence stays blocked",
           w.obstacle[oc])
+    st = w.stats()
+    check("stats: the map-vs-path invariant reads 0 off the delivered layer",
+          st["obstacle_on_path_cells"] == 0)
+    check("stats: ... while the upstream count is still reported (%d cell)"
+          % st["obstacle_on_path_raw"], st["obstacle_on_path_raw"] == 1)
+    check("stats: path_cells counts the cells the robot occupied",
+          st["path_cells"] == 1)
 
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:

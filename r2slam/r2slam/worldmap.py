@@ -672,14 +672,27 @@ class WorldMap:
                  & (self._ground_after >= OBSTACLE_RELEASE_FRAMES)
                  & (self._ground_after * 1.0
                     >= OBSTACLE_RELEASE_RATIO * self._obs_votes)).sum()),
-            # Cells on the robot's own path.  `obstacle_on_path_cells` counts the
-            # ones that the obstacle layer would have called blocked -- the map
-            # disagreeing with its own trajectory.  It is reported rather than
-            # only corrected: a large number means something upstream (poses or
-            # the obstacle band) is putting returns where the robot is, and that
-            # should be visible in the run report, not silently tidied away.
+            # Cells on the robot's own path, and two different questions about
+            # them:
+            #
+            #  * `obstacle_on_path_cells` -- **the invariant**.  Read off the
+            #    *delivered* obstacle layer, so it is "does the artifact claim
+            #    the robot was inside a wall".  It must be 0; the audit checks it.
+            #    Reporting it rather than only correcting it is deliberate: a
+            #    non-zero value means the `_on_path` exemption did not run (a
+            #    `--npz` replay that never calls `add`, say), and that must be
+            #    visible in the run record instead of the number quietly
+            #    disappearing.
+            #  * `obstacle_on_path_raw` -- **the upstream diagnostic**: cells on
+            #    the path that collected `OBSTACLE_MIN_VOTES` or more obstacle
+            #    evidence *before* the exemption.  Measured on the real capture:
+            #    910 of 998 path cells, median 2 votes each -- i.e. returns land
+            #    in the band in the cell the robot itself occupies.  That is a
+            #    fact about the sensor or the pose, not about the map, so it is
+            #    reported and **not** used to gate the release.
             "path_cells": int(self._on_path.sum()),
-            "obstacle_on_path_cells": int(
+            "obstacle_on_path_cells": int((self._on_path & self.obstacle).sum()),
+            "obstacle_on_path_raw": int(
                 (self._on_path & (self._obs_votes >= OBSTACLE_MIN_VOTES)).sum()),
             "traversable_of_seen_pct": round(100.0 * trav / max(obs, 1), 2),
             "traversable_area_m2": round(trav * self.resolution ** 2, 1),

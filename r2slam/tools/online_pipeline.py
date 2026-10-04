@@ -62,7 +62,8 @@ from r2slam import sysinfo                                           # noqa: E40
 from r2slam.worldmap import WorldMap                                 # noqa: E402
 from r2slam.worldmap import (OBSTACLE_MIN_VOTES,                     # noqa: E402
                              OBSTACLE_OPEN_PX,
-                             OBSTACLE_RELEASE_FRAMES)
+                             OBSTACLE_RELEASE_FRAMES,
+                             OBSTACLE_RELEASE_RATIO)
 from r2slam import tf_out                                            # noqa: E402
 
 # The traversability rule itself now lives in `r2slam/traversable.py`, next to
@@ -205,6 +206,13 @@ def dump_grids(dest, wmap, cfg):
     np.save(os.path.join(dest, "obstacle_votes.npy"), wmap._obs_votes)
     np.save(os.path.join(dest, "obstacle_now.npy"), wmap.obstacle_now)
     np.save(os.path.join(dest, "ground_after_obstacle.npy"), wmap._ground_after)
+    # The cells the robot's own body occupied.  Dumped because the interesting
+    # question about them is a comparison -- "how many of them did the obstacle
+    # layer collect evidence in, and how many did it still call blocked" -- and
+    # without this array the second half of that comparison cannot be
+    # recomputed offline (`stats()` reports both, but a visitor reading an old
+    # dump has neither).
+    np.save(os.path.join(dest, "on_path.npy"), wmap._on_path)
     np.save(os.path.join(dest, "traj.npy"),
             np.asarray(wmap.traj, dtype=np.float64).reshape(-1, 2))
     meta = {"resolution": wmap.resolution, "extent": wmap.extent, "n": wmap.n,
@@ -214,9 +222,10 @@ def dump_grids(dest, wmap, cfg):
             "obstacle_min_votes": int(OBSTACLE_MIN_VOTES),
             "obstacle_open_px": int(OBSTACLE_OPEN_PX),
             "obstacle_release_frames": int(OBSTACLE_RELEASE_FRAMES),
+            "obstacle_release_ratio": float(OBSTACLE_RELEASE_RATIO),
             "arrays": ["ground", "obstacle", "seen", "ground_ever",
                        "obstacle_votes", "obstacle_now", "ground_after_obstacle",
-                       "traj"]}
+                       "on_path", "traj"]}
     with open(os.path.join(dest, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
     return meta
