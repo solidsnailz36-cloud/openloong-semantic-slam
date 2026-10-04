@@ -1073,6 +1073,19 @@ def main():
                      "sweep_targets": explorer.n_sweep_targets,
                      "island_probes": explorer.n_island_probes,
                      "sweep_abandoned": explorer.n_sweep_abandoned,
+                     # --- finishing a patch, and the map's blind spots -------
+                     # `patch_locks` counts how many distinct unvisited patches
+                     # were opened.  `shadow_probes` / `shadow_skipped` count
+                     # trips to a viewpoint aimed at a patch of *mapped* space
+                     # the sensors have never returned from (an occlusion
+                     # shadow) and pockets rejected because no reachable cell
+                     # has line of sight into them.  Both are reported because
+                     # "the mechanism exists" and "the mechanism fired" are
+                     # different statements -- the island probe taught that one.
+                     "patch_locks": explorer.n_patch_locks,
+                     "patch_releases": explorer.n_patch_releases,
+                     "shadow_probes": explorer.n_shadow_probes,
+                     "shadow_skipped": explorer.n_shadow_skipped,
                      "targets_picked": explorer.n_picks,
                      "frames_pose_off_map": explorer.n_pose_off_map,
                      "arrivals": explorer.n_arrivals,

@@ -168,6 +168,33 @@ def world_with_specks():
     return w
 
 
+def world_with_pocket(extent=12.0):
+    """A mapped corridor with a patch of it the sensors have never returned from.
+
+    An **occlusion shadow**: something the robot did not walk around is between
+    it and that floor, so the cells are unknown while every cell around them is
+    seen.  Nothing else in the policy can see this kind of hole --
+    `_frontier` needs a free cell next to the unknown and this pocket is ringed
+    by *seen* floor, and the sweep only ever drives to floor it can already see.
+
+    Planted by erasing a rectangle after the fact, the same way
+    `world_with_specks` plants its specks, because what makes the case
+    interesting is precisely the state of the surrounding cells: seen, floor
+    evidence present, not an obstacle.
+    """
+    pts, ground = corridor(observed_to=4.0)
+    w = WorldMap(resolution=0.1, extent=extent)
+    w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.0)
+    w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.1)
+    c0 = w.cell_of(-0.4, -1.3)
+    c1 = w.cell_of(0.6, 1.3)
+    ys = slice(int(c0[1]), int(c1[1]) + 1)
+    xs = slice(int(c0[0]), int(c1[0]) + 1)
+    for arr in (w.seen, w.ground_ever, w.ground):
+        arr[ys, xs] = False
+    return w
+
+
 def walked_everywhere(w):
     """Record a trajectory that has already covered the corridor floor.
 
@@ -624,13 +651,104 @@ def main():
         fails.append("two-stage arrival made no net progress (x=%.2f)"
                      % pose15[0])
 
+    # --- 16. a blind spot in mapped space gets a viewpoint, exactly once ----
+    print("16) an occlusion shadow gets a viewpoint into it")
+    w16 = world_with_pocket()
+    e16 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e16._start_xy = (0.0, 0.0)
+    r16, _ext16 = e16._masks(w16, (0.0, 0.0))
+    sh = e16._pick_shadow_target(w16, 0.0, 0.0)
+    print("    pocket cells %.2f m2, target %s"
+          % (((~w16.seen) & ~e16._exterior).sum() * 0.01,
+             None if sh is None else "(%.2f, %.2f)" % (sh[0], sh[1])))
+    if sh is None:
+        fails.append("case 16 lost its meaning: the shadow produced no target")
+    else:
+        c16 = w16.cell_of(sh[0], sh[1])
+        if not r16[int(c16[1]), int(c16[0])]:
+            fails.append("the shadow viewpoint is not somewhere the robot can "
+                         "stand")
+        if not e16._clear(w16, sh[0], sh[1], 0.1, 0.0):
+            fails.append("the viewpoint has no line of sight into the pocket "
+                         "it was chosen for")
+        if len(sh[2]) < 2:
+            fails.append("the shadow target has no route")
+    # One trip per spot: the point is "go and look", not "orbit the hole".
+    if e16._pick_shadow_target(w16, 0.0, 0.0) is not None:
+        fails.append("the same pocket was offered a second trip")
+    # ... and the switch really gates it, so a run can be reproduced without it
+    e16b = FrontierExplorer(sweep=True, shadow=False, stagnate_frames=10 ** 9)
+    e16b._masks(w16, (0.0, 0.0))
+    if e16b._pick_shadow_target(w16, 0.0, 0.0) is not None:
+        fails.append("`shadow=False` still produced a shadow target")
+
+    # --- 17. finish one patch before opening the next ---------------------
+    #
+    # The failure this encodes, measured on the v11 simulator run: of 1163
+    # frames, 43 were spent inside the upper-right room (16% of its walkable
+    # floor) and 101 inside the upper-left room (36%), because every arrival
+    # re-ran a *global* score and the next patch won.  Splitting the unvisited
+    # floor in two and checking that the second choice stays in the first patch
+    # is the smallest map on which that is visible.
+    print("17) one unvisited patch is finished before the next is opened")
+    w17 = world(observed_to=6.0)
+    for x in np.arange(-1.9, 5.6, 0.2):          # drive straight down the middle
+        w17.traj.append((float(x), 0.0))
+    e17 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e17._start_xy = (0.0, 0.0)
+    r17, _e17 = e17._masks(w17, (5.5, 0.0))
+    t1 = e17._pick_sweep_target(w17, r17, 5.5, 0.0)
+    m1 = e17._sweep_patch_mask
+    if t1 is None or m1 is None:
+        fails.append("case 17 lost its meaning: nothing to sweep")
+    else:
+        print("    patch 1: target (%.2f, %.2f), %d cells, locks=%d"
+              % (t1[0], t1[1], int(m1.sum()), e17.n_patch_locks))
+        # ... go and stand on it
+        for _ in range(8):
+            w17.traj.append((t1[0], t1[1]))
+        t2 = e17._pick_sweep_target(w17, r17, t1[0], t1[1])
+        if t2 is None:
+            fails.append("the locked patch had nothing left after one stop")
+        else:
+            c2 = w17.cell_of(t2[0], t2[1])
+            inside = bool(m1[int(c2[1]), int(c2[0])])
+            print("    patch 1 again: target (%.2f, %.2f) inside it: %s, "
+                  "locks=%d" % (t2[0], t2[1], inside, e17.n_patch_locks))
+            if not inside:
+                fails.append("the second target jumped to a different patch "
+                             "instead of finishing the first")
+            if e17.n_patch_locks != 1:
+                fails.append("a new patch was opened while the first still had "
+                             "floor in it")
+        # ... now cover the locked patch, and the lock must release
+        ys_, xs_ = np.nonzero(m1)
+        for k in range(0, len(ys_), 3):
+            w17.traj.append(((xs_[k] + 0.5) * w17.resolution - w17.extent,
+                             (ys_[k] + 0.5) * w17.resolution - w17.extent))
+        t3 = e17._pick_sweep_target(w17, r17, 5.5, 0.0)
+        free_left = int((m1 & ~e17._visited_mask(w17)).sum())
+        print("    after covering patch 1 (%d cells left): locks=%d, "
+              "next target %s"
+              % (free_left, e17.n_patch_locks,
+                 None if t3 is None else "(%.2f, %.2f)" % (t3[0], t3[1])))
+        if free_left * 0.01 < e17.sweep_patch_keep_m2:
+            if e17.n_patch_locks < 2:
+                fails.append("the lock never released after the patch was "
+                             "covered: the robot would never leave the room")
+            if t3 is not None:
+                c3 = w17.cell_of(t3[0], t3[1])
+                if m1[int(c3[1]), int(c3[0])]:
+                    fails.append("after the patch was covered the target is "
+                                 "still inside it")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (15 checks)")
+    print("verdict: PASS (17 checks)")
     return 0
 
 

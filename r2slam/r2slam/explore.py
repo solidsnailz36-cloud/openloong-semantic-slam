@@ -75,7 +75,15 @@ class FrontierExplorer:
                  sweep_min_m2: float = 3.0, sweep_min_dist: float = 0.50,
                  sweep_commit_frames: int = 300,
                  sweep_stuck_frames: int = 0,
-                 sweep_stuck_improve_m: float = 0.50):
+                 sweep_stuck_improve_m: float = 0.50,
+                 sweep_patch_keep_m2: float = 1.20,
+                 sweep_patch_max_targets: int = 4,
+                 shadow: bool = True, shadow_min_m2: float = 1.00,
+                 shadow_probe_limit: int = 10,
+                 shadow_blacklist_m: float = 1.00,
+                 shadow_max_range_m: float = 10.0,
+                 shadow_shore_cells: int = 10,
+                 shadow_viewpoint_tries: int = 12):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
@@ -147,6 +155,68 @@ class FrontierExplorer:
         # `sweep_stuck_frames > 0` to enable; `test_explore` case 14 does.
         self.sweep_stuck_frames = int(sweep_stuck_frames)
         self.sweep_stuck_improve_m = float(sweep_stuck_improve_m)
+        # --- finish one patch before moving to the next --------------------
+        #
+        # Every sweep target is one stop, and one stop covers a disc of
+        # `sweep_radius` around the path to it.  Ranking patches globally and
+        # re-ranking on every arrival therefore produces a robot that touches
+        # each room once and leaves: measured on the v11 run, of 1163 frames
+        # **43 were spent inside the upper-right room** (16% of its walkable
+        # floor) and 101 inside the upper-left room (36%), while 200+ frames
+        # went into commuting between them.  `sweep_min_m2` finishes the job:
+        # whatever is left in a room after one visit is split into pieces under
+        # 3 m2 and stops being a candidate at all -- measured, 4.5 m2 of the
+        # final map was unvisited floor in pieces below the bar, invisible to
+        # the sweep by construction.
+        #
+        # So: choose a patch by the global score, then **stay in it** until its
+        # remainder is below `sweep_patch_keep_m2` or has no cell more than
+        # `sweep_min_dist` from somewhere the robot has been.  Same score for
+        # *which* patch (so a room is not entered in a silly order), different
+        # bar for *continuing* (so a room is finished once entered).
+        self.sweep_patch_keep_m2 = float(sweep_patch_keep_m2)
+        # ... but not forever.  A room can always be covered better, and with a
+        # wall-clock budget (`--duration`) "better in here" is paid for with
+        # "never went there".  Measured on v11: 12 targets in 232 s of simulator
+        # time, i.e. one stop per room per visit.  A cap of 4 is the middle:
+        # four times the stops in the room the robot is already in, and the
+        # ordering between rooms still gets to act every four stops.
+        # 0 means "no cap", which is the thoroughness limit and the wrong
+        # default for a fixed budget.
+        self.sweep_patch_max_targets = int(sweep_patch_max_targets)
+        self._sweep_patch_stops = 0
+        self._sweep_patch_mask = None      # the patch currently being finished
+        self.n_patch_locks = 0
+        self.n_patch_releases = 0
+        # --- the map's own blind spots -------------------------------------
+        #
+        # A cell the sensors have never returned a signal from, in the middle of
+        # a room that is otherwise mapped, is not "unexplored world" -- it is an
+        # **occlusion shadow**, and no amount of further sweeping will resolve
+        # it, because the sweep only ever drives to floor it can already see.
+        # Measured on `grids_v11_sim`: the upper-right room holds 1.64 m2 of
+        # floor that was never illuminated (a 1.2 x 1.8 m pocket behind
+        # whatever the robot never walked around) and 2.25 m2 of a 0.4 m slot
+        # beside the kitchen cabinet; both are surrounded by floor the robot
+        # *has* seen, and both were invisible to every target generator in the
+        # system.  Boss found them by looking at the video (2026-10-04).
+        #
+        # The remedy is a viewpoint, not a destination: find where to stand so
+        # the shadow is in line of sight, drive there once, and blacklist the
+        # spot.  This is the `viewpoint generation` half of FUEL / TARE, reduced
+        # to what a 2-D occupancy grid can support -- no ray casting into the
+        # future, just "is the line to it clear from here".
+        self.shadow = bool(shadow)
+        self.shadow_min_m2 = float(shadow_min_m2)
+        self.shadow_probe_limit = int(shadow_probe_limit)
+        self.shadow_blacklist_m = float(shadow_blacklist_m)
+        self.shadow_max_range_m = float(shadow_max_range_m)
+        self.shadow_shore_cells = int(shadow_shore_cells)
+        self.shadow_viewpoint_tries = int(shadow_viewpoint_tries)
+        self._shadow_spots: List[Tuple[float, float]] = []
+        self._shadow_spot: Optional[Tuple[float, float]] = None
+        self.n_shadow_probes = 0
+        self.n_shadow_skipped = 0
         self.n_sweep_abandoned = 0
         self._sw_best = float("inf")
         self._sw_since = 0
@@ -963,38 +1033,247 @@ class FrontierExplorer:
         sx, sy = self._start_xy if self._start_xy is not None else (x0, y0)
         depth = self._fresh_depth(wmap)
         min_depth = self.sweep_min_dist / wmap.resolution
-        cands = []
-        for L in range(1, n):
-            if sz[L] * cell < self.sweep_min_m2:
-                continue
-            ys, xs = np.nonzero(lab == L)
-            wx = (xs + 0.5) * wmap.resolution - wmap.extent
-            wy = (ys + 0.5) * wmap.resolution - wmap.extent
-            d_start = np.hypot(wx - sx, wy - sy)
-            # Aim *deep* inside the patch -- the cell furthest from anywhere the
-            # robot has been -- rather than at the rim of the visited disc or at
-            # whatever happens to be furthest from the robot right now.  Rank
-            # the patches by how far they are from where the run began, so the
-            # walk grows outward instead of ping-ponging between two patches
-            # that are equidistant from the robot (measured: 214 frames, 0.61 m
-            # of net displacement, in the first version of this).
-            dep = depth[ys, xs]
-            j = int(np.argmax(dep))
-            if dep[j] < min_depth:
-                continue                      # too small or already well covered
-            d0 = float(d_start.min())
-            ncell = int(sz[L])
-            cands.append((-ncell / (1.0 + d0), d0,
-                          float(wx[j]), float(wy[j]), ncell))
-        # Biggest-and-nearest first: `-size/(1+d)`, see the docstring.
-        cands.sort(key=lambda c: c[0])
-        for _s, _d, tx, ty, ncell in cands[:self.max_plans_per_pick]:
+
+        # Which patches are eligible: the locked one alone, or all of them.
+        # The lock is followed by **overlap**, not by label -- connected-
+        # component labels are not stable across frames, and the patch itself
+        # changes shape as the robot drives through it.  The fragment carrying
+        # most of what was locked is the same patch for our purposes; if the
+        # robot's own corridor cut the patch in two, following the larger half
+        # is the behaviour we want anyway.
+        locked = 0
+        old = self._sweep_patch_mask
+        if old is not None and old.shape == lab.shape:
+            hit = np.bincount(lab[old], minlength=n)
+            hit[0] = 0
+            if hit.any():
+                L = int(np.argmax(hit))
+                if sz[L] * cell >= self.sweep_patch_keep_m2:
+                    locked = L
+        if not locked:
+            self._sweep_patch_mask = None
+        elif (self.sweep_patch_max_targets > 0
+              and self._sweep_patch_stops >= self.sweep_patch_max_targets):
+            # Enough stops in this room for one visit.  Re-rank globally -- the
+            # patch is still eligible and may well win again.
+            locked = 0
+            self._sweep_patch_mask = None
+            self._sweep_patch_stops = 0
+            self.n_patch_releases += 1
+
+        def gather(labels, min_area):
+            out = []
+            for L in labels:
+                if sz[L] * cell < min_area:
+                    continue
+                ys, xs = np.nonzero(lab == L)
+                wx = (xs + 0.5) * wmap.resolution - wmap.extent
+                wy = (ys + 0.5) * wmap.resolution - wmap.extent
+                d_start = np.hypot(wx - sx, wy - sy)
+                # Aim *deep* inside the patch -- the cell furthest from anywhere
+                # the robot has been -- rather than at the rim of the visited
+                # disc or at whatever happens to be furthest from the robot
+                # right now.  Rank the patches by how far they are from where
+                # the run began, so the walk grows outward instead of
+                # ping-ponging between two patches that are equidistant from
+                # the robot (measured: 214 frames, 0.61 m of net displacement,
+                # in the first version of this).
+                dep = depth[ys, xs]
+                j = int(np.argmax(dep))
+                if dep[j] < min_depth:
+                    continue
+                d0 = float(d_start.min())
+                ncell = int(sz[L])
+                out.append((-ncell / (1.0 + d0), d0, float(wx[j]), float(wy[j]),
+                            ncell, L))
+            # Biggest-and-nearest first: `-size/(1+d)`, see the docstring.
+            out.sort(key=lambda c: c[0])
+            return out
+
+        if locked:
+            cands = gather([locked], self.sweep_patch_keep_m2)
+        else:
+            cands = gather(range(1, n), self.sweep_min_m2)
+        picked = self._plan_first(wmap, cands, x0, y0)
+        if picked is None and locked:
+            # The locked patch has nothing plannable left.  Drop the lock and
+            # make the global choice in the same frame rather than spending a
+            # frame with no target at all.
+            self._sweep_patch_mask = None
+            cands = gather(range(1, n), self.sweep_min_m2)
+            picked = self._plan_first(wmap, cands, x0, y0)
+        if picked is None:
+            return None
+        tx, ty, path, ncell, L = picked
+        if not locked:
+            self.n_patch_locks += 1
+            self._sweep_patch_stops = 1
+        else:
+            self._sweep_patch_stops += 1
+        self._sweep_patch_mask = (lab == L)
+        return tx, ty, path, ncell
+
+    def _plan_first(self, wmap, cands, x0, y0):
+        """The first candidate the planner can actually route to, or None."""
+        for _s, _d, tx, ty, ncell, L in cands[:self.max_plans_per_pick]:
             path = self.planner.plan(wmap, (x0, y0), (tx, ty))
             if path:
                 self.n_plans += 1
-                return tx, ty, path, ncell
+                return tx, ty, path, ncell, L
             self.n_plan_failures += 1
         return None
+
+    def _pick_shadow_target(self, wmap, x0, y0):
+        """A place to *stand* so that a blind spot comes into view.
+
+        A cell the sensors have never returned a signal from, sitting inside a
+        room that is otherwise mapped, is an occlusion shadow: something the
+        robot has never walked around is between it and that patch of floor, and
+        no amount of further sweeping will fix it, because the sweep only ever
+        drives to floor it can already see.  `frontier` does not fix it either
+        -- the frontier needs a free cell adjacent to the unknown, and these
+        pockets are enclosed by *seen* floor on every side, so there is no
+        frontier there at all.  Measured on `grids_v11_sim`, the upper-right
+        room held 1.64 m2 of such floor (a 1.2 x 1.8 m pocket) plus 2.25 m2 of
+        a 0.4 m slot beside the kitchen cabinet, and neither was offered by any
+        target generator in the system.
+
+        So the target is a **viewpoint**, not a destination -- the same idea as
+        FUEL/TARE's viewpoint generation, reduced to what a 2-D occupancy grid
+        can support: pick the reachable cell, close to the pocket, from which
+        the most of the pocket is in line of sight, and drive there once.
+        `shadow_blacklist_m` + `shadow_probe_limit` make it bounded.
+
+        Deliberately *ahead of* the sweep: the two are different kinds of work.
+        A sweep target adds floor the robot **has already seen** to the floor it
+        has driven over; a shadow viewpoint is the only way to learn *anything*
+        about that patch.  See the note on `sweep` in `__init__` for why the
+        sweep normally wins, and `island_trigger_m2` for the same argument
+        applied to doorways.
+        """
+        if not self.shadow or self._reach is None or self._exterior is None:
+            return None
+        if len(self._shadow_spots) >= self.shadow_probe_limit:
+            return None
+        pocket = (~wmap.seen) & ~self._exterior
+        if not pocket.any():
+            return None
+        cell = wmap.resolution ** 2
+        # It has to be floor we have evidence for right next to it.  The inside
+        # of a closed wardrobe is unknown too, and no viewpoint can resolve
+        # that; nor is an unexplored room a "shadow in mapped space" -- its
+        # cells have no floor evidence at all.
+        near_floor = cv2.dilate(wmap.ground_ever.astype(np.uint8),
+                                np.ones((3, 3), np.uint8)) > 0
+        n_lab, lab = cv2.connectedComponents(pocket.astype(np.uint8),
+                                             connectivity=8)
+        if n_lab <= 1:
+            return None
+        sz = np.bincount(lab.ravel(), minlength=n_lab)
+        reach = self._reach
+        if not reach.any():
+            return None
+        # Distance from every cell to the nearest place the robot can stand.
+        dt = cv2.distanceTransform((~reach).astype(np.uint8), cv2.DIST_L2, 5)
+        sx, sy = self._start_xy if self._start_xy is not None else (x0, y0)
+        cands = []
+        for L in range(1, n_lab):
+            area = sz[L] * cell
+            if area < self.shadow_min_m2:
+                continue
+            m = (lab == L)
+            if int((m & near_floor).sum()) < 4:
+                continue
+            ys, xs = np.nonzero(m)
+            pwx = (xs + 0.5) * wmap.resolution - wmap.extent
+            pwy = (ys + 0.5) * wmap.resolution - wmap.extent
+            mx, my = float(pwx.mean()), float(pwy.mean())
+            if any((mx - bx) ** 2 + (my - by) ** 2 <= self.shadow_blacklist_m ** 2
+                   for bx, by in self._shadow_spots):
+                continue
+            d0 = float(np.hypot(mx - sx, my - sy))
+            # Sample the pocket: the whole thing is too many ray tests, and the
+            # question is "will standing here get me returns from in there",
+            # which a handful of well-spread cells answers.
+            step = max(1, len(ys) // 8)
+            samples = list(zip(pwx[::step].tolist(), pwy[::step].tolist()))[:8]
+            # The shore: the pocket cells nearest standing room.  Anything deep
+            # inside is, by definition, not visible from where the robot can go.
+            shore = np.argsort(dt[ys, xs])[:self.shadow_shore_cells]
+            best = None
+            for i in shore:
+                radius_px = int(dt[ys[i], xs[i]]) + 3
+                vp = self._shadow_viewpoint(wmap, float(pwx[i]), float(pwy[i]),
+                                            reach, samples, radius_px)
+                if vp is None:
+                    continue
+                vx, vy, nvis = vp
+                dd = float(np.hypot(vx - x0, vy - y0))
+                if dd > self.shadow_max_range_m:
+                    continue
+                key = (-nvis, dd)
+                if best is None or key < best[0]:
+                    best = (key, vx, vy, nvis)
+            if best is None:
+                self.n_shadow_skipped += 1
+                continue
+            _k, vx, vy, _nv = best
+            cands.append((-area / (1.0 + d0), vx, vy, mx, my, int(sz[L])))
+        cands.sort(key=lambda c: c[0])
+        for _s, vx, vy, mx, my, ncell in cands[:self.max_plans_per_pick]:
+            path = self.planner.plan(wmap, (x0, y0), (vx, vy))
+            if path:
+                self.n_plans += 1
+                # Banked at pick time, not at arrival: the trip is what costs,
+                # and a viewpoint we drove to and did not reach is still a spot
+                # this mechanism has already tried.
+                self._shadow_spots.append((mx, my))
+                return vx, vy, path, ncell
+            self.n_plan_failures += 1
+        return None
+
+    def _shadow_viewpoint(self, wmap, px, py, reach, samples, radius_px):
+        """The reachable cell nearest (px,py) that can actually see into the
+        pocket.  Returns (world_x, world_y, n_visible) or None.
+
+        "Nearby" is not enough on its own: the nearest green cell of a pocket
+        is usually on the *far* side of whatever is casting the shadow, which is
+        why the line of sight is tested rather than assumed -- and the count
+        that comes back is how much of the pocket would come into view, so the
+        caller can prefer the viewpoint that resolves more of it.
+        """
+        ci = wmap.cell_of(px, py)
+        cx, cy = int(ci[0]), int(ci[1])
+        n = wmap.n
+        r = max(int(radius_px), 2)
+        y0w, y1w = max(cy - r, 0), min(cy + r + 1, n)
+        x0w, x1w = max(cx - r, 0), min(cx + r + 1, n)
+        sub = reach[y0w:y1w, x0w:x1w]
+        ys, xs = np.nonzero(sub)
+        if not len(ys):
+            return None
+        ys = ys + y0w
+        xs = xs + x0w
+        d2 = (xs - cx) ** 2 + (ys - cy) ** 2
+        order = np.argsort(d2)[:self.shadow_viewpoint_tries]
+        best = None
+        for i in order:
+            vx = (int(xs[i]) + 0.5) * wmap.resolution - wmap.extent
+            vy = (int(ys[i]) + 0.5) * wmap.resolution - wmap.extent
+            nvis = 0
+            for sxp, syp in samples:
+                if self._clear(wmap, vx, vy, sxp, syp):
+                    nvis += 1
+            if nvis <= 0:
+                continue
+            key = (-nvis, float(d2[i]))
+            if best is None or key < best[0]:
+                best = (key, vx, vy, nvis)
+            if nvis >= max(2, len(samples) - 1):
+                break                     # good enough; stop ray-marching
+        if best is None:
+            return None
+        return best[1], best[2], best[3]
 
     def _still_unvisited(self, wmap, tx, ty) -> bool:
         """Is a committed sweep target still somewhere new?"""
@@ -1411,7 +1690,8 @@ class FrontierExplorer:
         # commitment block clears `_target` on arrival, so comparing against it
         # inside the branch would compare against None and count nothing
         if self._target is not None and self._target_age < (
-                self.sweep_commit_frames if self._target_kind == "sweep"
+                self.sweep_commit_frames
+                if self._target_kind in ("sweep", "shadow")
                 else self.commit_frames):
             tx, ty = self._target
             d = float(np.hypot(tx - x0, ty - y0))
@@ -1495,7 +1775,7 @@ class FrontierExplorer:
                 self._target_anchor = None
                 self._target_standoff = False
             elif (self._still_unvisited(wmap, tx, ty)
-                  if self._target_kind == "sweep"
+                  if self._target_kind in ("sweep", "shadow")
                   else self._target_still_frontier(
                       wmap, *(self._target_anchor or (tx, ty)))):
                 reuse = True
@@ -1554,6 +1834,21 @@ class FrontierExplorer:
             # one trip, and `island_probe_limit` caps the whole thing in case the
             # band turns out to be a wall that will never resolve.
             used_probe = False
+            used_shadow = False
+            # A blind spot in mapped space outranks a sweep.  Both are one trip;
+            # only one of them can change what the map knows.  See
+            # `_pick_shadow_target`.
+            if self.shadow:
+                # Deliberately not guarded on `sw is not None`: when the sweep
+                # has run out of floor to drive over, a blind spot is exactly
+                # what is left to do -- that is the state the map is in at the
+                # end of a run, and it is when these pockets are all that
+                # remains.
+                sh = self._pick_shadow_target(wmap, x0, y0)
+                if sh is not None:
+                    sw = sh
+                    used_shadow = True
+                    self.n_shadow_probes += 1
             if sw is not None:
                 stranded = self._stranded_fresh(wmap)
                 if stranded >= self.island_trigger_m2:
@@ -1561,12 +1856,15 @@ class FrontierExplorer:
                     if probe is not None:
                         sw = probe
                         used_probe = True
+                        used_shadow = False
                         self.n_island_probes += 1
             if sw is not None:
                 target_res = (sw[0], sw[1])
                 route = sw[2]
-                self._target_kind = "island" if used_probe else "sweep"
-                self.n_sweep_targets += 1
+                self._target_kind = ("shadow" if used_shadow else
+                                     ("island" if used_probe else "sweep"))
+                if self._target_kind == "sweep":
+                    self.n_sweep_targets += 1
                 self._sw_best = float("inf")       # fresh progress clock
                 self._sw_since = 0
                 n_cand = sw[3]
