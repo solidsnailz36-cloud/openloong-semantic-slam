@@ -23,9 +23,11 @@
 - **★ 仿真硬精度上界**：无 IMU、无里程计话题（只有 `/state_estimation`=真值），航向只能死推，`err_yaw` p50 **0.46°–12.05°** ⇒ **单跑之间不能比分数**，要比就**同一份采集重放**。
 
 ## 感知（定论）
-- 检测器 = **YOLO11n ONNX**（`vendor/detector/yolo11n.onnx`，640，COCO80；运行时只用 onnxruntime/cv2，**MAP 里没有 torch**）。旧 tiny-yolov3 退役。
-  - 备选 **yolo26n.onnx**（9.4 MB，同 `[1,84,8400]` 输出、parity 已验）已在 `vendor/detector/_export/`；**实测仿真更好、真实鱼眼观测 −17% ⇒ 维持 11n**（细节见交接第八轮）。
-- YOLO 输出裸 `[1,84,8400]`（cxcywh+letterbox，**无自带 NMS**）⇒ 解码自写 ⇒ **新模型必须跑 `tools/check_onnx_parity.py`**。
+- 检测器 = **YOLO26n ONNX**（`vendor/detector/yolo26n.onnx`，9.4 MB，640，COCO80；运行时只用 onnxruntime/cv2，**MAP 里没有 torch**）。**默认已切**（boss 拍板，2026-10-04 晚）；回退 `--model vendor/detector/yolo11n.onnx`。
+  - 为什么切：仿真 1229 帧有真值 ⇒ 过完融合门限后真人 **182 vs 178**、虚多 **111 vs 115**、**65.7 vs 77.4 ms**、**9.4 vs 10.7 MB**；`check_onnx_parity` 偏差 ≤1.26 px / 0 漏 / 0 类错。
+  - 代价（如实记）：真实鱼眼 `localised 757→630`、**全类别均匀 −17%**、确认的人是**同一批 8 个位置**（无真值 ⇒ 分不清误检还是漏检）。
+  - ⚠️ `*.onnx` 在 `.gitignore` ⇒ **模型不入库**，换机器要手动补；`sync_to_container.sh` 的 `ROOT_PATHS` 必须列上它（否则容器里跑旧模型，**静默**）。
+  - ⚠️ 换模型**必须**跑 `tools/check_onnx_parity.py`（YOLO11/26 输出都是裸 `[1,84,8400]`、无自带 NMS、解码自写）。
 - `labels.py` = 类别表唯一定义源。**尺寸门限是"充分 or + 必要 and"两层**：`LABEL_MAX_WIDTH`/`LABEL_BOX_MIN_PX`/`LABEL_BOX_HEIGHT` 是充分（`or`），`LABEL_BOX_HEIGHT_MUST={PERSON:(1.40,3.50)}` 是必要（`and`）。⚠️ **`or` 会让被 `or` 掉的那条彻底失效** ⇒ 每条门限都要报"它独自拒了多少"。
 - `fusion.py`：深度用**相机中心距离** → `is_floor` 剔地面 → **深度间隙切近组** → **体素连通域取大簇**；返回 `_idx` 供 `obj_mask`。位置＝簇的中位数。
 

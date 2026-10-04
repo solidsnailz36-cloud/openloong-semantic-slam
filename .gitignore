@@ -54,3 +54,6 @@ docs/_bak/
 Thumbs.db
 desktop.ini
 *.swp
+
+# 跑一次的日志，不入库（每次内容都不同）
+vendor/sim_scripts/*.log
