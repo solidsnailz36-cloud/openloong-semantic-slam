@@ -64,7 +64,7 @@ class FrontierExplorer:
                  min_frontier_cells: int = 25, commit_frames: int = 25,
                  reach_dist: float = 0.7, min_target_range: float = 1.0,
                  stagnate_frames: int = 300, stagnate_eps: float = 0.5,
-                 barren_targets: int = 8,
+                 barren_targets: int = 8, barren_blacklist_m: float = 0.60,
                  robot_radius: float = 0.22, replan_every: int = 12,
                  arc_scale: float = 0.40, arc_max_deg: float = 90.0,
                  arc_probe_deg: float = 40.0,
@@ -207,6 +207,28 @@ class FrontierExplorer:
         self.barren_targets_limit = int(barren_targets)
         self.n_arrivals = 0
         self.n_barren_targets = 0
+        # --- where white trips go to die -------------------------------------
+        # `barren_targets` above only *counts* consecutive fruitless arrivals and
+        # then ends the run.  It never makes the next choice better, so the robot
+        # re-picks the same corner until the counter runs out: measured on the
+        # 617-frame yolo26n run, **arrivals 11, barren 8**, and `done_reason`
+        # literally "reached 8 frontier targets in a row without observing
+        # anything new".  The video shows it pressed against a wall corner.
+        #
+        # A frontier cell is at the free/unknown boundary by construction and a
+        # wall corner is a boundary, so "the corner we already went to and
+        # learned nothing from" is exactly the target that must stop being
+        # offered.  Every reference implementation does this -- `explore_lite`
+        # blacklists a goal on navigation abort *and* on `progress_timeout`
+        # without progress, and `CS137A/frontier_explorer.py` blacklists anything
+        # within `min_goal_distance` of the robot outright.
+        #
+        # Radius 0.6 m rather than a single cell: the frontier's centroid moves a
+        # little as the map grows, so a cell-exact blacklist would miss the same
+        # corner next frame.
+        self.barren_blacklist_m = float(barren_blacklist_m)
+        self._barren_spots: List[Tuple[float, float]] = []
+        self.n_blacklisted = 0
         self._area_at_target = None
         self._last_area = None
         self._stagnant = 0
@@ -909,6 +931,20 @@ class FrontierExplorer:
             pool = far                          # worth the turn it costs
         if frontier_used is not None:
             pool = [i for i in pool if frontier_used[ys[i], xs[i]]]
+        # Drop anything near a place we already went to and learned nothing from
+        # (`barren_blacklist_m`).  Done last, so the counters above still say how
+        # much was on offer before the blacklist bit.
+        if self._barren_spots and pool:
+            keep = []
+            for i in pool:
+                px, py = float(wx[i]), float(wy[i])
+                if any((px - bx) ** 2 + (py - by) ** 2
+                       <= self.barren_blacklist_m ** 2
+                       for bx, by in self._barren_spots):
+                    self.n_blacklisted += 1
+                    continue
+                keep.append(i)
+            pool = keep
         if not pool:
             return None, None, 0
 
@@ -1158,6 +1194,11 @@ class FrontierExplorer:
                     self.n_barren_targets = 0
                 else:
                     self.n_barren_targets += 1
+                    # ... and stop offering this place.  See
+                    # `barren_blacklist_m`: counting fruitless arrivals without
+                    # acting on the count is how the same corner gets picked
+                    # eight times in a row.
+                    self._barren_spots.append((float(tx), float(ty)))
                 self._area_at_target = area
                 self._target = None
             elif (self._target_kind == "sweep"

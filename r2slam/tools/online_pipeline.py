@@ -1052,6 +1052,13 @@ def main():
                      "frames_pose_off_map": explorer.n_pose_off_map,
                      "arrivals": explorer.n_arrivals,
                      "barren_targets": explorer.n_barren_targets,
+                     # Places the robot reached, learned nothing from, and then
+                     # stopped offering (see `explore.barren_blacklist_m`).
+                     # `barren_targets` is the *consecutive* count that ends the
+                     # run; this is the list that stops the same corner being
+                     # picked again.
+                     "blacklist_places": len(explorer._barren_spots),
+                     "blacklisted_candidates": explorer.n_blacklisted,
                      "done_reason": explorer.n_done_reason,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,
