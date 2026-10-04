@@ -828,6 +828,16 @@ def main():
                 "traversable_m2": st["traversable_area_m2"],
                 "pose_x": round(float(t[0]), 3), "pose_y": round(float(t[1]), 3),
                 "explore_state": (cmd or {}).get("state"),
+                # What the explorer was aiming at, and what it was aiming
+                # *from*.  Without both, "it drove into the corner" cannot be
+                # told apart from "it stopped 0.8 m short and looked", which is
+                # the whole point of the viewpoint change -- and neither could
+                # be checked from the run record.
+                "target_x": ((cmd or {}).get("target") or (None, None))[0],
+                "target_y": ((cmd or {}).get("target") or (None, None))[1],
+                "target_kind": (cmd or {}).get("target_kind"),
+                "anchor_x": ((cmd or {}).get("anchor") or (None, None))[0],
+                "anchor_y": ((cmd or {}).get("anchor") or (None, None))[1],
                 "cmd_v": (cmd or {}).get("v"),
                 "cmd_w": (cmd or {}).get("w"),
                 "frontier_cells": (cmd or {}).get("nf"),
@@ -1052,6 +1062,20 @@ def main():
                      "frames_pose_off_map": explorer.n_pose_off_map,
                      "arrivals": explorer.n_arrivals,
                      "barren_targets": explorer.n_barren_targets,
+                     # --- aiming at a viewpoint rather than at the frontier --
+                     # `target_standoff_m` is the mechanism (borrowed from
+                     # m-explore/explore_lite's `recovery_delta` and FUEL/TARE's
+                     # viewpoint generation); see `explore.FrontierExplorer`.
+                     # These four counters are what says whether it did anything
+                     # at all: `viewpoints` non-zero with
+                     # `second_approach == viewpoints` would mean the standoff is
+                     # never enough and the robot always drives the last 0.8 m
+                     # anyway.
+                     "target_standoff_m": explorer.target_standoff_m,
+                     "viewpoints": explorer.n_viewpoints,
+                     "standoff_rejected": explorer.n_standoff_rejected,
+                     "viewpoint_stops": explorer.n_viewpoint_stops,
+                     "second_approach": explorer.n_second_approach,
                      # Places the robot reached, learned nothing from, and then
                      # stopped offering (see `explore.barren_blacklist_m`).
                      # `barren_targets` is the *consecutive* count that ends the

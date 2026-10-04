@@ -63,6 +63,7 @@ class FrontierExplorer:
                  max_turn_frames: int = 18, backoff_frames: int = 10,
                  min_frontier_cells: int = 25, commit_frames: int = 25,
                  reach_dist: float = 0.7, min_target_range: float = 1.0,
+                 target_standoff_m: float = 0.80,
                  stagnate_frames: int = 300, stagnate_eps: float = 0.5,
                  barren_targets: int = 8, barren_blacklist_m: float = 0.60,
                  robot_radius: float = 0.22, replan_every: int = 12,
@@ -238,6 +239,39 @@ class FrontierExplorer:
         # is what lets two similar targets flip back and forth.
         self.commit_frames = int(commit_frames)
         self.reach_dist = float(reach_dist)
+        # --- aim at a *viewpoint*, not at the frontier cell itself -----------
+        #
+        # Borrowed, not invented: `m-explore`/`explore_lite` push a goal that has
+        # ended up too close to the robot back out along the robot->goal line
+        # (`target_prox_lim` / `recovery_delta`, `explore/src/explore.cpp`), and
+        # FUEL/TARE generate an explicit **viewpoint** -- a pose the frontier is
+        # observable from -- rather than targeting the boundary cell at all.
+        #
+        # Why it is needed here: `_pick_target` returns *a frontier cell*, i.e. a
+        # free cell adjacent to unexplored space, and in a house that is the edge
+        # of the known world -- a doorway, the end of a wall, the inside corner
+        # of a room.  Driving at it is what puts the robot's nose in a corner
+        # that has nothing left to show (boss's report, 2026-10-04: "it insists
+        # on getting face-to-face with the corner").
+        #
+        # So the driven target becomes the walkable point `target_standoff_m`
+        # short of the frontier **on the line back towards the robot**, and the
+        # frontier position is kept separately as `_target_anchor` for the
+        # "is this frontier spent yet" test -- moving the goal without keeping
+        # the anchor would make that test look at a window of already-observed
+        # cells and retire the target on the next frame.
+        #
+        # 0.80 m: the robot is 0.44 m across and the lidar is ~1 m up, so this is
+        # far enough to see over the corner without the footprint touching it.
+        self.target_standoff_m = float(target_standoff_m)
+        self.n_viewpoints = 0          # times the pull-back was applied
+        self.n_standoff_rejected = 0   # ... and times it found nowhere walkable
+        self.n_viewpoint_stops = 0     # arrivals *at* a viewpoint
+        self.n_second_approach = 0     # ... that then had to drive on to the frontier
+        # True while the committed goal is a pulled-back viewpoint rather than
+        # the frontier itself; decides which kind of arrival this is.
+        self._target_standoff = False
+        self._target_anchor: Optional[Tuple[float, float]] = None
         self._target: Optional[Tuple[float, float]] = None
         self._target_age = 0
         # Progress-toward-target tracker, for the stagnation guard above.  Holds
@@ -983,6 +1017,46 @@ class FrontierExplorer:
         return None, None, len(cand)
 
 
+    def _viewpoint(self, wmap, x0, y0, tx, ty):
+        """A walkable point `target_standoff_m` short of `(tx, ty)`, or the
+        original if there is no such point.  See `target_standoff_m` in
+        `__init__` for where the mechanism comes from and why it is needed.
+
+        The search walks back along the robot->target line one cell at a time,
+        starting at the standoff distance, and takes the first cell the
+        **planner's own** walkable mask contains.  Using the planner's mask
+        rather than a local free/obstacle lookup is the point: the new goal has
+        to be somewhere A\\* agrees the robot can be, otherwise the pull-back
+        trades a corner-hug for a plan failure.
+        """
+        if self.target_standoff_m <= 0:
+            return tx, ty, False
+        dx, dy = tx - x0, ty - y0
+        d = float(np.hypot(dx, dy))
+        if d <= self.target_standoff_m + wmap.resolution:
+            return tx, ty, False               # already standing off far enough
+        # Never pull back so far that the new goal is itself an "arrival": the
+        # robot has to have a journey left after the standoff, or it stops where
+        # it stands and re-plans forever.  See the two-stage arrival in
+        # `command`.
+        r_max = min(self.target_standoff_m + 0.30,
+                    d - (self.reach_dist + 0.30))
+        if r_max < self.target_standoff_m:
+            return tx, ty, False
+        ux, uy = dx / d, dy / d                # unit vector target -> robot
+        walk = self.planner.free_space(wmap)
+        r = self.target_standoff_m
+        while r <= r_max + 1e-9:
+            gx, gy = tx - ux * r, ty - uy * r
+            cx, cy = wmap.cell_of(gx, gy)
+            cx, cy = int(cx), int(cy)
+            if not (0 <= cx < wmap.n and 0 <= cy < wmap.n):
+                break
+            if walk[cy, cx]:
+                return gx, gy, True
+            r += wmap.resolution
+        return tx, ty, False                   # nowhere walkable: keep the frontier
+
     def _lookahead(self, path: Sequence[Tuple[float, float]],
                    pose_xy) -> Tuple[float, float]:
         """Furthest waypoint within 1.2 m of the robot.
@@ -1187,20 +1261,75 @@ class FrontierExplorer:
             tx, ty = self._target
             d = float(np.hypot(tx - x0, ty - y0))
             if d <= self.reach_dist:
-                self.n_arrivals += 1
-                if self._area_at_target is None:
-                    self.n_barren_targets = 0      # first arrival: nothing to compare
-                elif area > self._area_at_target + self.stagnate_eps:
-                    self.n_barren_targets = 0
+                # ---- the two-stage arrival, and why it has to be two --------
+                #
+                # The goal may be a **viewpoint** -- a point short of the
+                # frontier (see `target_standoff_m`).  Standing there is worth
+                # something only if it actually resolves the frontier, so the
+                # first stop is a question, not an arrival:
+                #
+                #   * the frontier is gone -> it worked; that is a real arrival
+                #     and the ordinary accounting below applies;
+                #   * the frontier is still there -> the standoff was not
+                #     enough, so the goal becomes the frontier **itself** and the
+                #     robot drives the rest of the way.
+                #
+                # Without the second stage the pull-back is a trap, and it is
+                # worth writing down because a synthetic test caught it in one
+                # run: standing `standoff` short of the target leaves the robot
+                # permanently within `reach_dist` of the next viewpoint computed
+                # from where it now is, so every frame is an "arrival" at a
+                # point 0.8 m from where it already is.  Measured: the robot
+                # stopped making net progress and the moving-frame fraction fell
+                # to 41% (`tools/test_explore.py` case 6).  The second stage is
+                # what makes the change monotone: the robot always ends up at
+                # least as far along as it would have without the viewpoint.
+                if self._target_standoff:
+                    still = (
+                        self._still_unvisited(wmap, tx, ty)
+                        if self._target_kind == "sweep"
+                        else self._target_still_frontier(
+                            wmap, *(self._target_anchor or (tx, ty))))
+                    self.n_viewpoint_stops += 1
+                    self._target_standoff = False
+                    if still and self._target_anchor is not None:
+                        self.n_second_approach += 1
+                        self._target = self._target_anchor
+                        self._target_age = 0
+                        self._since_plan = 10 ** 9
+                        reuse = True
+                    else:
+                        self.n_arrivals += 1
+                        if self._area_at_target is None:
+                            self.n_barren_targets = 0
+                        elif area > self._area_at_target + self.stagnate_eps:
+                            self.n_barren_targets = 0
+                        else:
+                            self.n_barren_targets += 1
+                        self._area_at_target = area
+                        self._target = None
+                        self._target_anchor = None
                 else:
-                    self.n_barren_targets += 1
-                    # ... and stop offering this place.  See
-                    # `barren_blacklist_m`: counting fruitless arrivals without
-                    # acting on the count is how the same corner gets picked
-                    # eight times in a row.
-                    self._barren_spots.append((float(tx), float(ty)))
-                self._area_at_target = area
-                self._target = None
+                    self.n_arrivals += 1
+                    if self._area_at_target is None:
+                        self.n_barren_targets = 0  # first arrival: nothing to compare
+                    elif area > self._area_at_target + self.stagnate_eps:
+                        self.n_barren_targets = 0
+                    else:
+                        self.n_barren_targets += 1
+                        # ... and stop offering this place.  See
+                        # `barren_blacklist_m`: counting fruitless arrivals
+                        # without acting on the count is how the same corner gets
+                        # picked eight times in a row.  The *anchor* goes on the
+                        # list, not the viewpoint: what was fruitless is the
+                        # frontier, and the frontier is what a future candidate
+                        # would be compared to.
+                        bx, by = (self._target_anchor if self._target_anchor
+                                  else (tx, ty))
+                        self._barren_spots.append((float(bx), float(by)))
+                    self._area_at_target = area
+                    self._target = None
+                    self._target_anchor = None
             elif (self._target_kind == "sweep"
                   and self._sweep_target_stuck(d)):
                 # A patch can be reachable on paper and still be somewhere the
@@ -1208,12 +1337,17 @@ class FrontierExplorer:
                 # than spend the rest of the run driving at it.
                 self.n_sweep_abandoned += 1
                 self._target = None
+                self._target_anchor = None
+                self._target_standoff = False
             elif (self._still_unvisited(wmap, tx, ty)
                   if self._target_kind == "sweep"
-                  else self._target_still_frontier(wmap, tx, ty)):
+                  else self._target_still_frontier(
+                      wmap, *(self._target_anchor or (tx, ty)))):
                 reuse = True
             else:
                 self._target = None
+                self._target_anchor = None
+                self._target_standoff = False
         route = None
         if reuse:
             self._target_age += 1
@@ -1268,8 +1402,22 @@ class FrontierExplorer:
                     i = pick
                     # stabilise on the centroid of the chosen cluster
                     sel = np.hypot(wx - wx[i], wy - wy[i]) <= 1.0
-                    target_res = (float(wx[sel].mean()),
-                                  float(wy[sel].mean()))
+                    anchor = (float(wx[sel].mean()), float(wy[sel].mean()))
+                    # The frontier is what we mean to *look at*; the viewpoint is
+                    # where we mean to *stand*.  Keep both: the anchor is what
+                    # `_target_still_frontier` is asked about, the viewpoint is
+                    # what the base drives to.  See `target_standoff_m`.
+                    self._target_anchor = anchor
+                    gx, gy, moved = self._viewpoint(wmap, x0, y0,
+                                                    anchor[0], anchor[1])
+                    if moved:
+                        self.n_viewpoints += 1
+                    elif (self.target_standoff_m > 0
+                          and float(np.hypot(anchor[0] - x0, anchor[1] - y0))
+                          > self.target_standoff_m + wmap.resolution):
+                        self.n_standoff_rejected += 1
+                    self._target_standoff = bool(moved)
+                    target_res = (gx, gy)
             if target_res is None and self._linked is not None:
                 # Last resort before giving up / searching: go and look at a
                 # doorway we never resolved.
@@ -1292,6 +1440,8 @@ class FrontierExplorer:
                     n_cand = sw[3]
             if target_res is None:
                 self._target = None
+                self._target_anchor = None
+                self._target_standoff = False
                 self._path = []
                 self.n_search_turns += 1
                 self.n_search_frames += 1
@@ -1314,6 +1464,11 @@ class FrontierExplorer:
             if prev_target is not None and target_res != prev_target:
                 self.n_switches += 1
             self._target = target_res
+            # For a frontier the anchor was already set to the cluster centroid
+            # (the viewpoint is not what gets retired); for the other kinds the
+            # target *is* the anchor.
+            if self._target_kind != "frontier" or self._target_anchor is None:
+                self._target_anchor = target_res
             self._target_age = 0
             tx, ty = self._target
             if route is None:
@@ -1386,6 +1541,10 @@ class FrontierExplorer:
                      "mode": mode,
                      "candidates": len(self.last_candidates),
                      "target": (round(tx, 2), round(ty, 2)),
+                     "target_kind": self._target_kind,
+                     "anchor": ((round(self._target_anchor[0], 2),
+                                 round(self._target_anchor[1], 2))
+                                if self._target_anchor else None),
                      "dist": round(float(np.hypot(tx - x0, ty - y0)), 2),
                      "heading_err_deg": round(float(np.degrees(err)), 1),
                      "ahead_clear": bool(ahead),

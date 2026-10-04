@@ -120,6 +120,46 @@ OBSTACLE_MIN_VOTES = 2
 # returns -- so a wall the robot is looking at right now is still a wall.
 OBSTACLE_RELEASE_FRAMES = 2
 
+# ... and how much floor evidence is enough, as a *fraction of the obstacle
+# evidence* in the same cell.
+#
+# The release rule used to be "floor has been seen at least
+# `OBSTACLE_RELEASE_FRAMES` times since the last obstacle evidence, AND the cell
+# carries fewer than `OBSTACLE_STRONG_VOTES` (12) obstacle votes".  Measured on
+# the simulator run of 2026-10-04 (`out/y26_sim`, 617 frames), **the vote cap is
+# what sealed the doorway and left the robot locked in one room**: the doorway
+# strip at x = -9.2..-7.8 m carries 12-23 obstacle votes against 200-430 for the
+# real wall next to it, and `_ground_after` of **15-23** -- i.e. the floor was
+# visible there for 15-23 frames *after* the last obstacle return.  Those cells
+# were exactly one vote over the cap, so they stayed blocked for the rest of the
+# run.  Cost: the robot's reachable set was **32.5 m2 of 166.1 m2 walkable**.
+#
+# A ratio is the right shape for the test because a wall *does* leak a few floor
+# returns at its base (the laser grazes along the bottom edge and 0.1 m cells are
+# not fully covered by a 0.15 m wall), so an absolute floor count cannot
+# separate "wall" from "something that was there and left"; but the leak is
+# small relative to the hundreds of returns the wall itself produces, while a
+# transient is followed by floor being visible in the very same cell for as long
+# as the area stays in view.
+#
+# Swept offline on both captures (releasing cells with
+# `_ground_after >= ratio * _obs_votes`), for the simulator map:
+#
+#   ratio   reachable m2   released cells with >= 100 votes
+#   1.00        32.5                     0     <- door sealed again
+#   0.50       162.6                     0
+#   0.30       163.7                     0     <- chosen
+#   0.20       164.1                     1
+#   0.10       164.6                     5
+#   0.00       165.2                    26
+#
+# 0.30 is the largest ratio that still reopens the doorway, and it releases
+# **no** cell carrying 100+ votes on either capture -- i.e. every structure that
+# many frames of evidence agree on is left alone.  The real capture moves in the
+# same direction and by less: green 408.4 -> 415.5 m2, planner-walkable
+# 229.2 -> 241.5 m2, components 39 -> 36.
+OBSTACLE_RELEASE_RATIO = 0.30
+
 # ... and how the layer is cleaned once the votes are in.
 #
 # Measured on the real corridor replay (1427 frames, `tools/diagnose_ground.py`):
@@ -228,6 +268,27 @@ class WorldMap:
     # a timestamp so it can be dumped and replayed -- the artifact has to carry
     # the evidence behind every derived quantity.
     _ground_after: np.ndarray = field(init=False)
+    # Cells the robot's own body has occupied.  A robot cannot be inside a wall,
+    # so a cell on the recorded path is traversable **by construction** -- this
+    # is the map, not a heuristic, and it is what keeps the map from disagreeing
+    # with its own trajectory.
+    #
+    # Why it is needed even with the release rule above: `_ground_after` is
+    # reset to zero by an obstacle return in the *same frame*, so a cell that
+    # gets a floor return and a stray obstacle return together every time the
+    # robot passes over it never climbs the counter and stays blocked forever.
+    # Measured on the real capture (1427 frames): of the 998 distinct cells the
+    # path crosses, **807 were marked obstacle** -- with a median of just 2 votes
+    # each, i.e. exactly `OBSTACLE_MIN_VOTES`, scattered along the route rather
+    # than clustered anywhere.  That is the grey trail down the middle of the
+    # corridor that the video shows, and the release rule cannot reach it.
+    #
+    # It cannot open a hole in a wall by accident, either: the cells it frees
+    # form a one-cell-wide line, and `nav.PathPlanner.free_space` erodes the
+    # walkable mask by the robot radius, which removes any one-cell-wide free
+    # line regardless of where it is.  So this changes what the *map* says
+    # without changing what the planner will drive through.
+    _on_path: np.ndarray = field(init=False)
 
     # 3D points, voxelised, with a label each
     _pts: List[np.ndarray] = field(default_factory=list, init=False)
@@ -271,6 +332,7 @@ class WorldMap:
         self.ground_ever = np.zeros((n, n), bool)
         self.obstacle_now = np.zeros((n, n), bool)
         self._ground_after = np.zeros((n, n), np.int32)
+        self._on_path = np.zeros((n, n), bool)
 
     # ------------------------------------------------------------------ cells
     def cell_of(self, x, y):
@@ -346,6 +408,11 @@ class WorldMap:
         self.t_first = stamp if self.t_first is None else self.t_first
         self.t_last = stamp
         self.traj.append((float(pose_xy[0]), float(pose_xy[1])))
+        # ... and stamp the cell the robot's body is in, so the obstacle layer
+        # can never claim the robot was inside a wall.  See `_on_path`.
+        _px, _py = self.cell_of(pose_xy[0], pose_xy[1])
+        if self._in(_px, _py):
+            self._on_path[int(_py), int(_px)] = True
         for px, py in persons_xy:
             self.persons.append((float(px), float(py), float(stamp)))
         for px, py, lb in objects_xy:
@@ -410,8 +477,12 @@ class WorldMap:
         # turns around) re-blocks on the same frame.
         if OBSTACLE_RELEASE_FRAMES > 0:
             released = ((self._ground_after >= OBSTACLE_RELEASE_FRAMES)
-                        & (self._obs_votes < OBSTACLE_STRONG_VOTES))
+                        & (self._ground_after * 1.0
+                           >= OBSTACLE_RELEASE_RATIO * self._obs_votes))
             np.logical_and(self.obstacle, ~released, out=self.obstacle)
+        # The path exemption, applied after the release rule and never undone:
+        # the robot was there, so it is not a wall.
+        np.logical_and(self.obstacle, ~self._on_path, out=self.obstacle)
         if OBSTACLE_OPEN_PX > 0:
             opened = cv2.morphologyEx(
                 self.obstacle.astype(np.uint8), cv2.MORPH_OPEN,
@@ -594,12 +665,22 @@ class WorldMap:
             "obstacle_cells": int(self.obstacle.sum()),
             # Cells the release rule took out of the obstacle layer this frame:
             # obstacle evidence existed, the floor has since been visible, and
-            # there is no structural evidence.  On the real capture this is the
-            # walking-people trail.
+            # enough of it relative to the obstacle evidence.  On the real
+            # capture this is the walking-people trail.
             "obstacle_released_cells": int(
                 ((self._obs_votes >= OBSTACLE_MIN_VOTES)
                  & (self._ground_after >= OBSTACLE_RELEASE_FRAMES)
-                 & (self._obs_votes < OBSTACLE_STRONG_VOTES)).sum()),
+                 & (self._ground_after * 1.0
+                    >= OBSTACLE_RELEASE_RATIO * self._obs_votes)).sum()),
+            # Cells on the robot's own path.  `obstacle_on_path_cells` counts the
+            # ones that the obstacle layer would have called blocked -- the map
+            # disagreeing with its own trajectory.  It is reported rather than
+            # only corrected: a large number means something upstream (poses or
+            # the obstacle band) is putting returns where the robot is, and that
+            # should be visible in the run report, not silently tidied away.
+            "path_cells": int(self._on_path.sum()),
+            "obstacle_on_path_cells": int(
+                (self._on_path & (self._obs_votes >= OBSTACLE_MIN_VOTES)).sum()),
             "traversable_of_seen_pct": round(100.0 * trav / max(obs, 1), 2),
             "traversable_area_m2": round(trav * self.resolution ** 2, 1),
             # The raw appended count until `finalize()` has run, then the real

@@ -182,6 +182,69 @@ def main():
         w.add(hi, no, yes, no, (0.0, 0.0), t)
     check("the object returning re-blocks the cell", w.obstacle[walk_cell])
 
+    print("\n== 8. release needs a *proportion* of floor evidence, not just two ===")
+    # The vote cap (`votes < OBSTACLE_STRONG_VOTES`) used to be the second half
+    # of the release test, and it is what sealed the simulator's doorway: those
+    # cells carry 12-23 votes against the wall's 200-430, and floor was visible
+    # there for 15-23 frames afterwards -- one vote over the cap, blocked for the
+    # rest of the run, robot locked in one room (reachable 32.5 of 166.1 m2).
+    # See `worldmap.OBSTACLE_RELEASE_RATIO`.
+    w = WorldMap(resolution=0.10, extent=30.0, voxel=0.15)
+    hi = np.array([[2.0, 2.0, 1.0]])
+    lo = np.array([[2.0, 2.0, 0.0]])
+    no, yes = np.zeros(1, bool), np.ones(1, bool)
+    door = tuple(int(v) for v in w.cell_of(2.0, 2.0))
+    for i in range(20):                   # 20 votes: above the old 12-vote cap
+        w.add(hi, no, yes, no, (0.0, 0.0), float(i))
+    check("20 obstacle votes -> blocked", w.obstacle[door])
+    check("... and 0 floor frames after is not enough to release",
+          w._ground_after[door] == 0)
+    for i in range(6):                    # 6 floor frames = 0.30 * 20
+        w.add(lo, yes, no, no, (0.0, 0.0), 20.0 + i)
+    check("6 floor frames after 20 obstacle votes releases the cell "
+          "(the doorway case)", not w.obstacle[door])
+    check("... and the floor comes back with it", w.ground[door])
+
+    # The other half: a wall leaks floor returns at its base, and those must not
+    # be enough.  Same vote count, same floor count as `OBSTACLE_RELEASE_FRAMES`,
+    # but the wrong proportion.
+    w = WorldMap(resolution=0.10, extent=30.0, voxel=0.15)
+    wall = np.array([[8.0, 8.0, 1.0]])
+    base = np.array([[8.0, 8.0, 0.0]])
+    wc = tuple(int(v) for v in w.cell_of(8.0, 8.0))
+    for i in range(20):
+        w.add(wall, no, yes, no, (0.0, 0.0), float(i))
+    for i in range(5):                    # 5 < 6, i.e. below the 0.30 ratio
+        w.add(base, yes, no, no, (0.0, 0.0), 20.0 + i)
+    check("5 floor frames after 20 votes is 0.25 - not enough, wall survives",
+          w.obstacle[wc])
+
+    print("\n== 9. the map may not claim the robot was inside a wall ==")
+    # `_ground_after` is reset by an obstacle return in the same frame, so a cell
+    # that always gets a floor and a stray obstacle return together never climbs
+    # the counter.  Measured on the real capture: 807 of the 998 cells the path
+    # crosses were marked obstacle, median 2 votes each, scattered along the
+    # route.  See `worldmap._on_path`.
+    w = WorldMap(resolution=0.10, extent=30.0, voxel=0.15)
+    same = np.array([[3.0, 3.0, 1.0]])    # obstacle return in the cell it drives in
+    floor_here = np.array([[3.0, 3.0, 0.0]])
+    there = np.array([[9.0, 9.0, 1.0]])   # a cell it never visits
+    pc = tuple(int(v) for v in w.cell_of(3.0, 3.0))
+    oc = tuple(int(v) for v in w.cell_of(9.0, 9.0))
+    for i in range(4):
+        w.add(np.vstack([same, there]),
+              np.concatenate([np.zeros(1, bool), no]),
+              np.concatenate([yes, yes]), np.concatenate([no, no]),
+              (3.0, 3.0), float(i))
+        w.add(floor_here, yes, no, no, (3.0, 3.0), float(i) + 0.5)
+    check("the cell the robot stood in is not an obstacle",
+          not w.obstacle[pc])
+    check("... even though it collected obstacle votes",
+          w._obs_votes[pc] >= 2)
+    check("... and it is drivable", w.ground[pc])
+    check("a cell off the path with the same evidence stays blocked",
+          w.obstacle[oc])
+
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
         for f in FAILS:
