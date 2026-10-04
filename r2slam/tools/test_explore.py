@@ -575,13 +575,62 @@ def main():
         fails.append("drove at an unreachable sweep target for 260 frames "
                      "without giving up on it")
 
+    # ---- 15. the goal is a viewpoint, not the frontier cell itself --------
+    # Borrowed from `explore_lite` (`target_prox_lim` / `recovery_delta`) and
+    # FUEL/TARE's viewpoint generation: a frontier cell is a free cell *adjacent
+    # to the unexplored*, which in a house is a doorway or the inside corner of a
+    # room, so aiming at it is aiming at the wall.  See
+    # `FrontierExplorer.target_standoff_m`.
+    e15 = FrontierExplorer(sweep=False, stagnate_frames=10 ** 9,
+                           commit_frames=10 ** 9)   # hold the target, so the
+    #                                               viewpoint is the one that
+    #                                               gets arrived at
+    w15 = world_with_specks()
+    _v, _om, i15 = e15.command(w15, (0.0, 0.0), 0.0)
+    tgt, anc = i15.get("target"), i15.get("anchor")
+    print("15) aiming at a viewpoint rather than the boundary cell")
+    print("    target %s   anchor %s   standoff %.2f m"
+          % (tgt, anc, e15.target_standoff_m))
+    if tgt is None or anc is None:
+        fails.append("case 15 lost its meaning: no target/anchor reported")
+    else:
+        d_t = float(np.hypot(tgt[0], tgt[1]))
+        d_a = float(np.hypot(anc[0], anc[1]))
+        if not (d_a - d_t >= e15.target_standoff_m - 0.15):
+            fails.append("the goal is not pulled back by the standoff: "
+                         "target %.2f m, anchor %.2f m" % (d_t, d_a))
+        if e15.n_viewpoints == 0:
+            fails.append("the standoff mechanism never fired")
+    # ---- and the *second* stage must fire ----------------------------------
+    # `world_with_specks()` has no sensor, so the frontier never resolves no
+    # matter how long the robot looks at it.  That makes it the exact case the
+    # two-stage arrival exists for: the robot has to stop being polite about the
+    # standoff and drive the rest of the way, or it stands 0.8 m short for ever
+    # and every frame counts as an arrival (measured when the second stage was
+    # missing: 41% moving frames, zero net progress).
+    pose15 = (0.0, 0.0, 0.0)
+    for _ in range(150):
+        v, om, _i = e15.command(w15, (pose15[0], pose15[1]), pose15[2])
+        pose15 = drive_step(pose15, v, om)
+    print("    after 150 frames: viewpoint stops %d, second approaches %d, "
+          "end x=%.2f" % (e15.n_viewpoint_stops, e15.n_second_approach,
+                          pose15[0]))
+    if e15.n_viewpoint_stops == 0:
+        fails.append("case 15 lost its meaning: no viewpoint was ever reached")
+    elif e15.n_second_approach == 0:
+        fails.append("the frontier never resolved and the robot never drove on "
+                     "-- the standoff is a trap, not a viewpoint")
+    if pose15[0] < 2.5:
+        fails.append("two-stage arrival made no net progress (x=%.2f)"
+                     % pose15[0])
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (14 checks)")
+    print("verdict: PASS (15 checks)")
     return 0
 
 

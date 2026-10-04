@@ -209,6 +209,28 @@ def audit_source(key, label, out_root, checks):
         if ins and ins.get("n"):
             checks.append(("info", "%s instances: %s"
                            % (tag, ins.get("by_class")), ""))
+        # ---- the map must not contradict its own trajectory ----------------
+        # `obstacle_on_path_cells` counts cells the robot's body occupied that
+        # the obstacle layer still calls blocked.  WARN rather than FAIL because
+        # it is a *map-quality* signal, not a contract with the brief: it does
+        # not change the delivered files, and the planner will not route through
+        # a one-cell-wide line anyway (`nav.free_space` erodes it away).  Measured
+        # on the real capture before the path exemption existed: 807 of the 998
+        # distinct cells on the route, median 2 votes each -- the grey band down
+        # the middle of the corridor in the video.  After it: 0 by construction,
+        # so a non-zero count here means the exemption is not being applied (a
+        # `--npz` replay without `WorldMap.add`, say) and the run record has to
+        # say so instead of the number quietly disappearing.
+        mp = s.get("map") or {}
+        n_path, n_bad = mp.get("path_cells"), mp.get("obstacle_on_path_cells")
+        if n_path is None or n_bad is None:
+            checks.append(("info", "%s map-vs-path not reported "
+                           "(pre-2026-10-04 dump)" % tag, ""))
+        else:
+            frac = (100.0 * n_bad / n_path) if n_path else 0.0
+            checks.append(("PASS" if (n_bad == 0 or frac <= 2.0) else "WARN",
+                           "%s map agrees with its own path (%d/%d cells, %.1f%%)"
+                           % (tag, n_bad, n_path, frac), ""))
     else:
         checks.append(("FAIL", "%s summary.json missing" % tag, ""))
 
