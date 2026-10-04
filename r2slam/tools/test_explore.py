@@ -848,9 +848,56 @@ def main():
     if t18b is not None:
         fails.append("case 18 lost its meaning: a target came out of an empty "
                      "map")
-    if not e18b.sweep_first_pass:
-        fails.append("an empty map latched the survey off -- that is the v14 "
-                     "bug: the survey then never runs at all")
+    if e18b.n_deep_stops or e18b.n_first_pass_stops:
+        fails.append("an empty map produced a stop (survey %d, deep %d) -- it "
+                     "has nothing to sweep, so the counters must stay at zero"
+                     % (e18b.n_first_pass_stops, e18b.n_deep_stops))
+
+    # --- 19. the survey is re-asked, not decided once ----------------------
+    #
+    # The v15 bug, in one sentence: the survey latched off after two stops
+    # (`first_pass_stops 2, deep_stops 16`) because with only the living room
+    # mapped there was nothing else on offer -- and every room discovered later,
+    # which is all of them, was then never surveyed.  The work set grows during
+    # a run, so the test has to be re-asked.  The fixture is the smallest map
+    # that can show it: run the survey on a short corridor, then reveal more
+    # floor and check that the survey fires again, somewhere new.
+    print("19) the survey re-fires when the map grows (the v15 bug)")
+    pts19, ground19 = corridor(observed_to=3.0)
+    w19 = WorldMap(resolution=0.1, extent=12.0)
+    w19.add(pts19, ground19, ~ground19, None, (0.0, 0.0), 0.0)
+    w19.add(pts19, ground19, ~ground19, None, (0.0, 0.0), 0.1)
+    e19 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e19._start_xy = (0.0, 0.0)
+    r19, _e19 = e19._masks(w19, (0.0, 0.0))
+    stops19 = []
+    for _ in range(4):
+        t = e19._pick_sweep_target(w19, r19, 0.0, 0.0)
+        if t is None:
+            break
+        stops19.append((t[0], t[1]))
+        for _ in range(8):
+            w19.traj.append((t[0], t[1]))
+    before = e19.n_first_pass_stops
+    print("    short corridor: %d survey stops %s"
+          % (before, ", ".join("(%.2f, %.2f)" % s for s in stops19)))
+    pts19b, ground19b = corridor(observed_to=6.0)          # reveal more floor
+    w19.add(pts19b, ground19b, ~ground19b, None, (0.0, 0.0), 0.2)
+    r19, _e19 = e19._masks(w19, (0.0, 0.0))
+    t19 = e19._pick_sweep_target(w19, r19, 0.0, 0.0)
+    far = t19 is not None and all(
+        float(np.hypot(t19[0] - a, t19[1] - b)) > e19.sweep_stop_spread_m
+        for a, b in stops19)
+    print("    after revealing more floor: target %s, new survey stop: %s"
+          % (None if t19 is None else "(%.2f, %.2f)" % t19[:2],
+             e19.n_first_pass_stops))
+    if t19 is None:
+        fails.append("case 19 lost its meaning: no target after the map grew")
+    elif not far:
+        fails.append("the survey did not fire again once the map grew -- that "
+                     "is the v15 bug")
+    if e19.n_first_pass_stops <= before:
+        fails.append("no survey stop was recorded after the map grew")
 
     print()
     if fails:
@@ -858,7 +905,7 @@ def main():
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (18 checks)")
+    print("verdict: PASS (19 checks)")
     return 0
 
 

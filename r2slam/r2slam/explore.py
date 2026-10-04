@@ -204,9 +204,17 @@ class FrontierExplorer:
         # stop already made, take **that**, and ignore the within-patch
         # commitment.  The commitment then applies to the second pass, which is
         # where "finish this room" is the right instruction.
-        self.sweep_first_pass = bool(sweep_first_pass)
+        # `sweep_survey` is the *setting*; `sweep_first_pass` is what the last
+        # pick actually did.  Keeping them as one variable is how the first cut
+        # of this ended up with a switch that did nothing: the picker wrote its
+        # own answer over the configuration.
+        self.sweep_survey = bool(sweep_first_pass)
+        self.sweep_first_pass = False
         self.sweep_stop_spread_m = float(sweep_stop_spread_m)
-        self._sweep_stops: List[Tuple[float, float]] = []
+        # ... and the ledger is the *survey* stops only.  Deep stops must not go
+        # in it, or every deep target would look like "somewhere new" and the
+        # survey would never hand over to the commitment.
+        self._survey_stops: List[Tuple[float, float]] = []
         self.n_first_pass_stops = 0
         self.n_deep_stops = 0
         self._sweep_patch_mask = None      # the patch currently being finished
@@ -1143,40 +1151,43 @@ class FrontierExplorer:
             out.sort(key=lambda c: c[0])
             return out
 
-        if self.sweep_first_pass:
-            # One stop per room first: `_sweep_stops` are the stops the first
-            # pass has already made, and a candidate only counts if it is
-            # somewhere else.  When nothing qualifies the first pass is over --
-            # latched, not recomputed, so the second pass is not competing with
-            # it on every frame.
-            all_c = gather(range(1, n), self.sweep_min_m2)
+        # --- the survey, re-evaluated every pick (no latch) ----------------
+        #
+        # A patch counts as "already surveyed" if a survey stop is within
+        # `sweep_stop_spread_m` of its deepest cell.  While any eligible patch
+        # fails that test, take it and ignore the within-patch commitment.
+        #
+        # Two versions of this were wrong before it, both caught by running it:
+        #
+        #   * **a latch** ("once nothing new is on offer, the survey is over for
+        #     good").  `run_v15.sh sim` reported `first_pass_stops 2,
+        #     deep_stops 16`: with only the living room mapped, two stops covered
+        #     everything then known, the latch closed, and every room discovered
+        #     afterwards -- all of them -- was never surveyed.  The work set
+        #     *grows* during a run, so the test has to be re-asked, not decided
+        #     once.
+        #   * latching on an **empty map**: on frame one no patch reaches
+        #     `sweep_min_m2`, so "nothing new" was true and the survey closed
+        #     immediately (`run_v14.sh sim`: `first_pass_stops 0`).
+        #
+        # Both are the same mistake in different clothes: treating "there is
+        # nothing to do *yet*" as "there is nothing to do".
+        all_c = gather(range(1, n), self.sweep_min_m2)
+        new_c = []
+        if self.sweep_survey:
             spread = self.sweep_stop_spread_m ** 2
             new_c = [c for c in all_c
                      if all((c[2] - bx) ** 2 + (c[3] - by) ** 2 > spread
-                            for bx, by in self._sweep_stops)]
-            if new_c:
-                cands = new_c
-                locked = 0
-            elif all_c:
-                # There is work, and none of it is anywhere new: the survey is
-                # done.  Latch it off.
-                self.sweep_first_pass = False
-                cands = (gather([locked], self.sweep_patch_keep_m2)
-                         if locked else all_c)
-            else:
-                # No eligible patch *at all* -- which is the normal state on the
-                # first frames of a run, when almost nothing has been mapped.
-                # This must NOT latch the survey off, and the first version did:
-                # `run_v14.sh sim` reported `first_pass_stops 0, deep_stops 13`,
-                # i.e. the survey never ran once, because on frame one the map
-                # had no 3 m2 patch yet, `new_c` was empty, and the latch
-                # concluded "nothing else to see".  Hand back nothing and let the
-                # caller fall through to the frontier.
-                cands = []
+                            for bx, by in self._survey_stops)]
+        survey_pick = bool(new_c)
+        self.sweep_first_pass = survey_pick      # reported: was it on offer
+        if survey_pick:
+            cands = new_c
+            locked = 0
         elif locked:
             cands = gather([locked], self.sweep_patch_keep_m2)
         else:
-            cands = gather(range(1, n), self.sweep_min_m2)
+            cands = all_c
         picked = self._plan_first(wmap, cands, x0, y0)
         if picked is None and locked:
             # The locked patch has nothing plannable left.  Drop the lock and
@@ -1185,7 +1196,7 @@ class FrontierExplorer:
             self._sweep_patch_mask = None
             cands = gather(range(1, n), self.sweep_min_m2)
             picked = self._plan_first(wmap, cands, x0, y0)
-        if picked is None and self.sweep_first_pass and self._sweep_stops:
+        if picked is None and survey_pick and self._survey_stops:
             # Every "somewhere else" candidate was unroutable.  Take the best of
             # the rest rather than reporting "nothing to sweep" -- the spread
             # rule is a preference about *order*, not a reason to stop working.
@@ -1194,8 +1205,8 @@ class FrontierExplorer:
         if picked is None:
             return None
         tx, ty, path, ncell, L = picked
-        if self.sweep_first_pass:
-            self._sweep_stops.append((float(tx), float(ty)))
+        if survey_pick:
+            self._survey_stops.append((float(tx), float(ty)))
             self.n_first_pass_stops += 1
         else:
             self.n_deep_stops += 1
