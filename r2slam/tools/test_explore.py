@@ -195,6 +195,25 @@ def world_with_pocket(extent=12.0):
     return w
 
 
+def walked_past(w, y=-1.35):
+    """Record a trajectory that drives the length of the corridor, offset from
+    the pocket's centre line.  This is what makes a pocket a *blind spot* rather
+    than map that has simply not been swept yet -- see `shadow_near_m`.
+
+    The trajectory is **replaced, not appended to**.  `WorldMap.add` records the
+    pose it is handed, so a fixture built with `w.add(..., (0.0, 0.0), ...)` has
+    the origin in its trajectory -- and in this fixture the origin is on the
+    pocket's edge, which would satisfy the "has the robot been near it" gate for
+    free and turn the negative case below into a no-op.  (Found by the negative
+    case failing: `distance to nearest visited = 0.0` for a pocket 2.9 m from
+    where the robot was supposed to have been.)
+    """
+    del w.traj[:]
+    for x in np.arange(-1.9, 3.5, 0.25):
+        w.traj.append((float(x), float(y)))
+    return w
+
+
 def walked_everywhere(w):
     """Record a trajectory that has already covered the corridor floor.
 
@@ -653,7 +672,7 @@ def main():
 
     # --- 16. a blind spot in mapped space gets a viewpoint, exactly once ----
     print("16) an occlusion shadow gets a viewpoint into it")
-    w16 = world_with_pocket()
+    w16 = walked_past(world_with_pocket())
     e16 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
     e16._start_xy = (0.0, 0.0)
     r16, _ext16 = e16._masks(w16, (0.0, 0.0))
@@ -681,6 +700,29 @@ def main():
     e16b._masks(w16, (0.0, 0.0))
     if e16b._pick_shadow_target(w16, 0.0, 0.0) is not None:
         fails.append("`shadow=False` still produced a shadow target")
+    # ---- and it must NOT fire for a pocket the robot never drove past ------
+    #
+    # This is the guard for the first A/B of this feature, which regressed:
+    # `run_v12.sh sim` made 6 of its 7 targets `shadow` and spent 53% of the run
+    # on them, never entering the left-hand rooms -- reachable floor visited 32%
+    # against 46%, floor driven 70.4 m against 102.2 m.  The cause is structural
+    # (the map grows, so every newly seen object casts a fresh pocket), and the
+    # fix is that a pocket only counts once the robot has been within
+    # `shadow_near_m` of it and *still* cannot see it.
+    w16d = world_with_pocket()
+    del w16d.traj[:]
+    w16d.traj.extend([(3.5, 0.0), (3.5, 0.0)])       # ~2.9 m away, never closer
+    e16d = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e16d._masks(w16d, (3.5, 0.0))
+    sh_d = e16d._pick_shadow_target(w16d, 3.5, 0.0)
+    print("    a pocket 2.9 m off the trajectory -> %s (rejected as too far: %d)"
+          % (None if sh_d is None else "TARGETED", e16d.n_shadow_far))
+    if sh_d is not None:
+        fails.append("a pocket the robot has never been near was targeted -- "
+                     "that is the v12 regression, not a blind spot")
+    if e16d.n_shadow_far == 0:
+        fails.append("the near-trajectory gate never rejected anything, so it "
+                     "is not the thing doing the work")
 
     # --- 17. finish one patch before opening the next ---------------------
     #

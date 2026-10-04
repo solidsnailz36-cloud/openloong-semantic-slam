@@ -1086,6 +1086,7 @@ def main():
                      "patch_releases": explorer.n_patch_releases,
                      "shadow_probes": explorer.n_shadow_probes,
                      "shadow_skipped": explorer.n_shadow_skipped,
+                     "shadow_far": explorer.n_shadow_far,
                      "targets_picked": explorer.n_picks,
                      "frames_pose_off_map": explorer.n_pose_off_map,
                      "arrivals": explorer.n_arrivals,

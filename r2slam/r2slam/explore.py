@@ -79,6 +79,7 @@ class FrontierExplorer:
                  sweep_patch_keep_m2: float = 1.20,
                  sweep_patch_max_targets: int = 4,
                  shadow: bool = True, shadow_min_m2: float = 1.00,
+                 shadow_near_m: float = 2.00,
                  shadow_probe_limit: int = 10,
                  shadow_blacklist_m: float = 1.00,
                  shadow_max_range_m: float = 10.0,
@@ -208,6 +209,35 @@ class FrontierExplorer:
         # future, just "is the line to it clear from here".
         self.shadow = bool(shadow)
         self.shadow_min_m2 = float(shadow_min_m2)
+        # --- how near the robot must have got, for this to be a blind spot ---
+        #
+        # Without this the mechanism hijacks the run, and the first A/B proved
+        # it: `run_v12.sh sim` produced **6 of its 7 targets as `shadow`** and
+        # spent 637 of 1192 frames (53%) on them, never entering the left-hand
+        # rooms at all -- floor driven 70.4 m against 102.2 m, trajectory
+        # bounding box 9.9 x 9.8 m against 17.4 x 13.7 m, reachable floor
+        # visited 32% against 46%.
+        #
+        # The reason is structural, not a tuning error: **the map grows, so
+        # every newly seen object casts a fresh pocket.**  Early in a run there
+        # is always some >= 1 m2 patch of unknown ringed by seen floor, so an
+        # unconditional "resolve the blind spots" policy stops exploring and
+        # starts circling the furniture in the one room it has mapped.  That is
+        # the behaviour `sweep` was invented to replace (see its note in
+        # `__init__`), reintroduced through a side door.
+        #
+        # What actually deserves its own trip is a patch that **stayed
+        # invisible after the robot went past it** -- "I drove by here and still
+        # cannot see behind that".  So a pocket only qualifies if some part of
+        # it comes within `shadow_near_m` of somewhere the robot has already
+        # been (`_fresh_depth` is exactly that distance, in cells).  Measured on
+        # `grids_v11_sim`, the 1.64 m2 pocket behind furniture is 0.43 m from
+        # the trajectory of that run; the transient pockets that hijacked v12
+        # were 3-6 m away.  2.0 m separates them with room on both sides, and
+        # it is a statement about the world ("past it, and still blind") rather
+        # than a tuned number.
+        self.shadow_near_m = float(shadow_near_m)
+        self.n_shadow_far = 0
         self.shadow_probe_limit = int(shadow_probe_limit)
         self.shadow_blacklist_m = float(shadow_blacklist_m)
         self.shadow_max_range_m = float(shadow_max_range_m)
@@ -1175,6 +1205,9 @@ class FrontierExplorer:
             return None
         # Distance from every cell to the nearest place the robot can stand.
         dt = cv2.distanceTransform((~reach).astype(np.uint8), cv2.DIST_L2, 5)
+        # ... and from every cell to the nearest place it has *been*: that is
+        # what distinguishes a blind spot from map that has not been swept yet.
+        near = self._fresh_depth(wmap)
         sx, sy = self._start_xy if self._start_xy is not None else (x0, y0)
         cands = []
         for L in range(1, n_lab):
@@ -1185,6 +1218,12 @@ class FrontierExplorer:
             if int((m & near_floor).sum()) < 4:
                 continue
             ys, xs = np.nonzero(m)
+            # "Past it, and still blind" -- see `shadow_near_m`.  A patch the
+            # robot has never been near is not a blind spot, it is just map the
+            # sweep has not got to yet, and the sweep will resolve it.
+            if float(near[ys, xs].min()) > self.shadow_near_m / wmap.resolution:
+                self.n_shadow_far += 1
+                continue
             pwx = (xs + 0.5) * wmap.resolution - wmap.extent
             pwy = (ys + 0.5) * wmap.resolution - wmap.extent
             mx, my = float(pwx.mean()), float(pwy.mean())
@@ -1795,8 +1834,25 @@ class FrontierExplorer:
             # Frontier answers "where does the map end", which on this
             # 40 m world-aligned scanner is always a furniture shadow two
             # metres away -- see the note on `sweep` in __init__.
-            sw = (self._pick_sweep_target(wmap, reach, x0, y0)
-                  if self.sweep else None)
+            # --- a blind spot in mapped space, decided *before* the sweep -----
+            #
+            # Order matters here in a way that is easy to get wrong, and was:
+            # the first version called `_pick_sweep_target` first and then let
+            # the shadow override the answer.  `_pick_sweep_target` **commits**
+            # to a patch as a side effect, so the sweeps it discarded still
+            # advanced the patch-commitment bookkeeping -- and on the v13 A/B
+            # that showed up as two rooms never being entered at all.  Asking
+            # the shadow question first means a discarded sweep never runs.
+            used_shadow = False
+            sw = None
+            if self.shadow:
+                sh = self._pick_shadow_target(wmap, x0, y0)
+                if sh is not None:
+                    sw = sh
+                    used_shadow = True
+                    self.n_shadow_probes += 1
+            if sw is None and self.sweep:
+                sw = self._pick_sweep_target(wmap, reach, x0, y0)
             # ... unless there is more floor we *cannot* reach than floor we can.
             #
             # The first version of the island probe only ran when the sweep had
@@ -1834,21 +1890,8 @@ class FrontierExplorer:
             # one trip, and `island_probe_limit` caps the whole thing in case the
             # band turns out to be a wall that will never resolve.
             used_probe = False
-            used_shadow = False
-            # A blind spot in mapped space outranks a sweep.  Both are one trip;
-            # only one of them can change what the map knows.  See
-            # `_pick_shadow_target`.
-            if self.shadow:
-                # Deliberately not guarded on `sw is not None`: when the sweep
-                # has run out of floor to drive over, a blind spot is exactly
-                # what is left to do -- that is the state the map is in at the
-                # end of a run, and it is when these pockets are all that
-                # remains.
-                sh = self._pick_shadow_target(wmap, x0, y0)
-                if sh is not None:
-                    sw = sh
-                    used_shadow = True
-                    self.n_shadow_probes += 1
+            # A blind spot in mapped space outranks a sweep -- see the block
+            # above, which is where that decision is actually made.
             if sw is not None:
                 stranded = self._stranded_fresh(wmap)
                 if stranded >= self.island_trigger_m2:
