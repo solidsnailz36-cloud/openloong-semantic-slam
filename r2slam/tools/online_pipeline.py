@@ -936,7 +936,13 @@ def main():
     # reachable, i.e. quoting the first number as "area covered" overstates the
     # run by a factor of two.  Both are reported so the claim can be checked.
     reach_note = None
-    reach_radius = 0.22            # FrontierExplorer's default robot radius
+    # 0.19, at boss's direction (2026-10-04).  NOTE: it is a no-op as things
+    # stand -- `free_space` quantises the erosion kernel with
+    # `round(2*r/res)|1`, so 0.19 and 0.22 both give 5x5.  The real lever is
+    # <= 0.15, which gives 3x3, i.e. cutting the clearance from 0.2 m to 0.1 m.
+    # Kept in step with the explorer so the reachability note and the planner do
+    # not describe different robots.
+    reach_radius = 0.19            # FrontierExplorer's default robot radius
     try:
         from r2slam.nav import PathPlanner as _PP
         _pl = _PP(robot_radius=reach_radius, close_px=5)

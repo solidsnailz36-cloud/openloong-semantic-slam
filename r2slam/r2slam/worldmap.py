@@ -233,7 +233,49 @@ OBSTACLE_RELEASE_RATIO = 0.30
 # removes, the number adjacent to unseen space is 0, by construction, and the
 # robot's reachable set gains no cell that touches the unknown.
 OBSTACLE_OPEN_PX = 3
-OBSTACLE_STRONG_VOTES = 12
+
+# ... and what "structural evidence" means, for that guard.
+#
+# This was 12, and 12 is the number that has now sealed **two** doorways on
+# 2026-10-04.  The second one is what boss caught by eye: he looked at the
+# reachability figure, asked whether the top-right room's door could really be
+# too narrow, and it is not -- at y = +1.4 the floor evidence runs
+# **continuously for 1.0 m** (x = +4.1..+5.0) and is cut into 4-, 1- and 3-cell
+# pieces by **three isolated cells carrying 13 votes each** (`floor_after` = 1)
+# sitting in the middle of it.  13 is one over the old cap.  Measured contrast on
+# that same run:
+#
+#   the three cells in the doorway    13 votes    (1.2% of 1089 frames)
+#   the wall they punch through      237-597 votes (22-55% of frames)
+#
+# A wall of the map is hit in a fifth to a half of all frames; a speckle that
+# happens to sit in an opening is hit in about one percent.  20 sits in that gap:
+# 1.5x the speckle, 12x below the wall.  It is a number chosen from a measured
+# gap rather than derived, and the gap is quoted here so it can be moved with
+# evidence instead of taste.
+#
+# Swept offline on the v10 dump (both rooms must join the robot's component, and
+# the reachable bounding box must not move):
+#
+#   cap   walkable   robot component   rooms 1 & 2   newly freed  touching unknown
+#    12    185.1        171.5          ok / NO            68             0
+#    14    185.6        185.6          ok / ok            79             0
+#    20    186.2        186.2          ok / ok           124             0
+#    30    187.0        187.0          ok / ok           189             0
+#
+# 14 is the smallest cap that opens both; 20 is taken for margin at the cost of
+# 45 extra released cells on a 1089-frame run.  The bounding box of the robot's
+# reachable set is **unchanged at every value** -- this only merges what is
+# already inside the house.
+#
+# ⚠️ A second guard was tried here and **rejected**: "is the cell part of a wall
+# at all", measured as the number of obstacle cells within 0.5 m (4 and 7 at the
+# doorway, 18-21 at the wall -- a clean gap).  Added as a third mandatory
+# condition it **closed the round-10 doorway again**, because those cells sit
+# against the wall band and their neighbourhood is dense.  Measured, not
+# guessed -- `cap=12 + density<=12` puts the room at (-8.0,-6.4) back to an
+# isolated 13.5 m2.  A guard that undoes an earlier fix is not a guard.
+OBSTACLE_STRONG_VOTES = 20
 
 
 
@@ -523,7 +565,9 @@ class WorldMap:
             #     stayed in).  Requiring every neighbour to be seen costs nothing
             #     where the speckle is -- speckle sits inside known floor by
             #     definition -- and leaves the boundary of the known world intact.
-            #   * it has no strong evidence (see OBSTACLE_STRONG_VOTES)
+            #   * it is not hit often enough to be a wall (see
+            #     `OBSTACLE_STRONG_VOTES`: 13 votes for a doorway speckle against
+            #     237-597 for the wall next to it)
             unknown_next = cv2.dilate((~self.seen).astype(np.uint8),
                                       np.ones((3, 3), np.uint8)) > 0
             removable = (self.obstacle & ~opened & ~unknown_next

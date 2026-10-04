@@ -66,7 +66,7 @@ class FrontierExplorer:
                  target_standoff_m: float = 0.80,
                  stagnate_frames: int = 300, stagnate_eps: float = 0.5,
                  barren_targets: int = 8, barren_blacklist_m: float = 0.60,
-                 robot_radius: float = 0.22, replan_every: int = 12,
+                 robot_radius: float = 0.19, replan_every: int = 12,
                  arc_scale: float = 0.40, arc_max_deg: float = 90.0,
                  arc_probe_deg: float = 40.0,
                  sweep: bool = True, sweep_radius: float = 0.60,
@@ -904,13 +904,41 @@ class FrontierExplorer:
         return None
 
     def _pick_sweep_target(self, wmap, reach, x0, y0):
-        """Nearest sizeable reachable patch of floor the robot has never been near.
+        """A sizeable reachable patch of floor the robot has never been near.
 
-        Nearest first, so the walk grows outward instead of leapfrogging to the
-        far corner.  Each candidate is checked with the *planner* before it is
-        accepted: a patch can sit inside the robot's own connected free space and
-        still need a route this map cannot yet express.  `max_plans_per_pick`
-        caps the search so a pathological map cannot stall the control loop.
+        Scored `patch_size / (1 + distance_from_the_start)`, **not nearest
+        first**.  Nearest-first was the original rule, with the intent written in
+        this docstring -- "so the walk grows outward instead of leapfrogging to
+        the far corner" -- and it produced exactly the failure the frontier
+        picker had already been cured of ("candidates ranked by distance alone
+        gives a limit cycle; rank by cluster size with a distance decay"): with
+        the whole house reachable, the robot nibbled at the small patches around
+        it and never commuted to the big room.
+
+        Measured on the v10 run (boss: the top-left room, which the robot *had*
+        explored in an earlier round, was not entered this time).  At the end of
+        the run six unvisited patches of >= 3 m2 were on offer:
+
+            size    distance from start   nearest-first rank   size/(1+d)
+            6.6 m2      2.2 m                    1                2.05
+            7.2 m2      2.8 m                    2                1.91
+           28.7 m2      5.4 m                    3                4.45   <- the room
+           21.0 m2      5.6 m                    4                3.17
+
+        Nearest-first takes the 6.6 m2 patch; the score takes the 28.7 m2 room,
+        which is the one that was left unexplored.  The distance stays in the
+        score so that a patch four times the size but ten times as far does not
+        win -- the same shape as the frontier score, for the same reason.
+
+        `distance_from_the_start` rather than distance from the robot, and that
+        part is deliberate: it keeps the ranking stable while the robot drives,
+        which is what stops it ping-ponging between two patches that happen to be
+        equidistant from where it is at that moment.
+
+        Each candidate is checked with the *planner* before it is accepted: a
+        patch can sit inside the robot's own connected free space and still need
+        a route this map cannot yet express.  `max_plans_per_pick` caps the
+        search so a pathological map cannot stall the control loop.
         """
         vis = self._visited_mask(wmap)
         fresh = reach & ~vis
@@ -954,10 +982,13 @@ class FrontierExplorer:
             j = int(np.argmax(dep))
             if dep[j] < min_depth:
                 continue                      # too small or already well covered
-            cands.append((float(d_start.min()), float(wx[j]), float(wy[j]),
-                          int(sz[L])))
+            d0 = float(d_start.min())
+            ncell = int(sz[L])
+            cands.append((-ncell / (1.0 + d0), d0,
+                          float(wx[j]), float(wy[j]), ncell))
+        # Biggest-and-nearest first: `-size/(1+d)`, see the docstring.
         cands.sort(key=lambda c: c[0])
-        for _d, tx, ty, ncell in cands[:self.max_plans_per_pick]:
+        for _s, _d, tx, ty, ncell in cands[:self.max_plans_per_pick]:
             path = self.planner.plan(wmap, (x0, y0), (tx, ty))
             if path:
                 self.n_plans += 1

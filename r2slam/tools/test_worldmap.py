@@ -252,6 +252,50 @@ def main():
     check("stats: path_cells counts the cells the robot occupied",
           st["path_cells"] == 1)
 
+    print("\n== 10. a 13-vote speckle in a 1.0 m doorway is opened; the wall is not ==")
+    # Boss looked at a reachability figure and asked whether the top-right room's
+    # door could really be too narrow.  It is not: the floor evidence runs
+    # continuously for 1.0 m and is cut into pieces by three isolated cells with
+    # 13 votes each, against 237-597 for the wall beside them.  See
+    # `worldmap.OBSTACLE_STRONG_VOTES`.
+    w = WorldMap(resolution=0.10, extent=30.0, voxel=0.15)
+    cx, cy = (int(v) for v in w.cell_of(0.0, 0.0))
+    # Point at **cell centres**, computed from the index: a metre-space
+    # `np.arange(-1.0, 1.0, 0.1)` is not the same set of cells (0.6 m lands at
+    # 305.99999), and the holes it leaves in `seen` silently disable the guard
+    # this test is about.
+    def centre(i):
+        return i * w.resolution - w.extent + w.resolution / 2.0
+    idx = list(range(cx - 10, cx + 11))
+    pts = np.array([[centre(i), centre(j), 1.0] for i in idx for j in idx])
+    no = np.zeros(len(pts), bool)
+    for t in range(4):
+        w.add(pts, no, no, no, (5.0, 5.0), float(t))
+    check("the window is 'seen' (the opening guard needs that)",
+          bool(w.seen[cy - 10:cy + 11, cx - 10:cx + 11].all()))
+    # a wall on y=0, and a 13-vote speckle left inside a 1.0 m gap in it
+    wall_cell = (cy, cx - 8)
+    door_cell = (cy, cx)                 # the gap is |x| <= 0.2 m
+    w._obs_votes[cy, cx - 10:cx + 11] = 0
+    w._obs_votes[cy, cx - 10:cx - 1] = 300     # wall, left of the gap
+    w._obs_votes[cy, cx + 2:cx + 11] = 300     # wall, right of the gap
+    w._obs_votes[door_cell] = 13               # the speckle, in the gap
+    # ... and one lone 13-vote cell out in the unknown, to exercise the
+    # neighbour guard: nothing may be opened next to unseen space
+    far_cell = (cy, cx + 60)
+    w._obs_votes[far_cell] = 13
+    # A non-empty scan: `add` returns early on an empty cloud, so the derived
+    # layers would never be recomputed.  The point is inside the seen window and
+    # is not ground and not an obstacle, so it changes nothing else.
+    one = np.array([[centre(cx), centre(cy), 1.0]])
+    w.add(one, np.zeros(1, bool), np.zeros(1, bool), np.zeros(1, bool),
+          (5.0, 5.0), 5.0)
+    check("the wall stays (%d votes there)" % 300, w.obstacle[wall_cell])
+    check("the 13-vote speckle inside the 1.0 m doorway is opened",
+          not w.obstacle[door_cell])
+    check("a 13-vote cell next to unseen space is NOT opened",
+          w.obstacle[far_cell])
+
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
         for f in FAILS:
