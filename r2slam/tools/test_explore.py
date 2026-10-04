@@ -830,6 +830,27 @@ def main():
                             ", ".join("%s/%s" % (a, b) for a, b in too_close[:2])))
     if e18.n_first_pass_stops == 0:
         fails.append("the survey never ran")
+    # ---- and an empty map must not latch the survey off -------------------
+    #
+    # `run_v14.sh sim` reported `first_pass_stops 0, deep_stops 13`: the survey
+    # never ran once.  On frame one almost nothing is mapped, so no patch reaches
+    # `sweep_min_m2`; the first version read `new_c == []` as "nowhere new left"
+    # and latched the survey off for the rest of the run.  Asking the picker for
+    # a target on a map with nothing in it must be *no target*, not *survey
+    # over*.
+    e18b = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    w18b = WorldMap(resolution=0.1, extent=12.0)      # nothing mapped at all
+    r18b, _ = e18b._masks(w18b, (0.0, 0.0))
+    t18b = e18b._pick_sweep_target(w18b, r18b, 0.0, 0.0)
+    print("    empty map -> target %s, still in first pass: %s"
+          % (None if t18b is None else "(%.2f, %.2f)" % t18b[:2],
+             e18b.sweep_first_pass))
+    if t18b is not None:
+        fails.append("case 18 lost its meaning: a target came out of an empty "
+                     "map")
+    if not e18b.sweep_first_pass:
+        fails.append("an empty map latched the survey off -- that is the v14 "
+                     "bug: the survey then never runs at all")
 
     print()
     if fails:

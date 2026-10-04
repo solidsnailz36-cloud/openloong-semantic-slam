@@ -1157,10 +1157,22 @@ class FrontierExplorer:
             if new_c:
                 cands = new_c
                 locked = 0
-            else:
+            elif all_c:
+                # There is work, and none of it is anywhere new: the survey is
+                # done.  Latch it off.
                 self.sweep_first_pass = False
                 cands = (gather([locked], self.sweep_patch_keep_m2)
                          if locked else all_c)
+            else:
+                # No eligible patch *at all* -- which is the normal state on the
+                # first frames of a run, when almost nothing has been mapped.
+                # This must NOT latch the survey off, and the first version did:
+                # `run_v14.sh sim` reported `first_pass_stops 0, deep_stops 13`,
+                # i.e. the survey never ran once, because on frame one the map
+                # had no 3 m2 patch yet, `new_c` was empty, and the latch
+                # concluded "nothing else to see".  Hand back nothing and let the
+                # caller fall through to the frontier.
+                cands = []
         elif locked:
             cands = gather([locked], self.sweep_patch_keep_m2)
         else:
