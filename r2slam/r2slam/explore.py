@@ -485,7 +485,56 @@ class FrontierExplorer:
         linked = reach.copy()
         probe = np.zeros_like(reach)
         if rseed and pseed:
-            other = raw & (lab_raw != rseed) & (lz == pseed)
+            # **Known floor the planner will not enter** -- a room behind a
+            # doorway whose threshold was never resolved.
+            #
+            # This used to read `raw & (lab_raw != rseed) & (lz == pseed)`, and
+            # boss found the hole in it by looking at a picture (2026-10-04:
+            # "there are still two rooms the car has never entered").  A room
+            # whose floor evidence *does* join the robot's own ground, but only
+            # through a one-or-two-cell strip, lives in the **same** ground
+            # component and is **not** in `reach`: `lab_raw != rseed` excluded it
+            # from `other`, while `reach` never contained it either.  It was
+            # therefore neither reachable nor stranded -- invisible to the sweep
+            # (which works inside `reach`), invisible to `_stranded_fresh`
+            # (outside it), and never probed.  Measured on `grids_v9_sim`: the
+            # room at (+5.3, +3.4), 6.8 m2, sits inside the main 212.4 m2 ground
+            # component, and its own walkable component is separated from the
+            # main one by a strip of floor evidence **0.20 m** wide.
+            #
+            # Two conditions, and both are needed:
+            #   * `~reach` alone would include the **erosion shell** -- the two
+            #     cells around every obstacle that the robot radius takes out.
+            #     That shell lines the whole map, and treating it as a doorway
+            #     makes the probe aim 0.4 m away from wherever the robot already
+            #     stands (measured: the largest "patch" came out 42.6 m2 and the
+            #     chosen probe was 0.4 m away).  So a candidate has to be a patch
+            #     **thicker than the safety margin** -- a thing you can stand in,
+            #     not a lining.
+            #   * `lz == pseed` keeps floor on the far side of a wall out: a room
+            #     seen only through a window is a different `~obstacle`
+            #     component, and driving at it is the failure this guard exists
+            #     for.
+            holes = raw & ~reach
+            room = np.zeros_like(holes)
+            if holes.any():
+                k_h = max(3, int(round(2 * self.robot_radius
+                                       / wmap.resolution)) | 1)
+                core = cv2.erode(holes.astype(np.uint8),
+                                 np.ones((k_h, k_h), np.uint8)) > 0
+                if core.any():
+                    # Kept near the *core* rather than by connected-component
+                    # label: `holes` is 8-connected, and the erosion shell is
+                    # joined to every room through the gaps it lines, so a
+                    # label-based filter keeps the whole shell with it --
+                    # measured, it produced a 42.6 m2 "doorway" in the middle of
+                    # the house and a chosen probe 0.4 m from where the robot
+                    # already stood.
+                    room = cv2.dilate(core.astype(np.uint8),
+                                      np.ones((k_h, k_h),
+                                              np.uint8)) > 0
+                    room &= holes
+            other = room & (lz == pseed)
             if other.any():
                 linked = reach | other
                 grown = cv2.dilate(
@@ -765,18 +814,93 @@ class FrontierExplorer:
         probe = self._probe & ~self._visited_mask(wmap)
         if not probe.any():
             return None
-        ys, xs = np.nonzero(probe)
+        # Aim at the cells **nearest to where the robot can already stand**, which
+        # is what the docstring above has always claimed and the code did not do:
+        # it took the `max_plans_per_pick` cells *nearest the robot* instead, and
+        # those are frequently the far side of the patch.  Measured on
+        # `grids_v9_sim`: all six were 0.7 m away at x = +5.85..+6.25, i.e. beyond
+        # the east wall, `plan()` failed on every one, the probe returned None,
+        # and the mechanism had therefore **never fired** -- while 5.2 m2 of
+        # legitimate doorway cells were on offer.
+        #
+        # "Nearest to standing room" is `distanceTransform(~reach)`, small exactly
+        # at the doorway.  A fixed cut-off on it does not work (the beachhead is
+        # 0 cells within 0.3 m, because the free-space erosion shell plus the
+        # speckle line put the first walkable-looking cell 0.4-0.6 m out), so it
+        # is used as a **sort key** instead: closest to standing room first, tie
+        # broken by distance to the robot.
+        dt_reach = cv2.distanceTransform((~self._reach).astype(np.uint8),
+                                        cv2.DIST_L2, 5)
         cell = wmap.resolution ** 2
-        if len(ys) * cell < self.island_min_m2:
+        if int(probe.sum()) * cell < self.island_min_m2:
             return None
+        ys, xs = np.nonzero(probe)
+        # **Aim at the nearest cell the robot can stand in**, not at the patch.
+        #
+        # The patch is by definition outside `reach`, and it is not even close to
+        # it: measured on `grids_v9_sim`, the distance from a doorway cell back to
+        # the nearest reachable cell is 5-20 cells (0.5-2.0 m), because the gap
+        # contains the free-space erosion shell as well as the speckle line that
+        # caused the problem.  `plan()` snaps its goal at most 4 cells, so a goal
+        # inside the patch fails on every candidate -- which is why this probe had
+        # **never once fired** while 5.2 m2 of legitimate doorway cells were on
+        # offer.  The nearest reachable cell is the closest the robot may legally
+        # stand to the doorway, and that is the pose this probe wants.
+        #
+        # No scipy here: the shipped runtime is numpy + cv2 + onnxruntime, so the
+        # lookup is a bounded local window rather than a KD-tree.
+        dt_reach = cv2.distanceTransform((~self._reach).astype(np.uint8),
+                                        cv2.DIST_L2, 5)
+        cell = wmap.resolution ** 2
+        # Per **patch**, not on the union: the union is always big enough, so the
+        # gate never bit and a 0.41 m2 speck 21.3 m away was picked ahead of a
+        # 2.11 m2 room.  A doorway is worth a trip when *the floor behind that
+        # doorway* is worth entering, and patches are ordered by that area --
+        # a room before a pocket.
+        _np_, lp = cv2.connectedComponents(probe.astype(np.uint8), connectivity=8)
+        areas = np.bincount(lp.ravel()) * cell
+        cand_labels = [int(L) for L in range(1, _np_)
+                       if areas[L] >= self.island_min_m2]
+        if not cand_labels:
+            return None
+        cand_labels.sort(key=lambda L: -areas[L])     # biggest room first
+        ys, xs = np.nonzero(probe)
         wx = (xs + 0.5) * wmap.resolution - wmap.extent
         wy = (ys + 0.5) * wmap.resolution - wmap.extent
-        order = np.argsort(np.hypot(wx - x0, wy - y0))
-        for i in order[:self.max_plans_per_pick]:
-            path = self.planner.plan(wmap, (x0, y0), (float(wx[i]), float(wy[i])))
-            if path:
-                self.n_plans += 1
-                return float(wx[i]), float(wy[i]), path, int(len(ys))
+        lab_of = lp[ys, xs]
+        reach = self._reach
+        n = reach.shape[0]
+        tried = 0
+        for L in cand_labels:
+            m = lab_of == L
+            # inside the patch: closest to standing room, then closest to the robot
+            sub = np.nonzero(m)[0]
+            sub = sub[np.lexsort((np.hypot(wx[sub] - x0, wy[sub] - y0),
+                                  dt_reach[ys[sub], xs[sub]]))]
+            for i in sub[:max(1, self.max_plans_per_pick - tried)]:
+                tried += 1
+                py, pxx = int(ys[i]), int(xs[i])
+                r = int(dt_reach[py, pxx]) + 2
+                y0w, y1w = max(py - r, 0), min(py + r + 1, n)
+                x0w, x1w = max(pxx - r, 0), min(pxx + r + 1, n)
+                wy_, wx_ = np.nonzero(reach[y0w:y1w, x0w:x1w])
+                if not len(wy_):
+                    continue
+                wy_ = wy_ + y0w
+                wx_ = wx_ + x0w
+                j = int(np.argmin((wx_ - pxx) ** 2 + (wy_ - py) ** 2))
+                gx = (int(wx_[j]) + 0.5) * wmap.resolution - wmap.extent
+                gy = (int(wy_[j]) + 0.5) * wmap.resolution - wmap.extent
+                path = self.planner.plan(wmap, (x0, y0), (gx, gy))
+                if path:
+                    self.n_plans += 1
+                    # `sw[3]` is reported as `candidates` alongside the other
+                    # target kinds, so it is a cell count -- the size of the
+                    # patch behind this doorway, which is the thing that made it
+                    # worth the trip.
+                    return float(gx), float(gy), path, int((lp == L).sum())
+            if tried >= self.max_plans_per_pick:
+                break
         return None
 
     def _pick_sweep_target(self, wmap, reach, x0, y0):
@@ -1374,11 +1498,34 @@ class FrontierExplorer:
             # unreachable-but-walkable floor outweighs the reachable-and-unvisited
             # floor, the doorways are the bigger win**, whatever the sweep thinks.
             # Both quantities are known and both are reported.
+            # --- an unresolved doorway beats a sweep, and here is why --------
+            #
+            # The two candidate actions are not the same kind of thing:
+            #
+            #  * going to a sweep target adds floor the robot has *already seen*
+            #    to the list of floor it has *driven over* -- coverage;
+            #  * going to a doorway can **change what the map says is reachable**
+            #    -- information.  Every metre behind that doorway is invisible to
+            #    `reach` until something drives up to the threshold and resolves
+            #    it, so the sweep cannot even see that room as work to do.
+            #
+            # The old rule required the unreachable floor to outweigh *all* the
+            # unvisited reachable floor (`stranded > max(island_trigger_m2,
+            # fresh_in)`), and on a 40 m scanner it never can: measured on the v9
+            # run, 15.9 m2 behind two doorways against 92.0 m2 of unvisited open
+            # floor, so the probe fired **0 times in 841 frames** and two rooms
+            # were never entered.  It is also circular -- the sweep's own notion
+            # of "where can I go" is what the doorway is blocking.
+            #
+            # So: probe whenever there is a real patch of floor behind a doorway
+            # and the trip has not already been made.  `_pick_island_probe`
+            # refuses to aim at anywhere already visited, so each doorway costs
+            # one trip, and `island_probe_limit` caps the whole thing in case the
+            # band turns out to be a wall that will never resolve.
             used_probe = False
             if sw is not None:
-                fresh_in = float(self._fresh_area(wmap, reach, x0, y0))
                 stranded = self._stranded_fresh(wmap)
-                if stranded > max(self.island_trigger_m2, fresh_in):
+                if stranded >= self.island_trigger_m2:
                     probe = self._pick_island_probe(wmap, x0, y0)
                     if probe is not None:
                         sw = probe

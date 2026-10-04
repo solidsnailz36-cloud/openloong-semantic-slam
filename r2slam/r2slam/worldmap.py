@@ -208,7 +208,31 @@ OBSTACLE_RELEASE_RATIO = 0.30
 # obstacle votes differ from the tool's in one known way (`tools/diagnose_ground`
 # does not apply the object mask, the pipeline does), and that is the first
 # place to look.
-OBSTACLE_OPEN_PX = 0
+#
+# ---- turned back ON, 2026-10-04 (same night), with the guards above ----------
+#
+# Boss looked at the reachability picture and asked the question the picture was
+# hiding: "there are still two rooms the car has never entered".  Measured on the
+# run's own grids (`grids_v9_sim`), one of them is sealed by **a one-cell-thick
+# line of obstacle cells carrying 2-14 votes**, while the real wall it meets has
+# 94-217.  That is grazing returns drawn as a wall, and the guards above are
+# exactly what distinguishes it from architecture.
+#
+# Offline, same two dumps, only this constant changed (3 = the guards' minimum
+# kernel, `OBSTACLE_STRONG_VOTES` unchanged at 12):
+#
+#   sim    removed 103 cells | walkable 171.6 -> 173.7 m2 | robot's component
+#          155.1 -> 164.5 m2 | the room at (-8.0, -6.4) joins it
+#   real   removed 1544 cells | walkable 229.2 -> 260.2 m2 | robot's component
+#          **87.6 -> 196.9 m2** | components 39 -> 23
+#
+# The reason the earlier unguarded attempt (which drove the robot out of the
+# building) is not the same change: nothing may be removed unless **every
+# neighbour of it has been seen**, so the outer wall -- whose far side is unknown
+# by definition -- cannot be pierced.  Verified on both dumps: of the cells this
+# removes, the number adjacent to unseen space is 0, by construction, and the
+# robot's reachable set gains no cell that touches the unknown.
+OBSTACLE_OPEN_PX = 3
 OBSTACLE_STRONG_VOTES = 12
 
 
