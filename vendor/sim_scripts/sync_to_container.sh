@@ -47,6 +47,7 @@ PKG_PATHS=(
   "tools/package_submission.py"
 )
 ROOT_PATHS=(
+  "vendor/detector/yolo26n.onnx"
   "vendor/detector/yolo11n.onnx"
   "vendor/detector/coco.names"
   "vendor/sim_scripts/sim_truth_model_states.json"

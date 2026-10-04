@@ -516,7 +516,7 @@ if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.path.join(here, "..", "..", "vendor",
-                                                    "detector", "yolo11n.onnx"))
+                                                    "detector", "yolo26n.onnx"))
     ap.add_argument("--names", default=os.path.join(here, "..", "..", "vendor",
                                                     "detector", "coco.names"))
     ap.add_argument("--glob", required=True)

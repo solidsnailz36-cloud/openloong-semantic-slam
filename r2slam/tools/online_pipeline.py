@@ -348,7 +348,23 @@ def main():
     print("odometry    : KISS-ICP  voxel=%.2f range=%.1f-%.1f threads=%d"
           % (rt.voxel_size, rt.min_range, rt.max_range, rt.max_num_threads))
 
-    det_model = _resolve_vendor(a.model, "yolo11n.onnx")
+    # Default detector: **YOLO26n**, not YOLO11n.
+    #
+    # Measured on the simulator capture (1229 frames, ground truth projected in,
+    # `tools/diagnose_fusion.py`): YOLO26n emits 1131 person boxes against
+    # YOLO11n's 1227 and, after the fusion gates, keeps *more* real people
+    # (182 vs 178) with fewer phantoms (111 vs 115) -- for 65.7 ms/frame instead
+    # of 77.4, in a 9.4 MB model instead of 10.7.  It shares YOLO11's raw
+    # `[1,84,8400]` output, so the decoder is unchanged and
+    # `tools/check_onnx_parity.py` reproduces ultralytics to <=1.26 px.
+    #
+    # The one number that does NOT improve is the real fisheye: there it finds
+    # 17% fewer objects overall (757 -> 630 localised), evenly across classes,
+    # and it confirms the *same* people in the same places.  With no ground truth
+    # on that side there is no way to tell "removed false positives" from "lost
+    # real objects", so the switch is a decision the operator makes; this default
+    # records the one that was taken and the number that was known at the time.
+    det_model = _resolve_vendor(a.model, "yolo26n.onnx")
     det_names = _resolve_vendor(a.names, "coco.names")
     names = load_names(det_names) if os.path.exists(det_names) else None
     det = None
