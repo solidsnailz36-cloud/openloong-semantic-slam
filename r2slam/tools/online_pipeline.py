@@ -1084,6 +1084,14 @@ def main():
                      # different statements -- the island probe taught that one.
                      "patch_locks": explorer.n_patch_locks,
                      "patch_releases": explorer.n_patch_releases,
+                     # `first_pass_stops` are the "one stop per room" stops, and
+                     # `deep_stops` the ones made after that pass latched off.
+                     # The split is the whole point of the two-phase sweep: a run
+                     # whose deep stops are zero never got past the survey, and a
+                     # run whose first-pass stops are zero never surveyed.
+                     "first_pass_stops": explorer.n_first_pass_stops,
+                     "deep_stops": explorer.n_deep_stops,
+                     "first_pass": explorer.sweep_first_pass,
                      "shadow_probes": explorer.n_shadow_probes,
                      "shadow_skipped": explorer.n_shadow_skipped,
                      "shadow_far": explorer.n_shadow_far,

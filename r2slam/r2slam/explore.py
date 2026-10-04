@@ -78,6 +78,7 @@ class FrontierExplorer:
                  sweep_stuck_improve_m: float = 0.50,
                  sweep_patch_keep_m2: float = 1.20,
                  sweep_patch_max_targets: int = 4,
+                 sweep_first_pass: bool = True, sweep_stop_spread_m: float = 2.00,
                  shadow: bool = True, shadow_min_m2: float = 1.00,
                  shadow_near_m: float = 2.00,
                  shadow_probe_limit: int = 10,
@@ -186,6 +187,28 @@ class FrontierExplorer:
         # default for a fixed budget.
         self.sweep_patch_max_targets = int(sweep_patch_max_targets)
         self._sweep_patch_stops = 0
+        # --- first pass: every room gets one stop before any gets two -------
+        #
+        # Measured over five simulator runs of five different builds, the
+        # **per-room** coverage of the same three rooms was 0/3/17/78/51,
+        # 0/47/71/0/23 and 79/0/44/0/5 percent.  Every room ranges from never
+        # entered to mostly done, and the spread is wider than any change made
+        # to the policy in that time.  The cause is the global score: a room
+        # that wins wins repeatedly (its remainder is still the biggest patch),
+        # so *which* rooms get visited is decided by chance early on and never
+        # revisited.
+        #
+        # A human does not explore that way.  First walk into every room once,
+        # then go back and do the corners -- so: while there is any eligible
+        # patch whose deepest cell is more than `sweep_stop_spread_m` from every
+        # stop already made, take **that**, and ignore the within-patch
+        # commitment.  The commitment then applies to the second pass, which is
+        # where "finish this room" is the right instruction.
+        self.sweep_first_pass = bool(sweep_first_pass)
+        self.sweep_stop_spread_m = float(sweep_stop_spread_m)
+        self._sweep_stops: List[Tuple[float, float]] = []
+        self.n_first_pass_stops = 0
+        self.n_deep_stops = 0
         self._sweep_patch_mask = None      # the patch currently being finished
         self.n_patch_locks = 0
         self.n_patch_releases = 0
@@ -1120,7 +1143,25 @@ class FrontierExplorer:
             out.sort(key=lambda c: c[0])
             return out
 
-        if locked:
+        if self.sweep_first_pass:
+            # One stop per room first: `_sweep_stops` are the stops the first
+            # pass has already made, and a candidate only counts if it is
+            # somewhere else.  When nothing qualifies the first pass is over --
+            # latched, not recomputed, so the second pass is not competing with
+            # it on every frame.
+            all_c = gather(range(1, n), self.sweep_min_m2)
+            spread = self.sweep_stop_spread_m ** 2
+            new_c = [c for c in all_c
+                     if all((c[2] - bx) ** 2 + (c[3] - by) ** 2 > spread
+                            for bx, by in self._sweep_stops)]
+            if new_c:
+                cands = new_c
+                locked = 0
+            else:
+                self.sweep_first_pass = False
+                cands = (gather([locked], self.sweep_patch_keep_m2)
+                         if locked else all_c)
+        elif locked:
             cands = gather([locked], self.sweep_patch_keep_m2)
         else:
             cands = gather(range(1, n), self.sweep_min_m2)
@@ -1132,9 +1173,20 @@ class FrontierExplorer:
             self._sweep_patch_mask = None
             cands = gather(range(1, n), self.sweep_min_m2)
             picked = self._plan_first(wmap, cands, x0, y0)
+        if picked is None and self.sweep_first_pass and self._sweep_stops:
+            # Every "somewhere else" candidate was unroutable.  Take the best of
+            # the rest rather than reporting "nothing to sweep" -- the spread
+            # rule is a preference about *order*, not a reason to stop working.
+            picked = self._plan_first(wmap, gather(range(1, n), self.sweep_min_m2),
+                                      x0, y0)
         if picked is None:
             return None
         tx, ty, path, ncell, L = picked
+        if self.sweep_first_pass:
+            self._sweep_stops.append((float(tx), float(ty)))
+            self.n_first_pass_stops += 1
+        else:
+            self.n_deep_stops += 1
         if not locked:
             self.n_patch_locks += 1
             self._sweep_patch_stops = 1

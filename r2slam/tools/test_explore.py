@@ -732,11 +732,17 @@ def main():
     # re-ran a *global* score and the next patch won.  Splitting the unvisited
     # floor in two and checking that the second choice stays in the first patch
     # is the smallest map on which that is visible.
+    #
+    # `sweep_first_pass=False` on purpose: the "one stop per room" survey runs
+    # *before* this commitment and would correctly send the second stop
+    # elsewhere, so the case has to switch the survey off to be about the lock.
+    # Case 18 is the survey.
     print("17) one unvisited patch is finished before the next is opened")
     w17 = world(observed_to=6.0)
     for x in np.arange(-1.9, 5.6, 0.2):          # drive straight down the middle
         w17.traj.append((float(x), 0.0))
-    e17 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e17 = FrontierExplorer(sweep=True, sweep_first_pass=False,
+                           stagnate_frames=10 ** 9)
     e17._start_xy = (0.0, 0.0)
     r17, _e17 = e17._masks(w17, (5.5, 0.0))
     t1 = e17._pick_sweep_target(w17, r17, 5.5, 0.0)
@@ -784,13 +790,54 @@ def main():
                     fails.append("after the patch was covered the target is "
                                  "still inside it")
 
+    # --- 18. survey first: one stop per patch before any second stop -------
+    #
+    # Five simulator runs of five different builds gave per-room coverage of
+    # 0/3/17/78/51, 0/47/71/0/23 and 79/0/44/0/5 percent for the same three
+    # rooms -- every room from never entered to mostly done, with a spread wider
+    # than anything the policy changed in between.  A global score lets a room
+    # that wins keep winning; the survey is the fix, and the assertion is simply
+    # that no two of the first stops are near each other.
+    print("18) the first pass puts one stop in every patch before a second one")
+    w18 = world(observed_to=6.0)
+    for x in np.arange(-1.9, 5.6, 0.2):
+        w18.traj.append((float(x), 0.0))
+    e18 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e18._start_xy = (0.0, 0.0)
+    r18, _e18 = e18._masks(w18, (5.5, 0.0))
+    stops = []
+    for _ in range(4):
+        t = e18._pick_sweep_target(w18, r18, 5.5, 0.0)
+        if t is None:
+            break
+        stops.append((t[0], t[1]))
+        for _ in range(8):                       # ... and stand on it
+            w18.traj.append((t[0], t[1]))
+    print("    stop positions: %s"
+          % ", ".join("(%.2f, %.2f)" % s for s in stops))
+    print("    first pass stops %d, deep stops %d, still in first pass: %s"
+          % (e18.n_first_pass_stops, e18.n_deep_stops, e18.sweep_first_pass))
+    if len(stops) < 2:
+        fails.append("case 18 lost its meaning: fewer than two stops")
+    else:
+        too_close = [(a, b) for i, a in enumerate(stops) for b in stops[i + 1:]
+                     if float(np.hypot(a[0] - b[0], a[1] - b[1]))
+                     <= e18.sweep_stop_spread_m]
+        if too_close:
+            fails.append("two survey stops are within %.2f m of each other (%s) "
+                         "-- that is the concentration the survey exists to stop"
+                         % (e18.sweep_stop_spread_m,
+                            ", ".join("%s/%s" % (a, b) for a, b in too_close[:2])))
+    if e18.n_first_pass_stops == 0:
+        fails.append("the survey never ran")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (17 checks)")
+    print("verdict: PASS (18 checks)")
     return 0
 
 
