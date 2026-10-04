@@ -421,6 +421,41 @@ PERSON = COCO_TO_LABEL[0]
 # "no absolute window is defensible here".
 LABEL_BOX_HEIGHT: Dict[int, Tuple[float, float]] = {PERSON: (0.0, 2.40)}
 
+# ... and the half of the same idea that has to be **necessary**.
+#
+# `LABEL_BOX_HEIGHT` above is one of two *sufficient* tests in `fusion.object_3d`
+# (`pass_width or pass_box`), and on the render the sufficiency turned out to
+# mean it never bit: `pass_width` is true for essentially every box a person
+# detector draws, real or phantom, so the box window was bypassed.  Measured on
+# the 1229-frame simulator capture with the ground truth projected in
+# (`tools/diagnose_fusion.py --dump`), person boxes that the fusion accepted:
+#
+#     on a real person        192
+#     on nothing (wall)       241        -> precision 44%
+#
+# and *nothing* available at the box level separated them -- not the detector's
+# own confidence (precision stays 44-46% sweeping min_conf 0.35 -> 0.75), not the
+# LiDAR cross-section (`sel_width_lat` p50: real 0.29 m, phantom 0.18 m, i.e. the
+# phantoms are the *narrower* ones), not the point count.
+#
+# What does separate is what the box and the range together claim the object's
+# height is.  A wall patch under a full-height box claims to be a short thing:
+#
+#     box_height_m    real  p10 1.74  p50 2.37  p90 2.97
+#                     phantom p10 0.87  p50 2.79  p90 6.08
+#
+# A person is at least 1.4 m tall and at most 3.5 m, so this is not a tuned
+# separation but a physical statement -- which is also why it should transfer
+# between runs, unlike `LABEL_MIN_OBSERVATIONS` (q.v.).  Cost, measured:
+#
+#     simulator: keeps 178/192 of the person boxes (93%), precision 44% -> 61%
+#     real rig : keeps 341/342 (99.7%); its own box_height_m is p1 1.55,
+#                p50 1.72, p90 2.04, max 2.19 -- the window is not binding there
+#
+# So unlike `LABEL_BOX_HEIGHT` it is AND-ed in, and a class absent from this
+# table gets no opinion (as everywhere else).
+LABEL_BOX_HEIGHT_MUST: Dict[int, Tuple[float, float]] = {PERSON: (1.40, 3.50)}
+
 # Object labels in a fixed order, for stable reporting
 OBJECT_LABELS: List[int] = sorted(COCO_TO_LABEL.values())
 

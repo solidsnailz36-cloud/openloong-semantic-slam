@@ -346,6 +346,15 @@ def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
     max_width = L.LABEL_MAX_WIDTH.get(int(label))
     min_px = L.LABEL_BOX_MIN_PX.get(int(label))
     lo_bh, hi_bh = L.LABEL_BOX_HEIGHT.get(int(label), (0.0, float("inf")))
+    # A class can also carry a **necessary** window.  `pass_width`/`pass_box`
+    # above are alternatives (either may testify); this one is a veto -- the box
+    # and the range together claim a height a member of this class cannot have.
+    # It exists because on the render `pass_width` was true for every box, so the
+    # sufficient test never bit and wall patches sailed through.  See
+    # `labels.LABEL_BOX_HEIGHT_MUST` for the measurement (precision 44% -> 61% on
+    # the simulator for 7% of the real boxes, 99.7% kept on the real rig).
+    must_lo, must_hi = L.LABEL_BOX_HEIGHT_MUST.get(int(label),
+                                                  (0.0, float("inf")))
     if trace is not None:
         trace["max_width"] = (float(max_width) if max_width is not None
                               else float("nan"))
@@ -356,16 +365,25 @@ def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
     pass_width = max_width is not None and width_lat <= max_width
     resolvable = min_px is not None and box_h >= min_px
     pass_box = resolvable and (lo_bh <= box_height_m <= hi_bh)
+    must = (not np.isfinite(box_height_m)
+            or (must_lo <= box_height_m <= must_hi))
     # No test at all means no opinion: a class that appears in neither table is
     # accepted, which is what the tables being per-class is for.
     if (max_width is not None or min_px is not None
-            or (lo_bh, hi_bh) != (0.0, float("inf"))):
-        if not (pass_width or pass_box):
+            or (lo_bh, hi_bh) != (0.0, float("inf"))
+            or (must_lo, must_hi) != (0.0, float("inf"))):
+        if not must or not (pass_width or pass_box):
             if stats is not None:
-                key = ("reject_wide" if not resolvable else "reject_box_height")
+                if not must:
+                    key = "reject_box_height_must"
+                else:
+                    key = ("reject_wide" if not resolvable
+                           else "reject_box_height")
                 stats[key] = stats.get(key, 0) + 1
             if trace is not None:
-                trace["reason"] = "wide" if not resolvable else "box_height"
+                trace["reason"] = ("box_height_must" if not must
+                                   else ("wide" if not resolvable
+                                         else "box_height"))
             return None
     if trace is not None:
         trace["reason"] = "ok"

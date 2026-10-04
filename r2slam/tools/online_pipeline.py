@@ -60,6 +60,8 @@ from r2slam.traversable import (fit_ground, ground_tolerance,        # noqa: E40
                                 GROUND_TOL_BASE, GROUND_TOL_SLOPE)
 from r2slam import sysinfo                                           # noqa: E402
 from r2slam.worldmap import WorldMap                                 # noqa: E402
+from r2slam.worldmap import (OBSTACLE_MIN_VOTES,                     # noqa: E402
+                             OBSTACLE_OPEN_PX)
 from r2slam import tf_out                                            # noqa: E402
 
 # The traversability rule itself now lives in `r2slam/traversable.py`, next to
@@ -182,17 +184,35 @@ def dump_grids(dest, wmap, cfg):
     (resolution, extent, the trajectory, the final pose) are what make the dump
     self-describing -- a visitor who did not write this code should be able to
     load it and compute anything without asking.
+
+    The three "why" arrays are written on purpose.  `ground` is derived as
+    `ground_ever & ~obstacle`, so dumping only the derived pair makes the
+    obstacle layer **un-examinable after the fact**: you cannot ask "what would
+    the map look like with a different obstacle rule" because the evidence that
+    produced it (`_obs_votes`) and the floor evidence independent of it
+    (`ground_ever`) are both gone.  That is exactly what happened on 2026-10-04,
+    when the only way to test an obstacle-layer cleanup was a fixed-trajectory
+    replay -- which cannot answer the question, because the layer feeds the
+    planner and therefore the trajectory.  With these three arrays the delivered
+    run is its own instrument.
     """
     os.makedirs(dest, exist_ok=True)
     np.save(os.path.join(dest, "ground.npy"), wmap.ground)
     np.save(os.path.join(dest, "obstacle.npy"), wmap.obstacle)
     np.save(os.path.join(dest, "seen.npy"), wmap.seen)
+    np.save(os.path.join(dest, "ground_ever.npy"), wmap.ground_ever)
+    np.save(os.path.join(dest, "obstacle_votes.npy"), wmap._obs_votes)
+    np.save(os.path.join(dest, "obstacle_now.npy"), wmap.obstacle_now)
     np.save(os.path.join(dest, "traj.npy"),
             np.asarray(wmap.traj, dtype=np.float64).reshape(-1, 2))
     meta = {"resolution": wmap.resolution, "extent": wmap.extent, "n": wmap.n,
             "source": cfg.name,
             "pose_xy": (list(wmap.traj[-1]) if wmap.traj else None),
-            "truth_yaw_from_cmd": not cfg.lidar.rotates_with_base}
+            "truth_yaw_from_cmd": not cfg.lidar.rotates_with_base,
+            "obstacle_min_votes": int(OBSTACLE_MIN_VOTES),
+            "obstacle_open_px": int(OBSTACLE_OPEN_PX),
+            "arrays": ["ground", "obstacle", "seen", "ground_ever",
+                       "obstacle_votes", "obstacle_now", "traj"]}
     with open(os.path.join(dest, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
     return meta

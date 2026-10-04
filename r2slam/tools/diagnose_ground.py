@@ -20,8 +20,13 @@ counter per cause, so the answer is a number rather than an opinion:
 It also measures fragmentation directly: how many connected pieces the green is
 in, and how many of the grey cells are one-cell pinholes surrounded by green.
 
-  python3 tools/diagnose_ground.py --npz out/real_cap --out out/ab_perception/ground_real
+  python3 tools/diagnose_ground.py --npz out/real_cap --poses out/online_real/frames.csv \
+      --config config/real_r2.yaml --extent 60 --out out/ab_perception/ground_real
   python3 tools/diagnose_ground.py --grids out/ab_perception/grids_final
+
+⚠️ Always pass `--config` for a real (rolling-shutter) capture: the .npz holds the
+RAW cloud and the pipeline deskews it, so without the config the replay is
+measuring a different point set than the run did.
 """
 from __future__ import annotations
 
@@ -37,6 +42,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from r2slam.deskew import Deskewer                               # noqa: E402
 from r2slam.traversable import fit_ground                        # noqa: E402
 from r2slam.worldmap import WorldMap                             # noqa: E402
 
@@ -56,7 +62,23 @@ CAUSE_NAMES = ["obstacle", "deadband", "high", "object_only", "never_ground"]
 
 
 def analyse_grids(ground, obstacle, seen):
-    """Fragmentation of the green, and the pinholes inside it."""
+    """Fragmentation of the green, and the grey that sits *inside* it.
+
+    Two different counts for the same complaint, and why the second is the one
+    to quote:
+
+    `pinhole_cells` (grey cell with >= 6 green of 8 neighbours) is a per-cell
+    test, so it is only as stable as the boundary it sits on.  Measured on the
+    *same* real capture: the delivered map gives 1388, a replay of it 332, and
+    the green differs by 10% between the two -- a second-derivative count that
+    swings 4x on a 10% change is not an instrument, it is a coin flip.
+
+    `pockets` is the topological version: the connected components of grey that
+    are fully enclosed by green (no cell of the component, nor any of its
+    neighbours, is unknown).  A hole in the floor either exists or it does not,
+    so this survives the boundary wobble, and it is also the thing a viewer
+    actually sees -- a grey spot *in* the green rather than at its edge.
+    """
     green = ground & ~obstacle
     n, lab = cv2.connectedComponents(green.astype(np.uint8), connectivity=8)
     sizes = np.bincount(lab.ravel())[1:]
@@ -65,6 +87,25 @@ def analyse_grids(ground, obstacle, seen):
     ker = np.ones((3, 3), np.uint8)
     nb = cv2.filter2D(green.astype(np.uint8), -1, ker, borderType=cv2.BORDER_CONSTANT)
     pinhole = seen & ~green & (nb >= 6)
+
+    grey = seen & ~green
+    unknown = ~seen
+    unknown_next = cv2.dilate(unknown.astype(np.uint8),
+                              np.ones((3, 3), np.uint8)) > 0
+    ng, glab = cv2.connectedComponents(grey.astype(np.uint8), connectivity=4)
+    npocket = ncell = 0
+    biggest = 0
+    if ng > 1:
+        idx = np.arange(1, ng)
+        touches = np.bincount(glab.ravel(),
+                              weights=unknown_next.ravel().astype(np.float64),
+                              minlength=ng)
+        enclosed = idx[touches[idx] == 0]
+        if len(enclosed):
+            areas = np.bincount(glab.ravel(), minlength=ng)
+            npocket = int(len(enclosed))
+            ncell = int(areas[enclosed].sum())
+            biggest = int(areas[enclosed].max())
     return {
         "green_cells": int(green.sum()),
         "green_pieces": int(len(sizes)),
@@ -75,11 +116,15 @@ def analyse_grids(ground, obstacle, seen):
         "green_frac_in_big": float(
             sizes[sizes >= 100].sum() / max(sizes.sum(), 1)),
         "pinhole_cells": int(pinhole.sum()),
+        "pockets": npocket,
+        "pocket_cells": ncell,
+        "pocket_max": biggest,
     }
 
 
 def replay(npz_dir, out_dir, poses_csv=None, resolution=0.10, extent=30.0,
-           obstacle_min_votes=2, informative_seen=True):
+           obstacle_min_votes=2, informative_seen=True, deskew_enabled=False,
+           deskew_sign=1.0, deskew_period=None):
     files = sorted(glob.glob(os.path.join(npz_dir, "*.npz")))
     if not files:
         raise SystemExit("no .npz in %s" % npz_dir)
@@ -113,10 +158,27 @@ def replay(npz_dir, out_dir, poses_csv=None, resolution=0.10, extent=30.0,
     ob_rng_sum = np.zeros((n, n), np.float64)
     traj = []
 
+    # The pipeline deskews every frame before it does anything else, and the
+    # capture stores the **raw** cloud (`online_pipeline.dump_frame` saves
+    # `fr.cloud`, the pre-deskew array).  A replay that skips the deskew is
+    # therefore mapping a different point set than the run did -- and on the
+    # real capture, which sweeps 0.094 s while the robot drives, that is not a
+    # rounding error: green moved 382.2 -> 429.6 m2 and the in-floor speckle
+    # 1388 -> 300, so the instrument disagreed with the run by 4x.  Reproduce
+    # the pipeline's order exactly: apply with the poses of the *previous*
+    # frames, then fold this frame's pose in (`Deskewer.update_pose`).
+    deskewer = (Deskewer(enabled=True, sign=deskew_sign, period=deskew_period)
+                if deskew_enabled else None)
+    if deskew_enabled:
+        print("  deskew: ON (sign %+g, period guard %s)"
+              % (deskew_sign,
+                 ("%.3f s" % deskew_period) if deskew_period else "off"),
+              flush=True)
+
     for i, p in enumerate(files):
         z = np.load(p, allow_pickle=True)
-        cloud = np.asarray(z["cloud"], dtype=np.float64)
-        if len(cloud) < 50:
+        raw = np.asarray(z["cloud"], dtype=np.float64)
+        if len(raw) < 50:
             continue
         if rows:
             yaw = (float(z["control_yaw"]) if "control_yaw" in z.files
@@ -125,6 +187,16 @@ def replay(npz_dir, out_dir, poses_csv=None, resolution=0.10, extent=30.0,
         else:
             yaw, px, py = 0.0, 0.0, 0.0
         traj.append((px, py))
+        if deskewer is not None and "t_offset" in z.files:
+            cloud = deskewer.apply(raw.astype(np.float32),
+                                   z["t_offset"]).astype(np.float64)
+            c0, s0 = np.cos(yaw), np.sin(yaw)
+            T = np.eye(4)
+            T[:3, :3] = ((c0, -s0, 0.0), (s0, c0, 0.0), (0.0, 0.0, 1.0))
+            T[0, 3], T[1, 3] = px, py
+            deskewer.update_pose(T, float(z["stamp"]))
+        else:
+            cloud = raw
         c, s = np.cos(yaw), np.sin(yaw)
         world = np.column_stack([c * cloud[:, 0] - s * cloud[:, 1] + px,
                                  s * cloud[:, 0] + c * cloud[:, 1] + py,
@@ -303,6 +375,10 @@ def main():
                     help="old behaviour: any return marks a cell as seen")
     ap.add_argument("--extent", type=float, default=30.0,
                     help="must match the run's map_extent (60 for the real rig)")
+    ap.add_argument("--config", metavar="YAML",
+                    help="source config; supplies the deskew settings.  Without "
+                         "it a rolling-shutter capture is replayed WITHOUT "
+                         "deskew and the numbers will not match the run.")
     a = ap.parse_args()
     if a.grids:
         res = analyse_grids(*_grid_arrays(a.grids))
@@ -312,10 +388,18 @@ def main():
         return 0
     if not a.npz:
         raise SystemExit("need --npz or --grids")
+    desk = {}
+    if a.config:
+        from r2slam import load_config
+        cfg = load_config(a.config)
+        desk = dict(deskew_enabled=bool(cfg.lidar.deskew),
+                    deskew_sign=float(cfg.lidar.deskew_sign),
+                    deskew_period=(1.0 / cfg.lidar.nominal_hz
+                                   if cfg.lidar.nominal_hz else None))
     replay(a.npz, a.out, poses_csv=a.poses,
            resolution=a.resolution, extent=a.extent,
            obstacle_min_votes=a.obstacle_min_votes,
-           informative_seen=not a.no_informative_seen)
+           informative_seen=not a.no_informative_seen, **desk)
     return 0
 
 
