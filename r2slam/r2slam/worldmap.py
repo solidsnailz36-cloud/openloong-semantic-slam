@@ -91,6 +91,35 @@ OBJ_MIN_VOTES = 2
 # are separate.
 OBSTACLE_MIN_VOTES = 2
 
+# ... and how long an obstacle survives after the floor is visible again.
+#
+# `_obs_votes` only ever grows, so "two frames saw something here" used to mean
+# "blocked forever".  That is right for a wall and wrong for anything that
+# MOVES: a person walking down a corridor puts returns in the 0.35-2.0 m band in
+# every cell they cross, and the map then keeps a grey trail along the whole
+# route for the rest of the run -- even though the floor is plainly visible
+# there afterwards.  The object mask does not save those cells: it only covers
+# the frames in which the object was actually detected *and* fused, which is a
+# minority (measured on the simulator: 1227 person boxes, 214 of them on a real
+# person; on the real capture 32 of ~700 accepted boxes were phantoms).
+#
+# The rule is "the most recent thing we learned about this cell is the floor":
+# a cell is blocked only if no more than `OBSTACLE_RELEASE_FRAMES - 1` frames
+# have shown floor in it since the last obstacle evidence.  Ordering inside a
+# frame matters and is handled in `add`: floor counts first, then obstacle
+# evidence resets the counter, so a frame that shows both (a person standing on
+# floor) counts as obstacle.
+#
+# A cell that never gets floor returns -- a wall, a chair body, a door jamb --
+# stays blocked forever, because its counter never leaves zero.  And strong
+# evidence (a structure seen in many frames) is exempt from release entirely:
+# see OBSTACLE_STRONG_VOTES.
+#
+# Safety: this only relaxes the *map*.  The robot's own "is the way ahead clear"
+# test reads `blocked()`, which ORs in `obstacle_now` -- this frame's raw
+# returns -- so a wall the robot is looking at right now is still a wall.
+OBSTACLE_RELEASE_FRAMES = 2
+
 # ... and how the layer is cleaned once the votes are in.
 #
 # Measured on the real corridor replay (1427 frames, `tools/diagnose_ground.py`):
@@ -192,6 +221,13 @@ class WorldMap:
     # knows" and "what I can see right now" are different questions and merging
     # them is how a single stray return becomes a permanent wall.
     obstacle_now: np.ndarray = field(init=False)
+    # Frames that have shown *floor* in this cell since the last frame that
+    # showed an obstacle in it.  This is the counter the release rule reads (see
+    # `OBSTACLE_RELEASE_FRAMES`): a walking person's cell climbs it as soon as
+    # they move off, a wall's stays at zero.  Kept as its own array rather than
+    # a timestamp so it can be dumped and replayed -- the artifact has to carry
+    # the evidence behind every derived quantity.
+    _ground_after: np.ndarray = field(init=False)
 
     # 3D points, voxelised, with a label each
     _pts: List[np.ndarray] = field(default_factory=list, init=False)
@@ -234,6 +270,7 @@ class WorldMap:
         self._obs_votes = np.zeros((n, n), np.int32)
         self.ground_ever = np.zeros((n, n), bool)
         self.obstacle_now = np.zeros((n, n), bool)
+        self._ground_after = np.zeros((n, n), np.int32)
 
     # ------------------------------------------------------------------ cells
     def cell_of(self, x, y):
@@ -349,15 +386,32 @@ class WorldMap:
                 self.seen[cyo[sm], cxo[sm]] = True
             self.ground_ever[cyo, cxo] |= g[ok]
             self.obstacle_now[cyo, cxo] |= o[ok]
+            # One count per cell per frame for the release counter too.  Order
+            # matters: floor first, then obstacle resets it, so a frame that
+            # shows both in the same cell (a person standing *on* the floor)
+            # counts as obstacle and does not creep towards release.
+            if g[ok].any():
+                kg = cyo[g[ok]].astype(np.int64) * self.n + cxo[g[ok]]
+                for u in np.unique(kg):
+                    self._ground_after[int(u) // self.n, int(u) % self.n] += 1
             if o[ok].any():
                 # one vote per cell per frame: a single scan puts many returns in
                 # one 0.1 m cell and they are one observation, not many
                 key = cyo[o[ok]].astype(np.int64) * self.n + cxo[o[ok]]
                 for u in np.unique(key):
                     self._obs_votes[int(u) // self.n, int(u) % self.n] += 1
+                    self._ground_after[int(u) // self.n, int(u) % self.n] = 0
         # `votes` is monotone, so promoting it to the map layer every frame
         # converges to the same place as deciding it once at the end.
         np.greater_equal(self._obs_votes, OBSTACLE_MIN_VOTES, out=self.obstacle)
+        # Release the transient ones: the newest evidence is floor, and enough of
+        # it, and the cell does not carry structural evidence.  Recomputed fresh
+        # every frame, so a cell whose obstacle returns come back (the person
+        # turns around) re-blocks on the same frame.
+        if OBSTACLE_RELEASE_FRAMES > 0:
+            released = ((self._ground_after >= OBSTACLE_RELEASE_FRAMES)
+                        & (self._obs_votes < OBSTACLE_STRONG_VOTES))
+            np.logical_and(self.obstacle, ~released, out=self.obstacle)
         if OBSTACLE_OPEN_PX > 0:
             opened = cv2.morphologyEx(
                 self.obstacle.astype(np.uint8), cv2.MORPH_OPEN,
@@ -538,6 +592,14 @@ class WorldMap:
             "seen_cells": obs,
             "traversable_cells": trav,
             "obstacle_cells": int(self.obstacle.sum()),
+            # Cells the release rule took out of the obstacle layer this frame:
+            # obstacle evidence existed, the floor has since been visible, and
+            # there is no structural evidence.  On the real capture this is the
+            # walking-people trail.
+            "obstacle_released_cells": int(
+                ((self._obs_votes >= OBSTACLE_MIN_VOTES)
+                 & (self._ground_after >= OBSTACLE_RELEASE_FRAMES)
+                 & (self._obs_votes < OBSTACLE_STRONG_VOTES)).sum()),
             "traversable_of_seen_pct": round(100.0 * trav / max(obs, 1), 2),
             "traversable_area_m2": round(trav * self.resolution ** 2, 1),
             # The raw appended count until `finalize()` has run, then the real

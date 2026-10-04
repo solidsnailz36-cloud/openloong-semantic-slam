@@ -68,6 +68,14 @@ def main():
     ap.add_argument("--dump", help="write every box's raw trace to this csv, so "
                                    "gate combinations can be swept offline "
                                    "without replaying the detector")
+    ap.add_argument("--pad", type=float, default=2.0,
+                    help="pixels to shrink the box by on every side before "
+                         "collecting points (negative-ish margin, see "
+                         "`fusion.points_in_box`).  This is exactly the "
+                         "'only look near the centre of the box' idea: the "
+                         "shrink is symmetric about the box centre, so a larger "
+                         "pad keeps only the central part.  Default 2.0 is what "
+                         "the pipeline ships; sweep it to measure the trade.")
     a = ap.parse_args()
 
     cfg = load_config(a.config)
@@ -125,7 +133,7 @@ def main():
             x1, y1, x2, y2, sc, lb = b[0], b[1], b[2], b[3], b[4], int(b[5])
             tr = {}
             res = object_3d(cloud, cfg, b[:4], sc, label=lb, yaw=yaw_proj,
-                            plane=plane, trace=tr)
+                            plane=plane, trace=tr, pad=a.pad)
             key = tr.get("reason", "ok")
             if res is None:
                 key = "reject_" + key

@@ -153,6 +153,35 @@ def main():
     check("an unconfirmed sighting is NOT a map instance",
           w.inst_still == [] and w.inst_moving == [])
 
+    print("\n== 7. a walking object's trail is released; a wall's is not ==")
+    # The obstacle layer used to be monotone: two frames of obstacle evidence
+    # condemned a cell forever.  That is right for a wall and wrong for anything
+    # that moves -- a person crossing a corridor left a permanent grey trail
+    # across the walkable floor.  See `worldmap.OBSTACLE_RELEASE_FRAMES`.
+    w = WorldMap(resolution=0.10, extent=30.0, voxel=0.15)
+    hi = np.array([[1.0, 1.0, 1.0]])      # 1 m up: inside the obstacle band
+    lo = np.array([[1.0, 1.0, 0.0]])      # the same cell, on the floor
+    wall = np.array([[5.0, 5.0, 1.0]])
+    no, yes = np.zeros(1, bool), np.ones(1, bool)
+    walk_cell = tuple(int(v) for v in w.cell_of(1.0, 1.0))
+    wall_cell = tuple(int(v) for v in w.cell_of(5.0, 5.0))
+    for t in (0.0, 1.0):                  # two frames -> past OBSTACLE_MIN_VOTES
+        w.add(hi, no, yes, no, (0.0, 0.0), t)
+        w.add(wall, no, yes, no, (0.0, 0.0), t)
+    check("a cell seen as an obstacle twice is blocked",
+          w.obstacle[walk_cell] and w.obstacle[wall_cell])
+    for t in (2.0, 3.0):                  # the object moves off, floor shows
+        w.add(lo, yes, no, no, (0.0, 0.0), t)
+    check("the trail is released once the floor is visible again",
+          not w.obstacle[walk_cell])
+    check("... and the released cell goes back to drivable",
+          w.ground[walk_cell] and not w.ground[wall_cell])
+    check("a wall the laser keeps hitting stays blocked",
+          w.obstacle[wall_cell])
+    for t in (4.0, 5.0):                  # the object comes back
+        w.add(hi, no, yes, no, (0.0, 0.0), t)
+    check("the object returning re-blocks the cell", w.obstacle[walk_cell])
+
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
         for f in FAILS:
