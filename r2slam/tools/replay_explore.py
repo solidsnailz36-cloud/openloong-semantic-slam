@@ -508,7 +508,17 @@ def main():
                                                            "n_local_fallthrough", 0),
                                        lambda_=getattr(exr, "cand_local_lambda", 0.0),
                                        radius_m=getattr(exr,
-                                                        "cand_local_radius_m", 0.0)),
+                                                        "cand_local_radius_m", 0.0),
+                                       # Which spatial definition this arm ran
+                                       # under.  Section 24's lesson was that a
+                                       # swap can look right in direction and be
+                                       # wrong in distance, so the record has to
+                                       # say what "local" meant for the arm.
+                                       dist_mode=getattr(exr,
+                                                         "cand_local_dist_mode", "patch"),
+                                       scope_m=getattr(exr, "cand_local_scope_m", 0.0),
+                                       scope_blocked=getattr(exr,
+                                                             "n_local_scope_blocked", 0)),
                                    pick_sizes=getattr(exr, "pick_sizes", [])),
                               fh, ensure_ascii=False, indent=1)
                 print("  stats        : %s" % p)

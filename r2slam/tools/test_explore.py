@@ -1590,13 +1590,107 @@ def main():
           "u_spread_med %s, u_flat_frac %s"
           % (st27c.get("u_spread_med"), st27c.get("u_flat_frac")))
 
+    print("28) the spatial scope: the term may not choose between places that "
+          "are not neighbours")
+    # Boss, 2026-10-05 (docs section 24): the lambda = 1 live A/B was worse, and
+    # the reason was spatial -- 8 of its 10 swaps moved the goal more than 3 m,
+    # two moved it 18.12 m and 13.82 m, to buy +0.40 and +1.14 m2.  `base` and the
+    # `1/(1+d0)` denominator are both patch-level, so travel cost was invisible to
+    # the term inside a patch, and a patch here spans rooms.  Two knobs came out
+    # of that, and this case holds both of them plus the instrument that has to
+    # catch the failure if it ever comes back.
+    w28 = two_rooms()
+
+    def pick28(**kw):
+        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                             sweep_cands_per_patch=4, **kw)
+        r, _x = e._masks(w28, (0.0, 0.0))
+        p = e._pick_sweep_target(w28, r, 0.0, 0.0)
+        return e, (None if p is None else (round(p[0], 2), round(p[1], 2)))
+
+    _e0, p28_off = pick28(cand_local_lambda=0.0)
+    e28, p28_plain = pick28(cand_local_lambda=2.0)
+    e28s, p28_scoped = pick28(cand_local_lambda=2.0, cand_local_scope_m=0.5)
+    e28w, p28_wide = pick28(cand_local_lambda=2.0, cand_local_scope_m=2.0)
+    print("    lambda=0            -> %s" % (p28_off,))
+    print("    lambda=2, scope off -> %s   swap distance %.2f m (standing pick u=%.2f)"
+          % (p28_plain, e28.pick_stats().get("sw_dist_max", 0.0),
+             _e0.last_local_u_pick))
+    print("    lambda=2, scope 0.5 -> %s   swaps %s, scope-blocked %s"
+          % (p28_scoped, e28s.pick_stats().get("sw_n"),
+             e28s.pick_stats().get("scope_blocked")))
+    print("    lambda=2, scope 2.0 -> %s   swaps %s, max swap %.2f m"
+          % (p28_wide, e28w.pick_stats().get("sw_n"),
+             e28w.pick_stats().get("sw_dist_max", 0.0)))
+    if p28_plain is None or p28_plain == p28_off:
+        fails.append("case 28 lost its meaning: the local term did not move the "
+                     "pick at all on the two-room fixture (%s)" % (p28_off,))
+    else:
+        d_move = float(np.hypot(p28_plain[0] - p28_off[0],
+                                p28_plain[1] - p28_off[1]))
+        if d_move <= 0.5:
+            fails.append("the fixture only moves the pick %.2f m -- the scope "
+                         "test would be about noise" % d_move)
+        # (a) the gate must be able to forbid it: the standing pick must survive
+        if p28_scoped != p28_off:
+            fails.append("with a 0.5 m scope the term still moved the pick from "
+                         "%s to %s, and every candidate is 1.0 m from every other "
+                         "-- the scope is not being applied"
+                         % (p28_off, p28_scoped))
+        st28s = e28s.pick_stats()
+        if not st28s.get("scope_blocked"):
+            fails.append("the scope vetoed nothing at all: `scope_blocked` is 0 "
+                         "on a fixture where every rival is out of scope")
+        # (b) ... and it must not forbid a move that IS local
+        if p28_wide != p28_plain:
+            fails.append("a 2.0 m scope blocked a %.2f m swap that the unscoped "
+                         "run allowed (%s vs %s): the gate is anchored on the "
+                         "wrong place" % (d_move, p28_plain, p28_wide))
+        # (c) Gate 3's readout: it must report the distance, not just that a swap
+        # happened.  Section 23's instrument recorded only the direction, and a
+        # 14.2 m swap for +0.85 m2 went into the document as a feature.
+        st28 = e28.pick_stats()
+        if st28.get("sw_n") != 1:
+            fails.append("expected exactly one swap on the fixture, got %r"
+                         % (st28.get("sw_n"),))
+        elif abs(float(st28.get("sw_dist_max", 0.0)) - d_move) > 0.05:
+            fails.append("Gate 3 reports a maximum swap distance of %.2f m but "
+                         "the pick moved %.2f m -- the instrument is not measuring "
+                         "the displacement" % (st28.get("sw_dist_max", 0.0), d_move))
+        if float(st28.get("sw_unit_med", 0.0)) <= 0.0:
+            fails.append("the benefit-per-metre of the swap recorded as %r: a "
+                         "swap that moves the goal must record what it bought"
+                         % (st28.get("sw_unit_med"),))
+    # (d) the two travel-cost shapes are genuinely different, and `"cand"` is the
+    # one that carries each place's own cost.
+    e28c, _p = pick28(cand_local_lambda=2.0, cand_local_dist_mode="cand")
+    rows = list(e28c.last_sweep_cands)
+    ok_cand = False
+    for c in rows:
+        u, term, cd = float(c[11]), float(c[12]), None
+        if term <= 0.0:
+            continue
+        cd = u / term                      # invert what the score consumed
+        if cd > 1.0:                       # not the degenerate (1 + 1e-6) case
+            ok_cand = True
+            break
+    print("    dist_mode=cand: %d candidates, term/u implies distance %.2f m"
+          % (len(rows), cd if cd is not None else -1))
+    e28p, _p2 = pick28(cand_local_lambda=2.0, cand_local_dist_mode="patch")
+    t_cand = [float(c[12]) for c in e28c.last_sweep_cands]
+    t_patch = [float(c[12]) for c in e28p.last_sweep_cands]
+    if not ok_cand or t_cand == t_patch:
+        fails.append("`cand_local_dist_mode=\"cand\"` did not change the travel "
+                     "cost the term carries (term lists %r vs %r)"
+                     % (t_cand[:3], t_patch[:3]))
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (27 checks)")
+    print("verdict: PASS (28 checks)")
     return 0
 
 

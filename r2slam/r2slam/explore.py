@@ -78,6 +78,8 @@ class FrontierExplorer:
                  sweep_cand_sectors: int = 1,
                  cand_local_lambda: float = 0.0,
                  cand_local_radius_m: float = 1.00,
+                 cand_local_dist_mode: str = "patch",
+                 cand_local_scope_m: float = 0.0,
                  sweep_commit_frames: int = 300,
                  sweep_stuck_frames: int = 0,
                  sweep_stuck_improve_m: float = 0.50,
@@ -215,6 +217,45 @@ class FrontierExplorer:
         # alive").  `_record_local_margin` produces both; see its docstring.
         self.cand_local_lambda = float(cand_local_lambda)
         self.cand_local_radius_m = max(float(cand_local_radius_m), 1e-3)
+        # --- what "local" is allowed to mean --------------------------------
+        #
+        # Boss, 2026-10-05, after the lambda = 0 vs 1 live A/B came back worse
+        # (docs section 24): "it is no longer enough to say the denominator was
+        # wrong.  What is exposed is that the spatial scope of the local term and
+        # the spatial scope of candidate generation are not the same thing."
+        # Measured, in the live runs: of the 10 decisions the term changed, 8
+        # moved the goal more than 3 m and 2 moved it 18.12 m and 13.82 m -- to
+        # buy +0.40 and +1.14 m2.  Because `base` and the `1/(1+d0)` denominator
+        # are both patch-level, travel cost was **invisible to this term inside a
+        # patch**, and a "fresh patch" is one connected unvisited region that runs
+        # through unexplored doorways and spans two or three rooms.  So "within a
+        # patch, base ties, therefore any difference in u decides" -- which
+        # section 23 read as the ranking finally having something to rank -- was
+        # in the live run "move the goal to the other end of the house for
+        # 0.07 m2".
+        #
+        # Two separate fixes, kept as separate knobs because they answer two
+        # different questions ("what does it cost to get there" vs "is that place
+        # even a competitor") and section 24 could not tell them apart:
+        #
+        #   `cand_local_dist_mode = "cand"` -- the term's travel cost is the
+        #     candidate's **own** distance from the robot, not the patch's
+        #     distance from the start.  This is the `u / (d + eps)` economics:
+        #     benefit per metre of *extra* travel, not benefit alone.
+        #   `cand_local_scope_m > 0` -- the term may only speak about candidates
+        #     within that many metres of the place the standing policy would have
+        #     chosen anyway.  Everything further away keeps its standing order, so
+        #     two places 10 m apart **cannot** be separated by this term at all.
+        #     That is boss's rule: "if dist(A, B) > R, A and B must not compete on
+        #     local utility".  It is deliberately anchored on the plain winner
+        #     rather than pair-wise, so a chain of near-neighbours cannot walk the
+        #     goal across the house one hop at a time.
+        #
+        # Both default to the standing behaviour ("patch", 0.0), so the shipped
+        # path is unchanged and `cand_local_lambda = 0` remains an exact no-op.
+        self.cand_local_dist_mode = str(cand_local_dist_mode)
+        self.cand_local_scope_m = max(float(cand_local_scope_m), 0.0)
+        self.n_local_scope_blocked = 0   # candidates the scope vetoed outright
         self.last_local_u_pick = 0.0     # local_u of the place actually taken
         self.last_local_term_pick = 0.0  # and the term it added to the score
         self.n_local_picks = 0           # decisions where the term's choice was taken
@@ -1403,6 +1444,34 @@ class FrontierExplorer:
                            need_local_le2=round(float((a <= 2.0).mean()), 3))
             else:
                 out["need_local_inf"] = True
+        # --- Gate 3: is it making local decisions? ---------------------------
+        #
+        # Boss, 2026-10-05: ">= 10% of decisions changed is not enough -- the
+        # lambda = 1 run passed that and was worse."  What has to hold on top is
+        # that the term's decisions are **spatial**: every swap it makes must be
+        # between places close enough to be competing directions for the same
+        # bit of work.  Recorded as a distribution, and the hard rule is on the
+        # maximum: `sw_dist_max` above the scope means the term is choosing
+        # between places that are not neighbours, whatever the direction of the
+        # move looks like.  `sw_n_absurd` counts the specific pathology that
+        # produced the section-24 result -- a long move for a negligible gain.
+        if self.local_switches:
+            dd = np.array([s["dist"] for s in self.local_switches], float)
+            un = np.array([s["unit"] for s in self.local_switches], float)
+            ddu = np.array([s["du"] for s in self.local_switches], float)
+            out.update(sw_n=len(dd),
+                       sw_dist_med=round(float(np.median(dd)), 2),
+                       sw_dist_p90=round(float(np.percentile(dd, 90)), 2),
+                       sw_dist_max=round(float(dd.max()), 2),
+                       sw_unit_med=round(float(np.median(un)), 4),
+                       sw_unit_min=round(float(un.min()), 4),
+                       sw_n_far= int((dd >= 5.0).sum()),
+                       sw_n_absurd=int(((dd >= 5.0) & (ddu <= 0.5)).sum()))
+            if self.cand_local_scope_m > 0.0:
+                out["sw_n_over_scope"] = int(
+                    (dd > self.cand_local_scope_m + 1e-6).sum())
+        if self.cand_local_scope_m > 0.0:
+            out["scope_blocked"] = self.n_local_scope_blocked
         if not self.debt_margin:
             return out
         needs = [m["need_lam"] for m in self.debt_margin if m["need_lam"] >= 0.0]
@@ -1892,6 +1961,7 @@ class FrontierExplorer:
 
         def gather(labels, min_area):
             out = []
+            rows = []
             for L in labels:
                 if sz[L] * cell < min_area:
                     continue
@@ -1935,32 +2005,64 @@ class FrontierExplorer:
                 # the same patch.
                 for px, py in patch_points(ys, xs, dep, wx, wy):
                     cd = float(np.hypot(px - x0, py - y0))
-                    # The candidate-level extra, in the same units as `base`:
-                    # m2 per metre of travel, so at lambda = 0 the key is exactly
-                    # the old key and the A/B is one variable.
-                    #
-                    # `u_term` is **stored on the tuple** rather than recomputed
-                    # by the instrument, so the gate arithmetic reads the number
-                    # the ranking actually used.  The debt round is the reason:
-                    # modelling the code instead of reading it is how "cap 1 vs
-                    # cap 9 changed nothing" stayed unexplained for a day.
+                    # The candidate-level extra.  Which travel cost it carries is
+                    # the whole of section 24 -- see `cand_local_dist_mode`:
+                    # `"patch"` gives every place in a patch the same denominator
+                    # (so the term is blind to what getting there costs) and
+                    # `"cand"` gives each place its own.
                     lu = local_unfinished(px, py)
-                    u_term = lu / (1.0 + d0)
-                    out.append((
-                        self._rank_key(score + self.cand_local_lambda * u_term,
-                                       d0, tx_anchor, ty_anchor, px, py, cd),
-                        d0, px, py, ncell, L,
-                        self._rank_key(base, d0, tx_anchor, ty_anchor,
-                                       px, py, cd),
-                        bonus, idle_s, w, base,
-                        lu, u_term,
-                        # The comparator for the local term: the key this place
-                        # would have had with `cand_local_lambda = 0`.  Only used
-                        # to answer "did the term change the answer", which is
-                        # the difference between the mechanism running and the
-                        # mechanism mattering.
-                        self._rank_key(score, d0, tx_anchor, ty_anchor,
-                                       px, py, cd)))
+                    if self.cand_local_dist_mode == "cand":
+                        u_term = lu / (cd + 1e-6)
+                    else:
+                        u_term = lu / (1.0 + d0)
+                    rows.append(dict(px=px, py=py, cd=cd, lu=lu, u_term=u_term,
+                                     d0=d0, ncell=ncell, L=L, base=base,
+                                     ax=tx_anchor, ay=ty_anchor, bonus=bonus,
+                                     idle_s=idle_s, w=w, score=score,
+                                     u_eff=u_term))
+
+            # --- who is allowed to compete with whom ------------------------
+            #
+            # See `cand_local_scope_m`.  Anchored on the **plain winner** (the
+            # place the standing policy would have taken, i.e. the key with the
+            # local term switched off), not pair-wise: a pair-wise rule lets a
+            # chain of near-neighbours hand the goal along, hop by hop, to the
+            # other end of the house -- which is the failure this is fixing.
+            if (self.cand_local_scope_m > 0.0 and self.cand_local_lambda > 0.0
+                    and len(rows) >= 2):
+                plain = min(rows, key=lambda r: self._rank_key(
+                    r["score"], r["d0"], r["ax"], r["ay"], r["px"], r["py"],
+                    r["cd"]))
+                scope = self.cand_local_scope_m
+                for r in rows:
+                    if float(np.hypot(r["px"] - plain["px"],
+                                      r["py"] - plain["py"])) > scope + 1e-9:
+                        r["u_eff"] = 0.0        # out of scope: no local opinion
+                        self.n_local_scope_blocked += 1
+
+            for r in rows:
+                out.append((
+                    self._rank_key(r["score"] + self.cand_local_lambda * r["u_eff"],
+                                   r["d0"], r["ax"], r["ay"], r["px"], r["py"],
+                                   r["cd"]),
+                    r["d0"], r["px"], r["py"], r["ncell"], r["L"],
+                    self._rank_key(r["base"], r["d0"], r["ax"], r["ay"],
+                                   r["px"], r["py"], r["cd"]),
+                    r["bonus"], r["idle_s"], r["w"], r["base"],
+                    r["lu"],
+                    # `u_term` is **the term as it entered the score**, i.e. after
+                    # the scope veto.  The gate arithmetic in
+                    # `_record_local_margin` reads this number and not a model of
+                    # it -- the debt round is why: "cap 1 vs cap 9 changed
+                    # nothing" stayed unexplained for a day because the
+                    # instrument modelled the code instead of reading it.
+                    r["u_eff"],
+                    # The comparator for the local term: the key this place would
+                    # have had with `cand_local_lambda = 0`.  Only used to answer
+                    # "did the term change the answer", which is the difference
+                    # between the mechanism running and the mechanism mattering.
+                    self._rank_key(r["score"], r["d0"], r["ax"], r["ay"],
+                                   r["px"], r["py"], r["cd"])))
             # Biggest-and-nearest first, quantised so that two patches a few
             # percent apart do not change places on a floating-point hiccup.
             out.sort(key=lambda c: c[0])
@@ -2120,14 +2222,32 @@ class FrontierExplorer:
                             if float(c[11]) <= float(best_local[11]) + 1e-9:
                                 self.n_local_swaps_bad += 1
                             if len(self.local_switches) < 40:
+                                fx, fy = float(best_local[2]), float(best_local[3])
+                                dist = float(np.hypot(tx - fx, ty - fy))
+                                du = float(c[11]) - float(best_local[11])
                                 self.local_switches.append(dict(
                                     t=round(float(self._last_stamp or 0.0), 1),
                                     n=len(cands),
                                     to=[round(tx, 2), round(ty, 2)],
-                                    frm=[round(float(best_local[2]), 2),
-                                         round(float(best_local[3]), 2)],
+                                    frm=[round(fx, 2), round(fy, 2)],
                                     u_to=round(float(c[11]), 3),
-                                    u_frm=round(float(best_local[11]), 3)))
+                                    u_frm=round(float(best_local[11]), 3),
+                                    # ---- Gate 3: the economics of the swap ----
+                                    #
+                                    # Boss, 2026-10-05: "the instrument must record
+                                    # how far it moved the goal, not only which way.
+                                    # Only recording the direction makes 14 m and
+                                    # 1.4 m look identical in the record."  That is
+                                    # exactly what happened in section 23, where a
+                                    # 14.2 m swap for +0.85 m2 was written up as a
+                                    # feature.  So every swap now carries its
+                                    # displacement, the travel cost of each side,
+                                    # and the benefit per metre it bought.
+                                    dist=round(dist, 3),
+                                    d_frm=round(float(np.hypot(fx - x0, fy - y0)), 3),
+                                    d_to=round(float(np.hypot(tx - x0, ty - y0)), 3),
+                                    du=round(du, 3),
+                                    unit=round(du / max(dist, 1e-6), 4)))
                     elif self.cand_local_lambda > 0.0:
                         self.n_local_fallthrough += 1
                 return tx, ty, path, ncell, L

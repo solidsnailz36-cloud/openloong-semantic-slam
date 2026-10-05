@@ -1252,6 +1252,9 @@ def main():
                      # reading is a real signal, not a curiosity.
                      "cand_local_lambda": explorer.cand_local_lambda,
                      "cand_local_radius_m": explorer.cand_local_radius_m,
+                     "cand_local_dist_mode": explorer.cand_local_dist_mode,
+                     "cand_local_scope_m": explorer.cand_local_scope_m,
+                     "local_scope_blocked": explorer.n_local_scope_blocked,
                      "local_picks": explorer.n_local_picks,
                      "local_swaps": explorer.n_local_swaps,
                      "local_swaps_bad": explorer.n_local_swaps_bad,
