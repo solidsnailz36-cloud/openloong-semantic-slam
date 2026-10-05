@@ -1406,13 +1406,93 @@ def main():
             fails.append("neglect planted on the west room did not keep the "
                          "pick there (%s)" % (picks25[2],))
 
+    # --- 26. one fresh patch, several competing places --------------------
+    #
+    # Boss, 2026-10-05, after the eight-arm null result: "do (1) candidate
+    # generation, but do not treat mechanically splitting a big patch into points
+    # as the goal -- the goal is for the candidate set to go from *one direction*
+    # to *several competing directions*".  And: two acceptance questions -- did
+    # the count go up, and are the candidates actually apart -- before any claim
+    # that the ranking is now live.
+    #
+    # So this case pins both, on the one-world-that-answers-it fixture: a 3 m wide
+    # corridor with 7 m of never-walked floor, i.e. one patch that still has room
+    # for several places in it.
+    print("26) one patch offers several separated places, and K=1 is untouched")
+    w26 = world(observed_to=8.0)
+    picks26 = {}
+    for tag, k, sep, sec in (("K=1 (standing)", 1, 1.0, 1),
+                             ("K=4 sep 1.0", 4, 1.0, 1),
+                             ("K=4 sep 6.0", 4, 6.0, 1),
+                             ("K=4 sect 8", 4, 1.0, 8)):
+        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                             sweep_cands_per_patch=k, sweep_cand_sep_m=sep,
+                             sweep_cand_sectors=sec)
+        reach, _x = e._masks(w26, (0.0, 0.0))
+        p = e._pick_sweep_target(w26, reach, 0.0, 0.0)
+        st = e.pick_stats()
+        rec = e.pick_sizes[-1] if e.pick_sizes else {}
+        picks26[tag] = None if p is None else (round(p[0], 2), round(p[1], 2))
+        print("    %-14s -> %s   candidates %d, closest pair %.2f m, "
+              "bearing span %.0f deg"
+              % (tag, picks26[tag], rec.get("n", 0), rec.get("sep_min", 0.0),
+                 rec.get("az_span", 0.0)))
+        if st.get("cand_max"):                        # keep the reading honest
+            pass
+        if tag == "K=1 (standing)":
+            if rec.get("n") != 1:
+                fails.append("K=1 offered %r candidates on a single-patch world "
+                             "-- it must be exactly one per patch, or the "
+                             "subdivision A/B is not one variable"
+                             % (rec.get("n"),))
+        if tag.startswith("K=4 sep 1.0"):
+            if rec.get("n", 0) < 3:
+                fails.append("K=4 with 1.0 m separation found only %d places in "
+                             "a 3 x 7 m patch -- subdivision is not working"
+                             % rec.get("n", 0))
+            if rec.get("sep_min", 0.0) < 1.0 - 1e-6:
+                fails.append("two candidates are %.3f m apart with a %.1f m "
+                             "minimum: they are one direction with two labels"
+                             % (rec.get("sep_min", 0.0), 1.0))
+            if rec.get("az_span", 0.0) <= 1.0:
+                fails.append("the candidates span %.1f deg of bearing -- that is "
+                             "not a second direction"
+                             % rec.get("az_span", 0.0))
+        if tag == "K=4 sep 6.0":
+            if rec.get("n", 0) > 2:
+                fails.append("with a 6.0 m minimum separation the 3 m wide "
+                             "corridor still offered %d candidates: the "
+                             "suppression is not being applied"
+                             % rec.get("n", 0))
+        if tag == "K=4 sect 8":
+            # The bearing gate exists because separation alone produced places
+            # 1.00 m apart but only 7.4 deg of bearing on the real capture: the
+            # same direction, several labels (docs section 22).
+            if rec.get("n", 0) < 2:
+                fails.append("the bearing gate left only %d candidate(s)"
+                             % rec.get("n", 0))
+            if rec.get("az_span", 0.0) < 45.0:
+                fails.append("with 8 bearing sectors the candidates still span "
+                             "only %.0f deg -- they are not separate directions"
+                             % rec.get("az_span", 0.0))
+            if rec.get("sep_min", 0.0) < 1.0 - 1e-6:
+                fails.append("the bearing gate lost the distance guarantee "
+                             "(%.3f m apart)" % rec.get("sep_min", 0.0))
+    if picks26.get("K=1 (standing)") and picks26.get("K=4 sep 1.0"):
+        d = float(np.hypot(picks26["K=1 (standing)"][0] - picks26["K=4 sep 1.0"][0],
+                           picks26["K=1 (standing)"][1] - picks26["K=4 sep 1.0"][1]))
+        if d < 0.5:
+            fails.append("the pick did not move at all when the patch started "
+                         "offering several places (%.2f m): the candidates are "
+                         "decorative" % d)
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (25 checks)")
+    print("verdict: PASS (26 checks)")
     return 0
 
 

@@ -1234,12 +1234,14 @@ def main():
                      "debt_idle_pick_s": round(explorer.last_debt_idle_s, 1),
                      "debt_f_pick": round(explorer.last_debt_f, 3),
                      "debt_switches": explorer.debt_switches,
-                     # ... and the one that decides whether the next round is
-                     # worth a simulator run at all: the pull each pick would
-                     # have needed, in units of `debt_lambda`.  If the smallest
-                     # need over the whole run is > 1, no setting of the strength
-                     # would have changed a single decision.
-                     "debt_margin": explorer.debt_margin_stats(),
+                     # ... and the two that decide whether any of the above can
+                     # ever matter: what each pick had to choose between, and how
+                     # far apart the choices were.  A scoring term cannot be
+                     # judged on picks that offered one candidate, and several
+                     # candidates in one place are not several directions.
+                     "pick_stats": explorer.pick_stats(),
+                     "sweep_cands_per_patch": explorer.sweep_cands_per_patch,
+                     "sweep_cand_sep_m": explorer.sweep_cand_sep_m,
                      "done_reason": explorer.n_done_reason,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,

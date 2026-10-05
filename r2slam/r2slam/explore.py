@@ -73,6 +73,9 @@ class FrontierExplorer:
                  island_link_m: float = 1.5, island_probe_limit: int = 12,
                  island_min_m2: float = 0.5, island_trigger_m2: float = 4.0,
                  sweep_min_m2: float = 3.0, sweep_min_dist: float = 0.50,
+                 sweep_cands_per_patch: int = 1,
+                 sweep_cand_sep_m: float = 1.00,
+                 sweep_cand_sectors: int = 1,
                  sweep_commit_frames: int = 300,
                  sweep_stuck_frames: int = 0,
                  sweep_stuck_improve_m: float = 0.50,
@@ -142,6 +145,34 @@ class FrontierExplorer:
         # How far *inside* untouched ground a candidate has to be, in metres.
         # It is a depth, not a distance from the robot: see `_fresh_depth`.
         self.sweep_min_dist = float(sweep_min_dist)
+        # --- how many *directions* one fresh patch offers --------------------
+        #
+        # One candidate per patch was the standing behaviour and it is measurably
+        # why the whole ranking layer is inert: instrumented at the point of
+        # decision, 41 of 43 picks in one capture had at most ONE candidate on the
+        # table (docs section 21).  A ranking with nothing to rank cannot be
+        # helped by a better score -- debt, utility, hysteresis and the parameter
+        # that scales them were all measured to change exactly nothing.
+        #
+        # So a patch now offers up to `sweep_cands_per_patch` **well-separated**
+        # places: greedy non-maximum suppression on the fresh-depth field, deepest
+        # first, anything within `sweep_cand_sep_m` of a place already taken
+        # suppressed.  That is what makes them compete rather than decorate: two
+        # candidates 0.2 m apart are one direction with two labels, and the
+        # instrument reports the minimum separation so that failure mode cannot
+        # pass unnoticed (boss, 2026-10-05: "the goal is not to mechanically split
+        # a patch, it is to turn one direction into several competing ones").
+        #
+        # `= 1` is the standing behaviour, exactly, and it is the default: the
+        # sort key gains a suffix that is a function of the single candidate, so
+        # the ordering is provably unchanged.  Case 26 in `tools/test_explore.py`
+        # holds that, and test 25 asserts K=1 reproduces the old pick.
+        self.sweep_cands_per_patch = max(int(sweep_cands_per_patch), 1)
+        self.sweep_cand_sep_m = float(sweep_cand_sep_m)
+        # 1 = off (separation alone); >1 forces the places into different bearing
+        # sectors as seen from the robot.  See  for the measurement
+        # that made this necessary.
+        self.sweep_cand_sectors = max(int(sweep_cand_sectors), 1)
         self._dt = None
         self._dt_key = None
         # A sweep target is a *trip*, not a nudge, and it needs a commitment to
@@ -1140,8 +1171,9 @@ class FrontierExplorer:
         if len(self.debt_margin) > 400:
             del self.debt_margin[:200]
 
-    def _note_pick_size(self, where: str, cands) -> None:
-        """Record how many candidates a pick was actually choosing between.
+    def _note_pick_size(self, where: str, cands, x0: float = 0.0,
+                        y0: float = 0.0) -> None:
+        """Record what a pick was actually choosing between.
 
         This is the measurement that decides whether *any* re-ranking mechanism
         can work, and it is not implied by a swap count: with one candidate on
@@ -1151,38 +1183,71 @@ class FrontierExplorer:
         because the sweep reaches its decision three different ways -- the
         survey rule, the patch lock and its failure fallbacks -- and only some of
         them ever present more than one option.
+
+        Three numbers, because "more candidates" on its own is not the goal (boss,
+        2026-10-05): `n` (how many), `sep_min` (the closest pair, in metres) and
+        `az_span` (the smallest arc, in degrees, that contains them all as seen
+        from the robot).  Four candidates inside 0.3 m, or four inside 5 degrees,
+        are one direction with four labels and would change nothing about where
+        the robot goes.
         """
-        self.pick_sizes.append(dict(t=round(self._debt_t, 1), where=where,
-                                    n=len(cands)))
+        n = len(cands)
+        rec = dict(t=round(self._debt_t, 1), where=where, n=n,
+                   sep_min=float("nan") if n < 2 else 0.0,
+                   az_span=float("nan") if n < 2 else 0.0)
+        if n >= 2:
+            pts = np.array([[float(c[2]), float(c[3])] for c in cands])
+            d = np.hypot(pts[:, 0][:, None] - pts[:, 0][None, :],
+                         pts[:, 1][:, None] - pts[:, 1][None, :])
+            iu = np.triu_indices(n, 1)
+            rec["sep_min"] = float(d[iu].min())
+            az = np.degrees(np.arctan2(pts[:, 1] - y0, pts[:, 0] - x0)) % 360.0
+            az = np.sort(az)
+            gaps = np.diff(np.concatenate([az, az[:1] + 360.0]))
+            rec["az_span"] = float(360.0 - gaps.max())
+        self.pick_sizes.append(rec)
         if len(self.pick_sizes) > 600:
             del self.pick_sizes[:300]
 
-    def debt_margin_stats(self) -> dict:
-        """Percentiles of the pull each pick would have needed, and the sizes of
-        the choice sets it was drawn from.
+    def pick_stats(self) -> dict:
+        """What every pick had to choose between, and whether it was a real choice.
 
-        `need_lam` is in units of `debt_lambda` itself, so the reading is direct:
-        "the median pick would have needed lambda = 8" means the term as
-        configured (1.0) is 8x too small *if* strength is what is missing; "and
-        the smallest need over the whole run is 3.4" means there is no setting
-        that would have fired at all, i.e. the term is measuring something that
-        does not vary across the candidates on offer.  `need_lam_inf` counts the
-        picks where no lambda could flip the head, because the plain winner also
-        had the maximum weight available.
+        Read this **before** any A/B on a scoring term, because it decides whether
+        such an A/B can mean anything (docs section 21):
 
-        `pick_sizes` says whether there was a choice at all, which has to be read
-        first: a re-ranking mechanism cannot be evaluated on picks that offered
-        one candidate.
+        * `cand_med` / `p_ge2` / `p_ge3` -- how many candidates the picks offered.
+          One candidate on the table means the ranking was not consulted at all;
+        * `sep_min_med` / `az_span_med` -- over the picks that *did* offer several,
+          how far apart they were, in metres and in degrees of bearing as seen
+          from the robot.  Several candidates in one place are not several
+          directions, and a mechanism judged on them would look inert for the
+          wrong reason;
+        * `by_path` -- the same count split by the rule that produced the list
+          (`survey` / `locked` / `global` / the two failure fallbacks), because
+          the patch lock is single-candidate by construction while the survey rule
+          is not.
+
+        The `need_lam*` fields are the debt's own margin (see
+        `_record_debt_margin`) and only appear when `debt_lambda > 0`.
         """
         out: dict = {}
         if self.pick_sizes:
             sizes = np.array([p["n"] for p in self.pick_sizes], dtype=np.float64)
             out.update(n_picks_seen=len(sizes),
+                       cand_med=float(np.median(sizes)),
+                       cand_max=int(sizes.max()),
                        cand_1=int((sizes <= 1).sum()),
                        cand_2_3=int(((sizes >= 2) & (sizes <= 3)).sum()),
                        cand_4p=int((sizes >= 4).sum()),
-                       cand_med=float(np.median(sizes)),
-                       cand_max=int(sizes.max()))
+                       p_ge2=round(float((sizes >= 2).mean()), 3),
+                       p_ge3=round(float((sizes >= 3).mean()), 3))
+            sep = [p["sep_min"] for p in self.pick_sizes if p["n"] >= 2]
+            azs = [p["az_span"] for p in self.pick_sizes if p["n"] >= 2]
+            if sep:
+                out.update(sep_min_med=round(float(np.median(sep)), 2),
+                           sep_min_min=round(float(np.min(sep)), 2))
+                out.update(az_span_med=round(float(np.median(azs)), 1),
+                           az_span_min=round(float(np.min(azs)), 1))
             by_where: dict = {}
             for p in self.pick_sizes:
                 w = by_where.setdefault(p["where"], [0, 0, 0])
@@ -1209,6 +1274,9 @@ class FrontierExplorer:
             out["f_gap_med"] = round(float(np.median(fg)), 3)
             out["f_gap_max"] = round(float(np.max(fg)), 3)
         return out
+
+    # Kept under the old name: the two tools and every archived summary call it.
+    debt_margin_stats = pick_stats
 
     def _debt_f(self, idle_s: float) -> float:
         """Map "how long this region has been left alone" onto [0, 1].
@@ -1487,7 +1555,9 @@ class FrontierExplorer:
     def _deny(self, x: float, y: float) -> None:
         self._denied.append((float(x), float(y)))
 
-    def _rank_key(self, score: float, d: float, px: float, py: float) -> tuple:
+    def _rank_key(self, score: float, d: float, px: float, py: float,
+                  cx: float = None, cy: float = None,
+                  cd: float = None) -> tuple:
         """A five-cent coin instead of a thousandth of a millimetre.
 
         `score` is descending-is-better (m2), `d` is metres from the start,
@@ -1499,11 +1569,22 @@ class FrontierExplorer:
         ordered by size, then by distance, then by position, all to a fixed
         resolution -- so a difference below that resolution is *declared* equal
         instead of silently deciding the run.
+
+        The last three fields are a **within-patch** tiebreak, used when one
+        fresh patch offers several places (see `sweep_cands_per_patch`): the
+        place's distance, then its position.  They are a suffix on the same key,
+        so a patch that offers exactly one place is ordered exactly as it was
+        before they existed -- which is what makes the subdivision A/B one
+        variable rather than two.
         """
         q = max(self.score_quantum_m2, 1e-9)
         qm = max(self.rank_quantum_m, 1e-9)
-        return (-int(round(score / q)), int(round(d / qm)),
-                int(round(px / qm)), int(round(py / qm)))
+        key = (-int(round(score / q)), int(round(d / qm)),
+               int(round(px / qm)), int(round(py / qm)))
+        if cd is None:
+            return key
+        return key + (int(round(cd / qm)), int(round(cx / qm)),
+                      int(round(cy / qm)))
 
     def _pick_sweep_target(self, wmap, reach, x0, y0):
         """A sizeable reachable patch of floor the robot has never been near.
@@ -1593,6 +1674,51 @@ class FrontierExplorer:
             self._sweep_patch_stops = 0
             self.n_patch_releases += 1
 
+        def patch_points(ys, xs, dep, wx, wy):
+            """Up to `sweep_cands_per_patch` places in this patch, deepest first.
+
+            Greedy non-maximum suppression on the fresh-depth field: take the
+            deepest cell, then the deepest cell at least `sweep_cand_sep_m` away
+            from everything taken, and so on.  `kind="stable"` on the argsort
+            matters -- ties in a distance transform are common along a wall, and
+            an unstable sort would let memory order decide, which is the class of
+            bug `_rank_key` exists to keep out of the ranking.
+
+            **Why a bearing gate on top of the distance gate** (measured, docs
+            section 22).  With separation alone, `median sep_min = 1.00 m` but
+            `median bearing span = 7.4 deg`: the second place is the next one
+            along the same deep ridge, so the patch offers several places in
+            *one* direction, which is not the thing boss asked for ("if three
+            candidates all sit inside +-5 deg it is still useless").  With
+            `sweep_cand_sectors > 1` a place is only taken if its bearing sector
+            is still free, so the places are forced apart *as directions* -- the
+            same idea the frontier picker already uses (`n_sectors`) to stop one
+            blocked direction from hiding every other one.
+            """
+            k = self.sweep_cands_per_patch
+            n_sec = max(int(self.sweep_cand_sectors), 1)
+            order = np.argsort(-dep, kind="stable")
+            taken = []
+            used_sec = set()
+            for idx in order:
+                if len(taken) >= k:
+                    break
+                if dep[idx] < min_depth:
+                    break                     # sorted: everything after is shallower
+                px = float(wx[idx])
+                py = float(wy[idx])
+                if taken and min(np.hypot(px - a, py - b)
+                                 for a, b in taken) < self.sweep_cand_sep_m:
+                    continue
+                if n_sec > 1:
+                    bear = float(np.arctan2(py - y0, px - x0)) % (2.0 * np.pi)
+                    s = int(bear / (2.0 * np.pi) * n_sec) % n_sec
+                    if s in used_sec:
+                        continue
+                    used_sec.add(s)
+                taken.append((px, py))
+            return taken
+
         def gather(labels, min_area):
             out = []
             for L in labels:
@@ -1616,8 +1742,8 @@ class FrontierExplorer:
                     continue
                 d0 = float(d_start.min())
                 ncell = int(sz[L])
-                tx, ty = float(wx[j]), float(wy[j])
-                if self._is_denied(tx, ty):
+                tx_anchor, ty_anchor = float(wx[j]), float(wy[j])
+                if self._is_denied(tx_anchor, ty_anchor):
                     continue
                 # The region's own neglect, read off the patch -- see the note on
                 # `debt_lambda` in `__init__` for why the term lives here and
@@ -1629,9 +1755,21 @@ class FrontierExplorer:
                 w = self.debt_lambda * self._debt_f(idle_s)
                 score = base * (1.0 + w)
                 bonus = base * w
-                out.append((self._rank_key(score, d0, tx, ty), d0, tx, ty,
-                            ncell, L, self._rank_key(base, d0, tx, ty), bonus,
-                            idle_s, w, base))
+                # One entry per place.  They all share the patch's value, its
+                # anchor and its neglect: what separates them is **where they
+                # are**, so the patch-level ranking cannot change when a patch
+                # offers four places instead of one (see `sweep_cands_per_patch`),
+                # and the only new question the key answers is "which of these
+                # places do I go to first" -- nearest, since the expected gain is
+                # the same patch.
+                for px, py in patch_points(ys, xs, dep, wx, wy):
+                    cd = float(np.hypot(px - x0, py - y0))
+                    out.append((self._rank_key(score, d0, tx_anchor, ty_anchor,
+                                               px, py, cd),
+                                d0, px, py, ncell, L,
+                                self._rank_key(base, d0, tx_anchor, ty_anchor,
+                                               px, py, cd),
+                                bonus, idle_s, w, base))
             # Biggest-and-nearest first, quantised so that two patches a few
             # percent apart do not change places on a floating-point hiccup.
             out.sort(key=lambda c: c[0])
@@ -1676,7 +1814,8 @@ class FrontierExplorer:
         else:
             cands = all_c
         self._note_pick_size("survey" if survey_pick else
-                             ("locked" if locked else "global"), cands)
+                             ("locked" if locked else "global"),
+                             cands, x0, y0)
         picked = self._plan_first(wmap, cands, x0, y0)
         if picked is None and locked:
             # The locked patch has nothing plannable left.  Drop the lock and
@@ -1684,14 +1823,14 @@ class FrontierExplorer:
             # frame with no target at all.
             self._sweep_patch_mask = None
             cands = gather(range(1, n), self.sweep_min_m2)
-            self._note_pick_size("lock-failed", cands)
+            self._note_pick_size("lock-failed", cands, x0, y0)
             picked = self._plan_first(wmap, cands, x0, y0)
         if picked is None and survey_pick and self._survey_stops:
             # Every "somewhere else" candidate was unroutable.  Take the best of
             # the rest rather than reporting "nothing to sweep" -- the spread
             # rule is a preference about *order*, not a reason to stop working.
             cands = gather(range(1, n), self.sweep_min_m2)
-            self._note_pick_size("survey-failed", cands)
+            self._note_pick_size("survey-failed", cands, x0, y0)
             picked = self._plan_first(wmap, cands, x0, y0)
         if picked is None:
             return None

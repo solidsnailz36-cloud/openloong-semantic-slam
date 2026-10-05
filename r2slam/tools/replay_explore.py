@@ -352,7 +352,7 @@ def main():
         v = getattr(explorer, k, None)
         if v is not None:
             print("  %-22s %s" % (k, v))
-    for k, v in (explorer.debt_margin_stats() if hasattr(explorer, "debt_margin_stats")
+    for k, v in (explorer.pick_stats() if hasattr(explorer, "pick_stats")
                  else {}).items():
         print("  %-22s %s" % (k, v))
 
@@ -433,6 +433,41 @@ def main():
                   % (name, getattr(exr, "n_arrivals", "-"),
                      getattr(exr, "n_first_pass_stops", "-"),
                      getattr(exr, "n_deep_stops", "-"), sw))
+
+        # ---- the acceptance table for a candidate-generation change --------
+        #
+        # Boss, 2026-10-05: before "the ranking is now live" can be claimed two
+        # things must hold -- the candidate count has to go up AND the candidates
+        # have to be apart.  Four candidates inside 0.3 m, or inside 5 degrees of
+        # bearing, are one direction with four labels.
+        print()
+        print("  %-14s %7s %7s %7s %9s %10s"
+              % ("arm", "med N", "P>=2", "P>=3", "sep min", "bearing span"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %7s %7s %7s %9s %10s"
+                  % (name, st.get("cand_med", "-"), st.get("p_ge2", "-"),
+                     st.get("p_ge3", "-"), st.get("sep_min_med", "-"),
+                     st.get("az_span_med", "-")))
+        print("  （sep min / bearing span 只统计候选 >=2 的那些决策）")
+        for name, exr in arms:
+            if hasattr(exr, "pick_stats"):
+                print("  %-14s %s" % (name, exr.pick_stats().get("by_path", {})))
+
+        if a.out:
+            import json
+            for name, exr in arms:
+                if not hasattr(exr, "pick_stats"):
+                    continue
+                p = "%s_%s.stats.json" % (os.path.splitext(a.out)[0], name)
+                with open(p, "w", encoding="utf-8") as fh:
+                    json.dump(dict(arm=name,
+                                   overrides=a.arms or a.set,
+                                   stats=exr.pick_stats(),
+                                   switches=getattr(exr, "debt_switches", []),
+                                   pick_sizes=getattr(exr, "pick_sizes", [])),
+                              fh, ensure_ascii=False, indent=1)
+                print("  stats        : %s" % p)
 
     for k, lst in probes.items():
         for p in lst:
