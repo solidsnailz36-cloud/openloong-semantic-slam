@@ -763,7 +763,8 @@ def main():
                 cmd["mode"] = "navigate"
                 cmd["policy_state"] = ex.get("mode")
             elif explorer is not None:
-                v, w, ex = explorer.command(wmap, (t[0], t[1]), yaw)
+                v, w, ex = explorer.command(wmap, (t[0], t[1]), yaw,
+                                            stamp=float(fr.stamp))
                 sender.set(v, w)
                 cmd = dict(ex, v=round(v, 3), w=round(w, 3))
                 cmd["mode"] = "explore"
@@ -892,6 +893,13 @@ def main():
                 # times looks identical to one that backed off three times.
                 "wedge": int(bool((cmd or {}).get("wedge"))),
                 "frontier_cells": (cmd or {}).get("nf"),
+                # The debt field, per frame: `debt_max` is the largest single
+                # block's debt (m2-equivalents, capped by `debt_gain_m2`) and
+                # `debt_blocks` how many blocks are in debt at all.  A run where
+                # `debt_max` never leaves 0 is a run where the mechanism never
+                # had anything to pull on, whatever the summary counters say.
+                "debt_max": (cmd or {}).get("debt_max"),
+                "debt_blocks": (cmd or {}).get("debt_blocks"),
                 # yaw and the clearance flag are logged because "the robot is
                 # not moving" has two completely different causes -- never
                 # commanded, or commanded but physically stuck -- and only
@@ -1197,6 +1205,24 @@ def main():
                      "goal_blocked_budget": explorer.goal_blocked_frames,
                      "goal_abandons": explorer.n_goal_abandons,
                      "denied_goals": len(explorer._denied),
+                     # --- unfinished-region debt ---------------------------
+                     # `debt_swaps` is the one that must not be zero: it counts
+                     # picks where the *debt* changed which target won, i.e.
+                     # candidates ranked with and without the bonus disagreeing
+                     # at the head.  `debt_blocks` / `debt_max_m2` say whether
+                     # the field itself is alive (blocks meeting the three
+                     # conditions, and the largest single block's debt).
+                     # `debt_gain_m2 = 0` turns it all off on the same binary.
+                     "debt_gain_m2": explorer.debt_gain_m2,
+                     "debt_recall_s": explorer.debt_recall_s,
+                     "debt_cell_m": explorer.debt_cell_m,
+                     "debt_radius_m": explorer.debt_radius_m,
+                     "debt_updates": explorer.n_debt_updates,
+                     "debt_blocks": explorer.n_debt_blocks,
+                     "debt_eligible": getattr(explorer, "n_debt_eligible", 0),
+                     "debt_max_m2": round(explorer.max_debt_m2, 3),
+                     "debt_picks": explorer.n_debt_picks,
+                     "debt_swaps": explorer.n_debt_swaps,
                      "done_reason": explorer.n_done_reason,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,

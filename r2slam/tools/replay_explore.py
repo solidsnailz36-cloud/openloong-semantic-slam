@@ -224,7 +224,8 @@ def main():
         _still, _moving = registry.live(float(fr.stamp))
         wmap.set_instances(_still, _moving)
 
-        v, w, ex = explorer.command(wmap, (t[0], t[1]), yaw)
+        v, w, ex = explorer.command(wmap, (t[0], t[1]), yaw,
+                                    stamp=float(fr.stamp))
 
         if a.poses:
             pose_rows.append((float(fr.stamp), float(t[0]), float(t[1]),
@@ -280,6 +281,13 @@ def main():
               "n_routed", "n_arc_frames", "n_patch_locks", "n_patch_releases",
               "n_los_shortened", "n_frozen_frames", "n_wedge_frames",
               "n_goal_blocked_frames", "n_goal_abandons", "goal_blocked_frames",
+              # The debt counters matter here more than anywhere else: a replay
+              # walks the *recorded* trajectory, so `n_debt_swaps` is the only
+              # evidence available before a live run that the mechanism reaches
+              # the ranking at all.  Zero swaps on a real capture means the next
+              # live A/B would be measuring nothing.
+              "n_debt_updates", "n_debt_blocks", "max_debt_m2",
+              "n_debt_picks", "n_debt_swaps",
               "n_plans", "n_plan_failures", "n_blacklisted"):
         v = getattr(explorer, k, None)
         if v is not None:

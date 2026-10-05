@@ -150,6 +150,59 @@ def world(block_x=None, observed_to=4.0, extent=12.0):
     return w
 
 
+def two_rooms(extent=12.0):
+    """Two equal rooms either side of the start, joined by a short corridor.
+
+    The fixture for the debt cases, and it is built so that the plain ranking
+    **ties**: both rooms are the same size, and the deepest cell of each is the
+    same distance from where the run began.  So the unmodified policy picks one
+    of them on the position tiebreak in `_rank_key`, and if adding debt changes
+    the answer it did so by adding value, not by breaking a tie in its own
+    favour.
+
+    The start is in the middle of the corridor, so the visited disc
+    (`sweep_radius` 0.6 m) cuts the corridor into a west stub and an east stub.
+    That is what makes the two rooms two patches instead of one: the fresh floor
+    is connected only through the corridor, and the robot's own footprint breaks
+    that connection.
+
+        west room            connector           east room
+    x [-3.4,-1.0]          x [-1.0, 1.0]       x [ 1.0, 3.4]
+    y [-1.2, 1.2]          y [-0.5, 0.5]       y [-1.2, 1.2]
+    """
+    xs_w = np.arange(-3.4, -0.99, PITCH)
+    xs_c = np.arange(-1.0, 1.0, PITCH)
+    xs_e = np.arange(1.0, 3.41, PITCH)
+    ys_r = np.arange(-1.2, 1.21, PITCH)
+    ys_c = np.arange(-0.5, 0.51, PITCH)
+    parts, kinds = [], []
+    for xs, ys in ((xs_w, ys_r), (xs_c, ys_c), (xs_e, ys_r)):
+        gx, gy = np.meshgrid(xs, ys)
+        parts.append(np.column_stack([gx.ravel(), gy.ravel(),
+                                      np.full(gx.size, GROUND_Z)]))
+        kinds.append(np.ones(gx.size, bool))
+
+    def add_line(xs, ys):
+        gx, gy = np.meshgrid(xs, ys)
+        parts.append(np.column_stack([gx.ravel(), gy.ravel(),
+                                      np.full(gx.size, WALL_Z)]))
+        kinds.append(np.zeros(gx.size, bool))
+
+    for y in (1.35, -1.35):                     # the rooms' side walls
+        add_line(np.arange(-3.55, 3.56, PITCH), np.array([y]))
+    for y in (0.65, -0.65):                     # the connector's side walls
+        add_line(np.arange(-1.05, 1.06, PITCH), np.array([y]))
+    for x in (-3.55, 3.55):                     # end caps
+        add_line(np.array([x]), np.arange(-1.35, 1.36, PITCH))
+
+    pts = np.vstack(parts)
+    ground = np.concatenate(kinds)
+    w = WorldMap(resolution=0.1, extent=extent)
+    w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.0)
+    w.add(pts, ground, ~ground, None, (0.0, 0.0), 0.1)
+    return w
+
+
 def world_with_specks():
     """Known region up to x=4, plus three lone unobserved cells ~0.8 m out.
 
@@ -1138,13 +1191,176 @@ def main():
         fails.append("the tie-break is not the documented one: expected the "
                      "south patch (smaller y), got %s" % (picks[0],))
 
+    # --- 23/24. unfinished-region debt ------------------------------------
+    #
+    # Boss, 2026-10-05, after the four-run distribution: "do (2) and only (2)"
+    # -- a region that is known, still unfinished, and has not been worked on for
+    # a while should get more valuable with time, so that the robot comes back.
+    # The failure it is aimed at is measured, not hypothetical: scanning the four
+    # v19 runs found seven cases of ">= 100 s since the last real progress with
+    # >= 40% still undone", the worst 98% undone with 158 s left.  The map knew
+    # those rooms throughout -- nothing ever asked about them again.
+    #
+    # Two separate things have to be true and they are separately testable:
+    #   23. the debt is *earned* from behaviour (grows while ignored, is
+    #       cancelled by coverage, is capped, and is off at `debt_gain_m2=0`);
+    #   24. it actually reaches the ranking (a field planted on one of two
+    #       otherwise-equal rooms moves the pick, and the instrument says so).
+    # A mechanism that runs but never changes an answer is what `wedge_abandons 0`
+    # was one round ago, and the counters exist so that cannot pass unnoticed.
+    print("23) the debt field is earned: grows while ignored, cancelled by "
+          "coverage, capped")
+    w23 = world(observed_to=8.0)          # 21.7 m2 of reachable floor, 1.1 walked
+    e23 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    t23 = 0.0
+    ramp = []
+    for k in range(0, 451):               # 90 s at 5 Hz: past the 40 s recall
+        t23 = 0.2 * k
+        e23.command(w23, (0.0, 0.0), 0.0, stamp=t23)
+        ramp.append(e23.max_debt_m2)
+    print("    held at the start for %.0f s: blocks %d of %d eligible, "
+          "max debt %.3f m2 (cap %.1f, recall %.0f s)"
+          % (t23, e23.n_debt_blocks, e23.n_debt_eligible, e23.max_debt_m2,
+             e23.debt_gain_m2, e23.debt_recall_s))
+    if e23.n_debt_updates < 20:
+        fails.append("the debt field was barely updated at all (%d times in "
+                     "%.0f s)" % (e23.n_debt_updates, t23))
+    if e23.n_debt_blocks == 0:
+        fails.append("nothing ever went into debt on a map with 21.7 m2 of "
+                     "reachable floor and 1.1 m2 walked -- the mechanism is "
+                     "inert, whatever the code says")
+    if not (0.9 * e23.debt_gain_m2 <= e23.max_debt_m2 <= e23.debt_gain_m2 + 1e-6):
+        fails.append("after %.0f s (%.1f x the recall time) the largest block "
+                     "should have reached the cap %.2f, it is %.3f"
+                     % (t23, t23 / e23.debt_recall_s, e23.debt_gain_m2,
+                        e23.max_debt_m2))
+    if any(a > b + 1e-6 for a, b in zip(ramp, ramp[1:])):
+        fails.append("the debt fell while the robot stood still -- the only "
+                     "thing that may cancel it is coverage")
+
+    def blk_of(explorer, x, y):
+        blk_m, extent, _nb = explorer._debt_geo
+        return (int(np.floor((x + extent) / blk_m)),
+                int(np.floor((y + extent) / blk_m)))
+
+    def blk_debt(explorer, x, y):
+        bx, by = blk_of(explorer, x, y)
+        return float(explorer._debt[by, bx])
+
+    # ... and driving the corridor clears the debt **in the blocks it covered**,
+    # while the blocks further along keep theirs.  Both halves matter: a rule
+    # that cleared everything would be "the robot moved", and coverage is
+    # supposed to cancel debt outright rather than shave it.
+    under_before = blk_debt(e23, 2.0, 0.0)
+    ahead_before = blk_debt(e23, 6.0, 0.0)
+    w23.traj.append((2.0, 0.0))
+    e23.command(w23, (2.0, 0.0), 0.0, stamp=t23 + 0.2)     # < 1 s: no update yet
+    for j in range(6):                                     # force one update
+        e23.command(w23, (2.0, 0.0), 0.0, stamp=t23 + 0.4 + 0.2 * j)
+    under_after = blk_debt(e23, 2.0, 0.0)
+    ahead_after = blk_debt(e23, 6.0, 0.0)
+    print("    drove to x=2: the block driven through %.3f -> %.3f, the block "
+          "6 m further on %.3f -> %.3f"
+          % (under_before, under_after, ahead_before, ahead_after))
+    if under_before <= 0.0:
+        fails.append("case 23 lost its meaning: the block the robot drove "
+                     "through was not in debt to begin with")
+    elif under_after > 0.0:
+        fails.append("coverage did not cancel the debt in the block the robot "
+                     "drove through (%.3f left of %.3f)"
+                     % (under_after, under_before))
+    if ahead_after <= 0.0:
+        fails.append("driving 2 m into the corridor cleared the debt 4 m "
+                     "further along (%.3f): the rule is cancelling by "
+                     "proximity to the robot, not by coverage"
+                     % ahead_after)
+    # `debt_gain_m2 = 0` is the control arm, on the same binary.
+    e23off = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                              debt_gain_m2=0.0)
+    for k in range(0, 61):
+        e23off.command(w23, (0.0, 0.0), 0.0, stamp=0.2 * k)
+    print("    with debt_gain_m2=0: updates %d, blocks %d, max %.3f"
+          % (e23off.n_debt_updates, e23off.n_debt_blocks, e23off.max_debt_m2))
+    if e23off.n_debt_updates or e23off.n_debt_blocks or e23off.max_debt_m2:
+        fails.append("`debt_gain_m2=0` did not turn the mechanism off -- the "
+                     "A/B arm would be measuring nothing")
+    # ... and a caller with no clock leaves it alone too, rather than treating
+    # frames as seconds.
+    e23nc = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    for k in range(0, 61):
+        e23nc.command(w23, (0.0, 0.0), 0.0)
+    if e23nc.n_debt_updates:
+        fails.append("a caller that passed no timestamp still accumulated debt "
+                     "(%d updates): the recall time would mean 8 s on one "
+                     "dataset and 4 s on another" % e23nc.n_debt_updates)
+
+    print("24) the debt reaches the ranking: it moves a pick between two "
+          "equal rooms, and says so")
+    w24 = two_rooms()
+    # The unmodified policy: west wins (4.13 m2 at 1.55 m beats 4.07 m2 at
+    # 1.65 m -- a 7% edge), and with the mechanism off that must not change.
+    e24 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                           debt_gain_m2=0.0)
+    reach24, _ex24 = e24._masks(w24, (0.0, 0.0))
+    p_off = e24._pick_sweep_target(w24, reach24, 0.0, 0.0)
+    print("    debt off  -> %s"
+          % (None if p_off is None else "(%.2f, %.2f)" % (p_off[0], p_off[1])))
+
+    def plant(explorer, x_gt=None, x_lt=None):
+        """Fill the debt by hand so the ranking can be tested on its own."""
+        blk_m, extent, nb = explorer._debt_geo
+        explorer._debt[:] = 0.0
+        for bx in range(nb):
+            for by in range(nb):
+                wx = (bx + 0.5) * blk_m - extent
+                wy = (by + 0.5) * blk_m - extent
+                if abs(wy) >= 2.0:
+                    continue
+                if x_gt is not None and wx > x_gt:
+                    explorer._debt[by, bx] = explorer.debt_gain_m2
+                if x_lt is not None and wx < x_lt:
+                    explorer._debt[by, bx] = explorer.debt_gain_m2
+        return int((explorer._debt > 0).sum())
+
+    picks24 = []
+    for tag, kw in (("debt on the east room", dict(x_gt=0.4)),
+                    ("debt on the west room", dict(x_lt=-0.4))):
+        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+        r, _x = e._masks(w24, (0.0, 0.0))
+        e._debt_update(w24, r, 0.2)          # builds the geometry, then:
+        n_blk = plant(e, **kw)
+        p = e._pick_sweep_target(w24, r, 0.0, 0.0)
+        bonus = 0.0 if p is None else e._debt_bonus(p[0], p[1])
+        picks24.append(None if p is None else (round(p[0], 2), round(p[1], 2)))
+        print("    %s (%d blocks) -> %s, bonus %.1f, debt_picks %d, "
+              "debt_swaps %d"
+              % (tag, n_blk, picks24[-1], bonus, e.n_debt_picks,
+                 e.n_debt_swaps))
+        if p is None:
+            fails.append("%s: no candidate was offered at all" % tag)
+    if p_off is None:
+        fails.append("case 24 lost its meaning: the plain policy found no "
+                     "sweep target in the two-room fixture")
+    else:
+        if picks24[0] is None or picks24[0][0] < 0:
+            fails.append("debt on the east room left the pick in the west room "
+                         "(%s): the bonus never reached the ranking"
+                         % (picks24[0],))
+        if picks24[0] is not None and (abs(picks24[0][0] - p_off[0]) < 0.5
+                                       and abs(picks24[0][1] - p_off[1]) < 0.5):
+            fails.append("the debt did not move the pick at all (%s vs %s)"
+                         % (picks24[0], (round(p_off[0], 2), round(p_off[1], 2))))
+        if picks24[1] is None or picks24[1][0] > 0:
+            fails.append("debt on the west room did not keep the pick in the "
+                         "west room (%s)" % (picks24[1],))
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (22 checks)")
+    print("verdict: PASS (24 checks)")
     return 0
 
 
