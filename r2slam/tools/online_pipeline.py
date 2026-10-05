@@ -904,6 +904,15 @@ def main():
                 "debt_blocks": (cmd or {}).get("debt_blocks"),
                 "debt_pick": (cmd or {}).get("debt_idle_pick_s"),
                 "debt_f": (cmd or {}).get("debt_f_pick"),
+                # The candidate-level term, per frame: `local_u` is the chosen
+                # place's own unfinished area in m2 (no history, no clock -- what
+                # the term saw at the moment the target was committed) and
+                # `local_term` that quantity as it entered the score
+                # (`lambda * u / (1 + d)`).  Both are the *committed* target's,
+                # so they hold steady for the life of a target and step when a
+                # new one is picked, which is what makes a single column readable.
+                "local_u": (cmd or {}).get("local_u_pick"),
+                "local_term": (cmd or {}).get("local_term_pick"),
                 # yaw and the clearance flag are logged because "the robot is
                 # not moving" has two completely different causes -- never
                 # commanded, or commanded but physically stuck -- and only
@@ -1234,6 +1243,22 @@ def main():
                      "debt_idle_pick_s": round(explorer.last_debt_idle_s, 1),
                      "debt_f_pick": round(explorer.last_debt_f, 3),
                      "debt_switches": explorer.debt_switches,
+                     # --- the candidate-level term ---------------------------
+                     # `n_local_swaps` is the debt's `debt_swaps` one layer
+                     # down: picks where the candidate-level term changed which
+                     # place won.  `n_local_swaps_bad` counts the same swaps that
+                     # moved to a place with **less** left, which with an additive
+                     # term can only come from the quantiser -- so a non-zero
+                     # reading is a real signal, not a curiosity.
+                     "cand_local_lambda": explorer.cand_local_lambda,
+                     "cand_local_radius_m": explorer.cand_local_radius_m,
+                     "local_picks": explorer.n_local_picks,
+                     "local_swaps": explorer.n_local_swaps,
+                     "local_swaps_bad": explorer.n_local_swaps_bad,
+                     "local_fallthrough": explorer.n_local_fallthrough,
+                     "local_u_pick": round(explorer.last_local_u_pick, 3),
+                     "local_margin": explorer.local_margin[-60:],
+                     "local_switches": explorer.local_switches,
                      # ... and the two that decide whether any of the above can
                      # ever matter: what each pick had to choose between, and how
                      # far apart the choices were.  A scoring term cannot be

@@ -76,6 +76,8 @@ class FrontierExplorer:
                  sweep_cands_per_patch: int = 1,
                  sweep_cand_sep_m: float = 1.00,
                  sweep_cand_sectors: int = 1,
+                 cand_local_lambda: float = 0.0,
+                 cand_local_radius_m: float = 1.00,
                  sweep_commit_frames: int = 300,
                  sweep_stuck_frames: int = 0,
                  sweep_stuck_improve_m: float = 0.50,
@@ -173,6 +175,54 @@ class FrontierExplorer:
         # sectors as seen from the robot.  See  for the measurement
         # that made this necessary.
         self.sweep_cand_sectors = max(int(sweep_cand_sectors), 1)
+        # --- the candidate-level term: what *this place* still has left -----
+        #
+        # Boss, 2026-10-05: "(1) finally connected the ranking to the power, but
+        # do not just move the old debt from patch level to candidate level and
+        # call it done -- first say what the local term is for, then check it can
+        # possibly work, and do it on the replay."
+        #
+        # What it is for.  `base = patch_area / (1 + d)` is **one number shared by
+        # every place in the patch** -- it can only answer "which patch is worth a
+        # trip".  The subdivision in section 22 created several places inside one
+        # patch, and the only thing that currently separates them is a
+        # nearest-first suffix.  The question `base` cannot ask is "which of these
+        # directions still has floor left that I have not been near", and that is
+        # what this term adds:
+        #
+        #     local_u(place) = m2 of (reachable AND never-visited) floor within
+        #                      `cand_local_radius_m` of that place
+        #
+        #     score = base + cand_local_lambda * local_u / (1 + d0)      <- this
+        #
+        # so it rides the **same** `1/(1+d)` travel-cost denominator as every
+        # other term in the ranking (the debt learned this the hard way: an
+        # uncoupled bonus is how "pay the biggest debt" becomes "cross the map").
+        # Note what it is *not*: it carries no clock and no history.  The debt died
+        # of two things -- a cap that erased "how long", and a candidate set with
+        # nothing to order -- and neither belongs in the first version of this.
+        # The time dimension is deliberately left out so that if this changes the
+        # decisions, the reason is unambiguous.
+        #
+        # `= 0` is the standing behaviour, exactly: the term is multiplied by
+        # lambda and added, so at zero the key is bit-for-bit the old key.  That is
+        # what keeps the A/B one variable, and case 27 in `tools/test_explore.py`
+        # holds it.
+        #
+        # Two gates, both measured on the frozen replay **before** any lambda
+        # scan is worth running (boss: "if the local quantity has no variance
+        # across candidates, stop -- do not tune lambda to keep the experiment
+        # alive").  `_record_local_margin` produces both; see its docstring.
+        self.cand_local_lambda = float(cand_local_lambda)
+        self.cand_local_radius_m = max(float(cand_local_radius_m), 1e-3)
+        self.last_local_u_pick = 0.0     # local_u of the place actually taken
+        self.last_local_term_pick = 0.0  # and the term it added to the score
+        self.n_local_picks = 0           # decisions where the term's choice was taken
+        self.n_local_swaps = 0           # ... and it differed from the term-off pick
+        self.n_local_swaps_bad = 0       # ... and moved to a place with *less* left
+        self.n_local_fallthrough = 0     # picks decided by routing, not by ranking
+        self.local_margin: List[dict] = []   # per pick: Gate 1 and Gate 2
+        self.local_switches: List[dict] = []  # the picks it changed, and to what
         self._dt = None
         self._dt_key = None
         # A sweep target is a *trip*, not a nudge, and it needs a commitment to
@@ -1171,6 +1221,69 @@ class FrontierExplorer:
         if len(self.debt_margin) > 400:
             del self.debt_margin[:200]
 
+    def _record_local_margin(self, cands, best_plain) -> None:
+        """Gate 1 and Gate 2 for the candidate-level term, measured before the scan.
+
+        Boss, 2026-10-05: *"do not just move the old debt from patch level to
+        candidate level -- first state what the local term is for, then check that
+        it can work at all; and if the local quantity has no variance across the
+        candidates, stop, do not tune lambda to keep the experiment alive."*
+
+        Two questions, both answerable on a frozen replay in one pass at
+        `cand_local_lambda = 0`, because they are properties of the candidate set
+        rather than of the term:
+
+        * **Gate 1 -- is there anything to order on?**  `spread = max u - min u`
+          across the candidates of this pick, and `gap = u_max - u_best_plain`
+          (does the place the standing policy would pick even have the most
+          left?).  If the spread is ~0 on most picks, the term is the patch-level
+          debt in new clothes -- it would add the same number to every candidate
+          and change nothing, which is exactly what the four-run distribution and
+          the eight-arm scan already measured once (docs sections 20-21).
+        * **Gate 2 -- could it move the head, and at what strength?**  The score
+          is `base + lambda * u_term`, so the standing winner `i` is displaced by
+          `j` exactly when
+
+              base_i + lambda u_i < base_j + lambda u_j
+              lambda > (base_i - base_j) / (u_j - u_i)
+
+          and the smallest such lambda over the candidates is **the pull this
+          pick needs, in units of the parameter**.  A median of 20 means the
+          shape is wrong, not the strength -- the debt's dose-response lesson, one
+          layer down.
+
+        `need = 0` is the ordinary case here and it is not a bug: every place in
+        one patch shares `base` exactly, so inside a patch **any** difference in
+        `u` decides.  That is precisely the competition the subdivision created.
+        What Gate 2 is really asking is the *between-patch* question, where `base`
+        is not tied -- so the reading to look at is the upper percentile, not the
+        median.
+        """
+        if len(cands) < 2:
+            return
+        bi, ui = float(best_plain[10]), float(best_plain[12])
+        need = float("inf")
+        for c in cands:
+            if c is best_plain:
+                continue
+            bj, uj = float(c[10]), float(c[12])
+            if uj - ui > 1e-12:
+                need = min(need, max((bi - bj) / (uj - ui), 0.0))
+        us = [float(c[11]) for c in cands]
+        us_term = [float(c[12]) for c in cands]
+        self.local_margin.append(dict(
+            # The frame's own stamp, not the exploration clock: `_debt_t` only
+            # advances when the debt is switched on, so with `debt_lambda = 0`
+            # every entry here would read t=0 and the "when did it first fire"
+            # question would be unanswerable from the record.
+            t=round(float(self._last_stamp or 0.0), 1), n=len(cands),
+            u_min=round(min(us), 3), u_max=round(max(us), 3),
+            u_plain=round(float(best_plain[11]), 3),
+            u_term_max=round(max(us_term), 4),
+            need_lam=(round(need, 3) if np.isfinite(need) else -1.0)))
+        if len(self.local_margin) > 400:
+            del self.local_margin[:200]
+
     def _note_pick_size(self, where: str, cands, x0: float = 0.0,
                         y0: float = 0.0) -> None:
         """Record what a pick was actually choosing between.
@@ -1229,6 +1342,14 @@ class FrontierExplorer:
 
         The `need_lam*` fields are the debt's own margin (see
         `_record_debt_margin`) and only appear when `debt_lambda > 0`.
+
+        `u_*` / `need_local_*` are the same two gates for the **candidate-level**
+        term (`cand_local_lambda`), and they are reported whether or not it is
+        switched on -- see `_record_local_margin`.  `u_spread_med` is Gate 1
+        ("is there a difference between the candidates at all") and
+        `need_local_p90` is Gate 2 read where it matters ("how much pull would the
+        between-patch case need"), since a within-patch pair shares `base` and
+        therefore needs none.
         """
         out: dict = {}
         if self.pick_sizes:
@@ -1258,6 +1379,30 @@ class FrontierExplorer:
                     w[2] += 1
             out["by_path"] = {k: "%d picks, %d with >=2, %d with >=4" % tuple(v)
                               for k, v in sorted(by_where.items())}
+        if self.local_margin:
+            us = np.array([m["u_max"] for m in self.local_margin])
+            spread = np.array([m["u_max"] - m["u_min"] for m in self.local_margin])
+            gap = np.array([m["u_max"] - m["u_plain"] for m in self.local_margin])
+            out.update(n_local_seen=len(self.local_margin),
+                       u_med=round(float(np.median(us)), 3),
+                       u_spread_med=round(float(np.median(spread)), 3),
+                       u_spread_p90=round(float(np.percentile(spread, 90)), 3),
+                       u_flat_frac=round(float((spread <= 1e-9).mean()), 3),
+                       u_gap_med=round(float(np.median(gap)), 3),
+                       u_gap_flat_frac=round(float((gap <= 1e-9).mean()), 3))
+            needs = [m["need_lam"] for m in self.local_margin
+                     if m["need_lam"] >= 0.0]
+            if needs:
+                a = np.array(needs, dtype=np.float64)
+                out.update(need_local_min=round(float(a.min()), 3),
+                           need_local_p10=round(float(np.percentile(a, 10)), 3),
+                           need_local_med=round(float(np.median(a)), 3),
+                           need_local_p90=round(float(np.percentile(a, 90)), 3),
+                           need_local_le0=round(float((a <= 1e-9).mean()), 3),
+                           need_local_le1=round(float((a <= 1.0).mean()), 3),
+                           need_local_le2=round(float((a <= 2.0).mean()), 3))
+            else:
+                out["need_local_inf"] = True
         if not self.debt_margin:
             return out
         needs = [m["need_lam"] for m in self.debt_margin if m["need_lam"] >= 0.0]
@@ -1719,6 +1864,32 @@ class FrontierExplorer:
                 taken.append((px, py))
             return taken
 
+        # --- the candidate-level quantity: what is left around a place -------
+        #
+        # A disc of offsets in cells, built once per pick.  `local_unfinished` is
+        # then a masked sum over `fresh` -- the same mask the patches themselves
+        # were cut out of, so "unfinished" means the same thing at both scales,
+        # and the robot's own footprint is already stamped out of it.
+        r_px = max(1, int(round(self.cand_local_radius_m / wmap.resolution)))
+        _dy, _dx = np.mgrid[-r_px:r_px + 1, -r_px:r_px + 1]
+        _off = np.argwhere((_dy * _dy + _dx * _dx) <= r_px * r_px) - r_px
+        _ny, _nx = fresh.shape
+
+        def local_unfinished(px: float, py: float) -> float:
+            """m2 of reachable, never-visited floor within `cand_local_radius_m`.
+
+            The one quantity this version adds, and it is deliberately the only
+            one: no clock, no history, no decay.  If the decisions change when it
+            is switched on, there is exactly one reason they changed.
+            """
+            cxx, cyy = wmap.cell_of(px, py)
+            xs_i = int(cxx) + _off[:, 1]
+            ys_i = int(cyy) + _off[:, 0]
+            ok = (xs_i >= 0) & (xs_i < _nx) & (ys_i >= 0) & (ys_i < _ny)
+            if not ok.any():
+                return 0.0
+            return float(fresh[ys_i[ok], xs_i[ok]].sum()) * cell
+
         def gather(labels, min_area):
             out = []
             for L in labels:
@@ -1764,12 +1935,32 @@ class FrontierExplorer:
                 # the same patch.
                 for px, py in patch_points(ys, xs, dep, wx, wy):
                     cd = float(np.hypot(px - x0, py - y0))
-                    out.append((self._rank_key(score, d0, tx_anchor, ty_anchor,
-                                               px, py, cd),
-                                d0, px, py, ncell, L,
-                                self._rank_key(base, d0, tx_anchor, ty_anchor,
-                                               px, py, cd),
-                                bonus, idle_s, w, base))
+                    # The candidate-level extra, in the same units as `base`:
+                    # m2 per metre of travel, so at lambda = 0 the key is exactly
+                    # the old key and the A/B is one variable.
+                    #
+                    # `u_term` is **stored on the tuple** rather than recomputed
+                    # by the instrument, so the gate arithmetic reads the number
+                    # the ranking actually used.  The debt round is the reason:
+                    # modelling the code instead of reading it is how "cap 1 vs
+                    # cap 9 changed nothing" stayed unexplained for a day.
+                    lu = local_unfinished(px, py)
+                    u_term = lu / (1.0 + d0)
+                    out.append((
+                        self._rank_key(score + self.cand_local_lambda * u_term,
+                                       d0, tx_anchor, ty_anchor, px, py, cd),
+                        d0, px, py, ncell, L,
+                        self._rank_key(base, d0, tx_anchor, ty_anchor,
+                                       px, py, cd),
+                        bonus, idle_s, w, base,
+                        lu, u_term,
+                        # The comparator for the local term: the key this place
+                        # would have had with `cand_local_lambda = 0`.  Only used
+                        # to answer "did the term change the answer", which is
+                        # the difference between the mechanism running and the
+                        # mechanism mattering.
+                        self._rank_key(score, d0, tx_anchor, ty_anchor,
+                                       px, py, cd)))
             # Biggest-and-nearest first, quantised so that two patches a few
             # percent apart do not change places on a floating-point hiccup.
             out.sort(key=lambda c: c[0])
@@ -1851,19 +2042,33 @@ class FrontierExplorer:
     def _plan_first(self, wmap, cands, x0, y0):
         """The first candidate the planner can actually route to, or None.
 
-        Also where the debt instrument lives.  `cands` carries, for every
-        candidate, the rank key it *would* have had with the debt switched off
-        (`c[6]`), the bonus it did carry (`c[7]`), the patch's mean neglect
-        (`c[8]`) and the weight that earned (`c[9]`).  So when a pick is made we
-        can say exactly how often the debt changed the answer, and when it did,
-        what it changed it *from* and *to* -- the two questions a dose-response
-        scan has to answer.  ("The mechanism ran" is not "the mechanism
-        mattered": that was the lesson of `wedge_abandons 0`.)
+        Also where the instruments live.  `cands` carries, for every candidate,
+        the rank key it *would* have had with the debt switched off (`c[6]`), the
+        bonus it did carry (`c[7]`), the patch's mean neglect (`c[8]`), the weight
+        that earned (`c[9]`), the candidate's own unfinished area in m2 (`c[11]`),
+        that same quantity as it entered the score (`c[12]`) and the key with the
+        local term switched off (`c[13]`).  So when a pick is made we can say
+        exactly how often each term changed the answer, and when it did, what it
+        changed it *from* and *to* -- the two questions a dose-response scan has
+        to answer.  ("The mechanism ran" is not "the mechanism mattered": that was
+        the lesson of `wedge_abandons 0`.)
         """
         best_plain = None
         if cands and self.debt_lambda > 0.0:
             best_plain = min(cands, key=lambda c: c[6])
             self._record_debt_margin(cands, best_plain)
+        # Gate 1 / Gate 2 are about the *quantity*, not the term, so this runs
+        # even at `cand_local_lambda = 0`.  The whole point of a gate is to say
+        # "do not run the scan" before the scan is paid for, and at lambda = 0 the
+        # comparator below is the same key as the one in use, so it costs one
+        # `min` and changes nothing.
+        best_local = None
+        top_used = None
+        if len(cands) >= 2:
+            best_local = min(cands, key=lambda c: c[13])
+            self._record_local_margin(cands, best_local)
+            if self.cand_local_lambda > 0.0:
+                top_used = min(cands, key=lambda c: c[0])
         for c in cands[:self.max_plans_per_pick]:
             tx, ty, ncell, L = float(c[2]), float(c[3]), int(c[4]), c[5]
             path = self.planner.plan(wmap, (x0, y0), (tx, ty))
@@ -1886,6 +2091,45 @@ class FrontierExplorer:
                                 idle_s=round(float(c[8]), 1),
                                 w=round(float(c[9]), 3),
                                 cells=ncell))
+                if best_local is not None:
+                    self.last_local_u_pick = float(c[11])
+                    self.last_local_term_pick = float(c[12])
+                    # A swap may only be counted when the term's own first choice
+                    # is the one that was taken.  Otherwise the pick fell through
+                    # to a lower rank for *routing* reasons -- the top candidate
+                    # was not plannable -- and both arms would have fallen through
+                    # together, so counting it would report a decision the term
+                    # never made.  This is the difference between "the mechanism
+                    # ran" and "the mechanism mattered", and getting it wrong is
+                    # how a mechanism looks busy while changing nothing.
+                    taken_is_top = (
+                        top_used is not None
+                        and abs(float(top_used[2]) - tx) < 1e-6
+                        and abs(float(top_used[3]) - ty) < 1e-6)
+                    if taken_is_top:
+                        if float(c[11]) > 0.0:
+                            self.n_local_picks += 1
+                        if (abs(best_local[2] - tx) > 1e-6
+                                or abs(best_local[3] - ty) > 1e-6):
+                            self.n_local_swaps += 1
+                            # The quality condition.  With an additive term and
+                            # the fall-through excluded, a swap can only land on a
+                            # place with less left through the quantiser
+                            # declaring two scores equal -- so a non-zero reading
+                            # here means the quantum is eating the term.
+                            if float(c[11]) <= float(best_local[11]) + 1e-9:
+                                self.n_local_swaps_bad += 1
+                            if len(self.local_switches) < 40:
+                                self.local_switches.append(dict(
+                                    t=round(float(self._last_stamp or 0.0), 1),
+                                    n=len(cands),
+                                    to=[round(tx, 2), round(ty, 2)],
+                                    frm=[round(float(best_local[2]), 2),
+                                         round(float(best_local[3]), 2)],
+                                    u_to=round(float(c[11]), 3),
+                                    u_frm=round(float(best_local[11]), 3)))
+                    elif self.cand_local_lambda > 0.0:
+                        self.n_local_fallthrough += 1
                 return tx, ty, path, ncell, L
             self.n_plan_failures += 1
         return None
@@ -2534,7 +2778,15 @@ class FrontierExplorer:
                       "debt_idle_s": round(self.max_debt_idle_s, 1),
                       "debt_blocks": self.n_debt_blocks,
                       "debt_idle_pick_s": round(self.last_debt_idle_s, 1),
-                      "debt_f_pick": round(self.last_debt_f, 3)}
+                      "debt_f_pick": round(self.last_debt_f, 3),
+                      # The chosen place's own unfinished area, in m2, every
+                      # frame.  Unlike the debt this carries no history, so the
+                      # reading is direct: it is what the term saw when the target
+                      # was last committed, and it goes to zero as the place is
+                      # worked on.  A run where it never leaves 0 is a run where
+                      # the term had nothing to say, whatever the counter says.
+                      "local_u_pick": round(self.last_local_u_pick, 3),
+                      "local_term_pick": round(self.last_local_term_pick, 4)}
 
         # Barren arrivals only end the run when the leftovers are all small.
         # Evaluated HERE, after the frontier is known, and deliberately after

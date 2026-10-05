@@ -327,6 +327,8 @@ def main():
                 debt_idle=_e.get("debt_idle_s", ""),
                 debt_pick=_e.get("debt_idle_pick_s", ""),
                 debt_f=_e.get("debt_f_pick", ""),
+                local_u=_e.get("local_u_pick", ""),
+                local_term=_e.get("local_term_pick", ""),
             ))
 
         if a.every > 1 and n % a.every:
@@ -348,6 +350,12 @@ def main():
               # live A/B would be measuring nothing.
               "n_debt_updates", "n_debt_blocks", "max_debt_idle_s",
               "n_debt_picks", "n_debt_swaps", "last_debt_idle_s", "last_debt_f",
+              # The candidate-level term's counters.  `n_local_swaps` is the one
+              # that has to be non-zero for a live A/B to be worth running, and
+              # `n_local_swaps_bad` is the quality condition -- swaps that moved
+              # to a place with *less* left, i.e. the quantiser eating the term.
+              "n_local_picks", "n_local_swaps", "n_local_swaps_bad",
+              "last_local_u_pick", "last_local_term_pick",
               "n_plans", "n_plan_failures", "n_blacklisted"):
         v = getattr(explorer, k, None)
         if v is not None:
@@ -454,6 +462,25 @@ def main():
             if hasattr(exr, "pick_stats"):
                 print("  %-14s %s" % (name, exr.pick_stats().get("by_path", {})))
 
+        # ---- the candidate-level term's own instrument ---------------------
+        #
+        # Boss, 2026-10-05: the acceptance for a scoring change is ">= 10% of the
+        # *decisions* the term dominates", not ">= 10% of the frames".  The
+        # denominator is the picks where the term's own first choice was actually
+        # taken -- picks decided by routing (the top candidate was not plannable,
+        # so both arms fall through together) are counted separately, because
+        # including them would report decisions the term never made.
+        print()
+        print("  %-14s %9s %9s %8s %9s" % ("arm", "decisions", "local sw",
+                                           "-> less", "fallthru"))
+        for name, exr in arms:
+            print("  %-14s %9s %9s %8s %9s"
+                  % (name, getattr(exr, "n_local_picks", 0),
+                     getattr(exr, "n_local_swaps", 0),
+                     getattr(exr, "n_local_swaps_bad", 0),
+                     getattr(exr, "n_local_fallthrough", 0)))
+        print("  （local sw / decisions 就是判据；`-> less` 若不为 0，说明量子在吃掉这一项）")
+
         if a.out:
             import json
             for name, exr in arms:
@@ -465,6 +492,23 @@ def main():
                                    overrides=a.arms or a.set,
                                    stats=exr.pick_stats(),
                                    switches=getattr(exr, "debt_switches", []),
+                                   # Gate 1 / Gate 2 for the candidate-level term,
+                                   # per pick: the u spread and the lambda each
+                                   # pick would have needed.  Dumped on every arm
+                                   # and at every lambda, because the gates are
+                                   # about the candidate set and have to be
+                                   # readable from the frozen control arm alone.
+                                   local_margin=getattr(exr, "local_margin", []),
+                                   local_switches=getattr(exr, "local_switches", []),
+                                   local=dict(
+                                       decisions=getattr(exr, "n_local_picks", 0),
+                                       swaps=getattr(exr, "n_local_swaps", 0),
+                                       swaps_bad=getattr(exr, "n_local_swaps_bad", 0),
+                                       fallthrough=getattr(exr,
+                                                           "n_local_fallthrough", 0),
+                                       lambda_=getattr(exr, "cand_local_lambda", 0.0),
+                                       radius_m=getattr(exr,
+                                                        "cand_local_radius_m", 0.0)),
                                    pick_sizes=getattr(exr, "pick_sizes", [])),
                               fh, ensure_ascii=False, indent=1)
                 print("  stats        : %s" % p)

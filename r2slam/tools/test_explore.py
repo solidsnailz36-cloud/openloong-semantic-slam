@@ -1486,13 +1486,117 @@ def main():
                          "offering several places (%.2f m): the candidates are "
                          "decorative" % d)
 
+    print("27) the candidate-level term: inert at zero, decisive when it differs")
+    # Boss, 2026-10-05: put ONE candidate-level quantity in (the unfinished area
+    # around a place), state what it is for, and prove it can work before paying
+    # for a lambda scan.  Four separate things have to hold and they are worth
+    # asserting separately, because three of them are the *negative* results the
+    # previous two rounds died of.
+    w27 = two_rooms()
+    e27 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                           sweep_cands_per_patch=4, cand_local_lambda=0.0)
+    r27, _x27 = e27._masks(w27, (0.0, 0.0))
+    p27_off = e27._pick_sweep_target(w27, r27, 0.0, 0.0)
+    st27 = e27.pick_stats()
+    cands27 = list(e27.last_sweep_cands)
+    # (a) invariance: at lambda = 0 the used key *is* the key with the term off
+    same = [c for c in cands27 if tuple(c[0]) == tuple(c[13])]
+    print("    lambda=0: %d/%d candidates have used key == term-off key; "
+          "pick %s" % (len(same), len(cands27),
+                       None if p27_off is None else
+                       "(%.2f, %.2f)" % (p27_off[0], p27_off[1])))
+    if not cands27 or len(same) != len(cands27):
+        fails.append("the local term is not inert at lambda=0 (%d of %d keys "
+                     "differ): the A/B would be two variables"
+                     % (len(cands27) - len(same), len(cands27)))
+    # (b) Gate 1 lives: there IS a difference to rank on, in this fixture
+    spread = max(float(c[11]) for c in cands27) - min(float(c[11]) for c in cands27)
+    print("    Gate 1: u spread %.2f m2 across %d candidates (u_flat_frac %s)"
+          % (spread, len(cands27), st27.get("u_flat_frac")))
+    if spread <= 0.5:
+        fails.append("the fixture offers only %.2f m2 of spread in the local "
+                     "quantity -- case 27 would be asserting about noise" % spread)
+    if st27.get("u_flat_frac") != 0.0:
+        fails.append("Gate 1 reports u_flat_frac=%r on a fixture with %.2f m2 of "
+                     "spread: the gate readout is not reading the candidates"
+                     % (st27.get("u_flat_frac"), spread))
+    # (c) Gate 2's arithmetic, cross-checked against the list it read.  The
+    # instrument must use the candidate's score contribution and nothing else --
+    # "cap 1 vs cap 9 changed nothing" is what happens when it does not.
+    best27 = min(cands27, key=lambda c: c[13])
+    want = min(max((float(best27[10]) - float(c[10]))
+                   / (float(c[12]) - float(best27[12])), 0.0)
+               for c in cands27
+               if c is not best27 and float(c[12]) - float(best27[12]) > 1e-12)
+    got = e27.local_margin[-1]["need_lam"]
+    print("    Gate 2: instrument says need_lam %.3f, recomputed from the "
+          "candidate list %.3f" % (got, want))
+    if abs(got - want) > 2e-3:
+        fails.append("the Gate 2 readout (%.3f) does not match the arithmetic "
+                     "recomputed from the candidate list (%.3f): the instrument "
+                     "and the ranking disagree about what the term adds"
+                     % (got, want))
+    # (d) the direction property: switched on hard, the pick must move, and it
+    # must move to a place with MORE left.  "The target moved" is worthless on
+    # its own -- boss: "if C has less local-unfinished than A, the utility is
+    # just disturbing the ranking".
+    e27b = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                            sweep_cands_per_patch=4, cand_local_lambda=20.0)
+    r27b, _y27 = e27b._masks(w27, (0.0, 0.0))
+    p27_on = e27b._pick_sweep_target(w27, r27b, 0.0, 0.0)
+    u_on = e27b.last_local_u_pick
+    u_off = e27.last_local_u_pick
+
+    def u_of(p, cands):
+        if p is None:
+            return float("nan")
+        for c in cands:
+            if abs(float(c[2]) - p[0]) < 1e-6 and abs(float(c[3]) - p[1]) < 1e-6:
+                return float(c[11])
+        return float("nan")
+
+    u_off2 = u_of(p27_off, cands27)
+    moved = (p27_off is None or p27_on is None
+             or abs(p27_on[0] - p27_off[0]) > 1e-6
+             or abs(p27_on[1] - p27_off[1]) > 1e-6)
+    po = None if p27_off is None else (round(p27_off[0], 2), round(p27_off[1], 2))
+    pn = None if p27_on is None else (round(p27_on[0], 2), round(p27_on[1], 2))
+    print("    lambda=0  -> %s u=%.2f | lambda=20 -> %s u=%.2f | swaps %d, "
+          "bad %d" % (po, u_off2, pn, u_on,
+                      e27b.n_local_swaps, e27b.n_local_swaps_bad))
+    if not moved:
+        fails.append("with the term at 20x the pick did not move (%s): either "
+                     "the term never reaches the ranking, or this fixture has "
+                     "nothing for it to say" % (po,))
+    elif not (u_on > u_off2 + 1e-9):
+        fails.append("the term moved the pick to a place with %.2f m2 left from "
+                     "one with %.2f m2 -- it moved the *wrong* way"
+                     % (u_on, u_off2))
+    if e27b.n_local_swaps_bad:
+        fails.append("%d of the local swaps went to a place with less left: the "
+                     "quantiser is eating the term" % e27b.n_local_swaps_bad)
+    # (e) ... and Gate 1 also has to be able to say NO.  A uniform corridor is
+    # the real failure mode: the bearing gate forces the places apart as
+    # directions, and in a straight corridor every one of them then sees exactly
+    # the same local world, so the term is flat.  This is the case that has to
+    # stop a scan, so it is asserted rather than hoped for.
+    e27c = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                            sweep_cands_per_patch=4, sweep_cand_sectors=8,
+                            cand_local_lambda=0.0)
+    r27c, _z27 = e27c._masks(w27, (0.0, 0.0))
+    e27c._pick_sweep_target(w27, r27c, 0.0, 0.0)
+    st27c = e27c.pick_stats()
+    print("    Gate 1 on a straight corridor with 8 bearing sectors: "
+          "u_spread_med %s, u_flat_frac %s"
+          % (st27c.get("u_spread_med"), st27c.get("u_flat_frac")))
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (26 checks)")
+    print("verdict: PASS (27 checks)")
     return 0
 
 
