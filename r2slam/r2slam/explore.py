@@ -91,8 +91,8 @@ class FrontierExplorer:
                  wedge_frames: int = 20, wedge_deny_m: float = 0.90,
                  goal_blocked_frames: int = 30,
                  score_quantum_m2: float = 0.25, rank_quantum_m: float = 0.25,
-                 debt_gain_m2: float = 1.0, debt_recall_s: float = 40.0,
-                 debt_cell_m: float = 1.0, debt_radius_m: float = 1.5,
+                 debt_lambda: float = 0.0, debt_grace_s: float = 20.0,
+                 debt_idle_cap_s: float = 120.0, debt_cell_m: float = 1.0,
                  debt_known_m2: float = 0.50, debt_fresh_m2: float = 0.25,
                  debt_cover_eps_m2: float = 0.10, debt_period_s: float = 1.0):
         self.v_max = float(v_max)
@@ -418,46 +418,86 @@ class FrontierExplorer:
         # they simply never came top of a ranking that only ever asks "what is
         # the biggest fresh patch per metre right now".
         #
-        # So each coarse block (`debt_cell_m`) accumulates a **debt** while three
-        # things hold at once:
-        #   * it is **known**   -- at least `debt_known_m2` of it has been seen
-        #     as floor, so this is not a wish about unmapped space;
-        #   * it is **unfinished** -- at least `debt_fresh_m2` of it is reachable
-        #     and has never been driven near (`reach & ~visited`);
-        #   * it is **not being worked on** -- it gained less than
-        #     `debt_cover_eps_m2` of new coverage since the last update.
-        # Whenever a block *does* gain coverage its debt is cancelled outright,
-        # and debt is capped at `debt_gain_m2`, so this cannot become a quota
-        # that forces the robot to tour the house: a region is only ever worth at
-        # most `debt_gain_m2` m2-equivalents, reached after `debt_recall_s` of
-        # being ignored, and the bonus rides the *same* `1/(1+distance)`
-        # denominator as every other term -- which is the travel-cost coupling
-        # that stops "pay the biggest debt" from turning into "cross the map".
+        # **This is the second shape of that idea, and the first one's failure is
+        # the reason for it.**  The first gave every 1 m block a score,
+        # `gain x min(idle / 40 s, 1)`, capped per block, and summed a 1.5 m
+        # window around each candidate.  Live, it changed 3 of 48 picks; the
+        # field reached its cap at t ~= 42 s and stayed there for 82% of every
+        # run; and raising the cap from 1 to 9 (**x9**) produced *bit-identical*
+        # decisions, so strength was never the binding constraint.  The shape
+        # was: the cap erased the difference between a region ignored 45 s and
+        # one ignored 200 s, and every candidate the sweep offers already sits on
+        # floor that has never been walked, so every candidate collected the same
+        # saturated bonus and the term cancelled out of the ranking.  It answered
+        # "has this block been looked after lately" instead of "which neglected
+        # region is the most overdue".
         #
-        # `debt_gain_m2 = 0` turns the whole mechanism off and reproduces the
-        # v19 policy exactly, on the same binary.
-        self.debt_gain_m2 = float(debt_gain_m2)
-        self.debt_recall_s = max(float(debt_recall_s), 1e-3)
+        # So the quantity is now a **region state**, not a per-candidate
+        # adjustment:
+        #
+        #     debt(region) ~ unfinished_area(region) x time_since_progress(region)
+        #
+        # and it is read off the two things the sweep already computes.  The
+        # *region* is a fresh patch -- a connected piece of reachable floor the
+        # robot has never been near, which is the only definition of "unfinished
+        # region" available without naming rooms: `reach & ~visited`, connected
+        # components.  Its **unfinished amount** is its area, which is already in
+        # the base score (`area / (1 + d)`), so what the debt adds is the **time**:
+        #
+        #     score = base x (1 + debt_lambda x f(idle_of_patch))
+        #
+        # which is the additive form `U = base + lambda x (base x f)` written
+        # once.  `f` is linear between `debt_grace_s` (below it, being ignored is
+        # queueing, not neglect) and `debt_idle_cap_s` (above it, nothing grows),
+        # and the cap is on the *time* rather than on the score -- that is the
+        # difference between "a region ignored 40 s and one ignored 200 s are
+        # worth the same" (the first version) and "neglect is worth more the
+        # longer it lasts, up to two minutes" (this one).  The whole term rides
+        # the base score, so it is divided by the same `1/(1+distance)`: a
+        # neglected region still has to be worth the walk.
+        #
+        # `debt_lambda = 0` turns it off and reproduces the v19 policy exactly on
+        # the same binary.  **It is the default, and the reason is measured, not
+        # a matter of taste** (docs section 21): an eight-arm zero-variance scan
+        # over cap = 40/60/90/120/180 s, grace = 0 and lambda = 2 produced
+        # *bit-identical* decisions, because (a) 41 of 43 picks in the capture
+        # offered at most one candidate at all, and (b) at every pick that did
+        # offer a choice, the plain winner already carried the maximum weight
+        # (`f_max - f_plain = 0`).  A candidate patch is `reach & ~visited` by
+        # construction, so the blocks that make up the candidates are exactly the
+        # ones without recent coverage: the term measures "has this been worked
+        # lately" on a set that is, by definition, not worked lately.  Kept in
+        # the tree, tested (cases 23-25) and instrumented, because the *candidate
+        # set* is the thing to fix next and this is the term that will be worth
+        # having once there is something to choose between.
+        self.debt_lambda = float(debt_lambda)
+        self.debt_grace_s = max(float(debt_grace_s), 0.0)
+        self.debt_idle_cap_s = max(float(debt_idle_cap_s),
+                                   self.debt_grace_s + 1e-3)
         self.debt_cell_m = max(float(debt_cell_m), 1e-3)
-        self.debt_radius_m = float(debt_radius_m)
         self.debt_known_m2 = float(debt_known_m2)
         self.debt_fresh_m2 = float(debt_fresh_m2)
         self.debt_cover_eps_m2 = float(debt_cover_eps_m2)
         self.debt_period_s = max(float(debt_period_s), 1e-3)
-        self._debt = None                # (nb, nb) m2-equivalents per block
-        self._debt_idle = None           # seconds each block has been ignored
+        self._debt_idle = None           # (nb, nb) seconds each block is ignored
         self._debt_cov = None            # coverage the block had last update
         self._debt_dt_acc = 0.0          # seconds since the last update
         self._debt_t = 0.0               # exploration clock, seconds
         self._last_stamp = None          # previous frame's own timestamp
-        self._debt_geo = None            # (block metres, extent, nb) for lookup
-        self._debt_offsets = None        # in-radius block offsets
+        self._debt_geo = None            # (block metres, extent, nb)
+        self._debt_block_px = 0          # block size in cells
         self.n_debt_updates = 0
-        self.n_debt_blocks = 0           # blocks carrying debt right now
+        self.n_debt_blocks = 0           # blocks past the grace period
         self.n_debt_eligible = 0         # blocks that meet the three conditions
-        self.max_debt_m2 = 0.0
-        self.n_debt_swaps = 0            # picks the bonus changed the winner of
+        self.max_debt_idle_s = 0.0
+        self.n_debt_swaps = 0            # picks the debt changed the winner of
         self.n_debt_picks = 0            # picks whose target carried a bonus
+        self.last_debt_idle_s = 0.0      # the chosen patch's mean neglect
+        self.last_debt_f = 0.0           # and the weight it earned
+        self.debt_switches: List[dict] = []   # first few swaps, for the scan
+        self.debt_margin: List[dict] = []     # per pick: the lambda it needed
+        self.pick_sizes: List[dict] = []      # per pick: how many candidates
+        self.last_sweep_cands: list = []      # the ranked list, for probes
 
         self.n_sweep_abandoned = 0
         self._sw_best = float("inf")
@@ -1057,48 +1097,181 @@ class FrontierExplorer:
         return self._visited
 
     # ---- unfinished-region debt ------------------------------------------
-    def _debt_bonus(self, tx: float, ty: float) -> float:
-        """m2-equivalents of accumulated debt around a candidate target.
+    def _record_debt_margin(self, cands, best_plain) -> None:
+        """How much `debt_lambda` this pick would have needed to go elsewhere.
 
-        The block the target sits in is not enough -- a target is often the deep
-        cell of a patch, or a viewpoint on the *shore* of one, and both can land
-        a block away from the region they serve.  Summing a disc of radius
-        `debt_radius_m` means a candidate inherits the neglect of the place it is
-        about to work on, and `debt_gain_m2` caps each block, so the sum is
-        bounded by (number of blocks in the disc) x `debt_gain_m2`.
+        The question a dose-response is supposed to answer is "is this term too
+        weak, or is it the wrong shape" -- and running the thing at lambda = 1, 3
+        and 9 and finding the same decisions tells you only that those three are
+        on the same side of the threshold.  This measures the threshold itself.
+
+        With `score = base x (1 + lambda x f)`, the plain winner `i` is displaced
+        by some candidate `j` exactly when
+
+            base_j (1 + lambda f_j) > base_i (1 + lambda f_i)
+            lambda > (base_i - base_j) / (base_j f_j - base_i f_i)
+
+        so the minimum such lambda over all candidates is **the pull this pick
+        would have needed**, in units of the parameter itself.  Recording it per
+        pick turns "it never fired" into a distribution: if the median pick needs
+        lambda = 8 and the maximum available weight difference is 1, then no
+        setting of lambda will do anything, and the term is not weak -- it is
+        measuring something that does not vary across the candidates on offer.
         """
-        if self._debt is None or self._debt_geo is None or self.debt_gain_m2 <= 0.0:
+        if len(cands) < 2:
+            return
+        bi, fi = float(best_plain[10]), float(best_plain[9])
+        need = float("inf")
+        gap = 0.0
+        for c in cands:
+            if c is best_plain:
+                continue
+            bj, fj = float(c[10]), float(c[9])
+            den = bj * fj - bi * fi
+            if den > 1e-9:
+                need = min(need, (bi - bj) / den)
+            if bj > 0:
+                gap = max(gap, bi / bj - 1.0)
+        self.debt_margin.append(dict(
+            t=round(self._debt_t, 1), n=len(cands),
+            need_lam=(round(need, 3) if np.isfinite(need) else -1.0),
+            base_gap=round(gap, 3), f_plain=round(fi, 3),
+            f_max=round(max(float(c[9]) for c in cands), 3)))
+        if len(self.debt_margin) > 400:
+            del self.debt_margin[:200]
+
+    def _note_pick_size(self, where: str, cands) -> None:
+        """Record how many candidates a pick was actually choosing between.
+
+        This is the measurement that decides whether *any* re-ranking mechanism
+        can work, and it is not implied by a swap count: with one candidate on
+        the table there is nothing to reorder, so `debt_swaps = 0` can mean
+        "the term is too weak" or "there was never a choice", and those two have
+        opposite fixes.  Recorded per pick, with the path that produced it,
+        because the sweep reaches its decision three different ways -- the
+        survey rule, the patch lock and its failure fallbacks -- and only some of
+        them ever present more than one option.
+        """
+        self.pick_sizes.append(dict(t=round(self._debt_t, 1), where=where,
+                                    n=len(cands)))
+        if len(self.pick_sizes) > 600:
+            del self.pick_sizes[:300]
+
+    def debt_margin_stats(self) -> dict:
+        """Percentiles of the pull each pick would have needed, and the sizes of
+        the choice sets it was drawn from.
+
+        `need_lam` is in units of `debt_lambda` itself, so the reading is direct:
+        "the median pick would have needed lambda = 8" means the term as
+        configured (1.0) is 8x too small *if* strength is what is missing; "and
+        the smallest need over the whole run is 3.4" means there is no setting
+        that would have fired at all, i.e. the term is measuring something that
+        does not vary across the candidates on offer.  `need_lam_inf` counts the
+        picks where no lambda could flip the head, because the plain winner also
+        had the maximum weight available.
+
+        `pick_sizes` says whether there was a choice at all, which has to be read
+        first: a re-ranking mechanism cannot be evaluated on picks that offered
+        one candidate.
+        """
+        out: dict = {}
+        if self.pick_sizes:
+            sizes = np.array([p["n"] for p in self.pick_sizes], dtype=np.float64)
+            out.update(n_picks_seen=len(sizes),
+                       cand_1=int((sizes <= 1).sum()),
+                       cand_2_3=int(((sizes >= 2) & (sizes <= 3)).sum()),
+                       cand_4p=int((sizes >= 4).sum()),
+                       cand_med=float(np.median(sizes)),
+                       cand_max=int(sizes.max()))
+            by_where: dict = {}
+            for p in self.pick_sizes:
+                w = by_where.setdefault(p["where"], [0, 0, 0])
+                w[0] += 1
+                if p["n"] >= 2:
+                    w[1] += 1
+                if p["n"] >= 4:
+                    w[2] += 1
+            out["by_path"] = {k: "%d picks, %d with >=2, %d with >=4" % tuple(v)
+                              for k, v in sorted(by_where.items())}
+        if not self.debt_margin:
+            return out
+        needs = [m["need_lam"] for m in self.debt_margin if m["need_lam"] >= 0.0]
+        inf_n = sum(1 for m in self.debt_margin if m["need_lam"] < 0.0)
+        out.update(n_margin=len(self.debt_margin), need_lam_inf=inf_n)
+        if needs:
+            a = np.array(needs, dtype=np.float64)
+            out.update(need_lam_min=round(float(a.min()), 2),
+                       need_lam_p10=round(float(np.percentile(a, 10)), 2),
+                       need_lam_med=round(float(np.median(a)), 2),
+                       need_lam_p90=round(float(np.percentile(a, 90)), 2))
+        fg = [m["f_max"] - m["f_plain"] for m in self.debt_margin]
+        if fg:
+            out["f_gap_med"] = round(float(np.median(fg)), 3)
+            out["f_gap_max"] = round(float(np.max(fg)), 3)
+        return out
+
+    def _debt_f(self, idle_s: float) -> float:
+        """Map "how long this region has been left alone" onto [0, 1].
+
+        `debt_grace_s` is a dead zone -- being ignored for 15 s is not neglect,
+        it is queueing -- and `debt_idle_cap_s` stops the term growing without
+        bound, which is what keeps a forgotten corner from outbidding a nearby
+        room forever.  Between the two it is **linear**, and that is the whole
+        point of this version: the previous one clipped at `debt_recall_s = 40`,
+        so a region ignored 40 s and one ignored 200 s were worth exactly the
+        same and the term could not order them at all.
+        """
+        span = max(self.debt_idle_cap_s - self.debt_grace_s, 1e-6)
+        return float(np.clip((idle_s - self.debt_grace_s) / span, 0.0, 1.0))
+
+    def _debt_idle_of_patch(self, ys: np.ndarray, xs: np.ndarray) -> float:
+        """Mean neglect of a fresh patch, in seconds.
+
+        The patch is the region: a connected piece of reachable floor the robot
+        has never been near.  Its "unfinished amount" is its area -- which is
+        already in the base score -- and this is its *time*: the area-weighted
+        (here: per-cell, and every cell is the same size) mean of how long each
+        of its blocks has been sitting there undone.
+
+        A mean and not a min or a max, because both extremes are wrong in a way
+        a run would show: a max lets one stale corner keep a region we just
+        worked in the ranking, and a min lets one freshly-glimpsed sliver reset
+        a room that has otherwise been ignored for minutes.
+        """
+        if self._debt_idle is None or self._debt_block_px <= 0:
             return 0.0
-        blk_m, extent, nb = self._debt_geo
-        cx = int(np.floor((tx + extent) / blk_m))
-        cy = int(np.floor((ty + extent) / blk_m))
-        if not (0 <= cx < nb and 0 <= cy < nb):
+        b = self._debt_block_px
+        by = np.clip(ys // b, 0, self._debt_idle.shape[0] - 1)
+        bx = np.clip(xs // b, 0, self._debt_idle.shape[1] - 1)
+        if not len(by):
             return 0.0
-        tot = 0.0
-        for dy, dx in self._debt_offsets:
-            x, y = cx + dx, cy + dy
-            if 0 <= x < nb and 0 <= y < nb:
-                tot += float(self._debt[y, x])
-        return tot
+        return float(self._debt_idle[by, bx].mean())
 
     def _debt_update(self, wmap, reach, dt) -> None:
-        """Accumulate neglect time, then recompute the debt field.
+        """Accumulate neglect time per block.  Once per frame, applied at most
+        every `debt_period_s`.
 
-        Called once per frame from `command`; the expensive part (a blockwise
-        reduction over the map) runs at most once every `debt_period_s`.
+        What is stored is **time**, not a score.  A block of an unfinished
+        region gains `dt` for as long as it is known, still partly unvisited,
+        and not gaining coverage; anything else resets it to zero.  The value of
+        that time is decided later, per candidate, by `_debt_f` and the patch it
+        belongs to -- because "how bad is 90 s of neglect" depends on how much
+        there is to do there, and that is a property of the region, not of the
+        block.
+
         `dt is None` means "this caller has no clock", in which case nothing is
-        updated: an unknown time step would silently turn `debt_recall_s` into a
-        frame count and make the same code mean 8 s on one dataset and 4 s on
+        updated: an unknown time step would silently turn the grace and cap into
+        frame counts and make the same code mean 8 s on one dataset and 4 s on
         another.
         """
-        if self.debt_gain_m2 <= 0.0 or dt is None:
+        if self.debt_lambda <= 0.0 or dt is None:
             return
         dt = float(dt)
         if not np.isfinite(dt) or dt <= 0.0:
             return
         self._debt_t += dt
         self._debt_dt_acc += dt
-        if self._debt is not None and self._debt_dt_acc < self.debt_period_s:
+        if self._debt_idle is not None and self._debt_dt_acc < self.debt_period_s:
             return
         elapsed = self._debt_dt_acc
         self._debt_dt_acc = 0.0
@@ -1106,7 +1279,6 @@ class FrontierExplorer:
         res = float(wmap.resolution)
         n = wmap.ground.shape[0]
         b = max(1, int(round(self.debt_cell_m / res)))
-        blk_m = b * res
         nb = int(np.ceil(n / b))
         cell = res * res
         pad = nb * b - n
@@ -1123,36 +1295,28 @@ class FrontierExplorer:
         known_a = blk(wmap.ground_ever)
         fresh_a = reach_a - cov_a
 
-        if self._debt is None or self._debt.shape != (nb, nb):
-            self._debt = np.zeros((nb, nb), np.float32)
+        if self._debt_idle is None or self._debt_idle.shape != (nb, nb):
             self._debt_idle = np.zeros((nb, nb), np.float32)
             self._debt_cov = np.zeros((nb, nb), np.float32)
-            self._debt_geo = (blk_m, float(wmap.extent), nb)
-            rb = int(np.ceil(self.debt_radius_m / blk_m))
-            self._debt_offsets = tuple(
-                (dy, dx)
-                for dy in range(-rb, rb + 1) for dx in range(-rb, rb + 1)
-                if float(np.hypot(dx, dy)) * blk_m <= self.debt_radius_m + 1e-9)
+            self._debt_geo = (b * res, float(wmap.extent), nb)
+            self._debt_block_px = b
 
         gained = cov_a - self._debt_cov
         np.maximum(self._debt_cov, cov_a, out=self._debt_cov)
         eligible = ((known_a >= self.debt_known_m2)
                     & (fresh_a >= self.debt_fresh_m2))
         working = gained >= self.debt_cover_eps_m2
-        # `working` cancels the debt outright -- not decays it.  A region that is
-        # being covered is not in debt, and a decay would leave a residue that
-        # keeps pulling the robot back to a room it has already finished.
+        # `working` cancels the neglect outright -- not decays it.  A region that
+        # is being covered is not neglected, and a decay would leave a residue
+        # that keeps pulling the robot back to a room it has already finished.
         self._debt_idle = np.where(working, 0.0,
                                    np.where(eligible, self._debt_idle + elapsed,
-                                            0.0))
-        k = self.debt_gain_m2 / self.debt_recall_s
-        self._debt = np.minimum(k * self._debt_idle, self.debt_gain_m2).astype(
-            np.float32)
+                                            0.0)).astype(np.float32)
 
         self.n_debt_updates += 1
-        self.n_debt_blocks = int((self._debt > 0.0).sum())
-        self.max_debt_m2 = float(self._debt.max())
+        self.n_debt_blocks = int((self._debt_idle >= self.debt_grace_s).sum())
         self.n_debt_eligible = int(eligible.sum())
+        self.max_debt_idle_s = float(self._debt_idle.max())
 
     def _fresh_area(self, wmap, reach, x0, y0) -> float:
         """Walkable floor the robot has never been near, in m2.
@@ -1455,18 +1619,23 @@ class FrontierExplorer:
                 tx, ty = float(wx[j]), float(wy[j])
                 if self._is_denied(tx, ty):
                     continue
-                bonus = self._debt_bonus(tx, ty)
-                # The debt rides the *same* denominator as the patch size, which
-                # is the coupling that keeps "pay the biggest debt" from
-                # becoming "cross the map": what is ranked is still
-                # m2-per-metre, the debt is just another kind of m2.
-                score = (ncell * cell + bonus) / (1.0 + d0)
-                plain = ncell * cell / (1.0 + d0)
+                # The region's own neglect, read off the patch -- see the note on
+                # `debt_lambda` in `__init__` for why the term lives here and
+                # nowhere else.  `base` already carries the unfinished *amount*
+                # (the patch area) and the travel cost (the `1/(1+d)`), so what
+                # the debt adds is the *time*.
+                base = ncell * cell / (1.0 + d0)
+                idle_s = self._debt_idle_of_patch(ys, xs)
+                w = self.debt_lambda * self._debt_f(idle_s)
+                score = base * (1.0 + w)
+                bonus = base * w
                 out.append((self._rank_key(score, d0, tx, ty), d0, tx, ty,
-                            ncell, L, self._rank_key(plain, d0, tx, ty), bonus))
+                            ncell, L, self._rank_key(base, d0, tx, ty), bonus,
+                            idle_s, w, base))
             # Biggest-and-nearest first, quantised so that two patches a few
             # percent apart do not change places on a floating-point hiccup.
             out.sort(key=lambda c: c[0])
+            self.last_sweep_cands = out
             return out
 
         # --- the survey, re-evaluated every pick (no latch) ----------------
@@ -1506,6 +1675,8 @@ class FrontierExplorer:
             cands = gather([locked], self.sweep_patch_keep_m2)
         else:
             cands = all_c
+        self._note_pick_size("survey" if survey_pick else
+                             ("locked" if locked else "global"), cands)
         picked = self._plan_first(wmap, cands, x0, y0)
         if picked is None and locked:
             # The locked patch has nothing plannable left.  Drop the lock and
@@ -1513,13 +1684,15 @@ class FrontierExplorer:
             # frame with no target at all.
             self._sweep_patch_mask = None
             cands = gather(range(1, n), self.sweep_min_m2)
+            self._note_pick_size("lock-failed", cands)
             picked = self._plan_first(wmap, cands, x0, y0)
         if picked is None and survey_pick and self._survey_stops:
             # Every "somewhere else" candidate was unroutable.  Take the best of
             # the rest rather than reporting "nothing to sweep" -- the spread
             # rule is a preference about *order*, not a reason to stop working.
-            picked = self._plan_first(wmap, gather(range(1, n), self.sweep_min_m2),
-                                      x0, y0)
+            cands = gather(range(1, n), self.sweep_min_m2)
+            self._note_pick_size("survey-failed", cands)
+            picked = self._plan_first(wmap, cands, x0, y0)
         if picked is None:
             return None
         tx, ty, path, ncell, L = picked
@@ -1539,27 +1712,41 @@ class FrontierExplorer:
     def _plan_first(self, wmap, cands, x0, y0):
         """The first candidate the planner can actually route to, or None.
 
-        Also where the debt instrument lives: `cands` carries, for every
+        Also where the debt instrument lives.  `cands` carries, for every
         candidate, the rank key it *would* have had with the debt switched off
-        (`c[6]`) and the bonus it did carry (`c[7]`).  So when a pick is made we
-        can say exactly how often the debt changed the answer -- the difference
-        between "the mechanism ran" and "the mechanism mattered", which is the
-        mistake `wedge_abandons 0` made one round ago.
+        (`c[6]`), the bonus it did carry (`c[7]`), the patch's mean neglect
+        (`c[8]`) and the weight that earned (`c[9]`).  So when a pick is made we
+        can say exactly how often the debt changed the answer, and when it did,
+        what it changed it *from* and *to* -- the two questions a dose-response
+        scan has to answer.  ("The mechanism ran" is not "the mechanism
+        mattered": that was the lesson of `wedge_abandons 0`.)
         """
         best_plain = None
-        if cands and self.debt_gain_m2 > 0.0:
+        if cands and self.debt_lambda > 0.0:
             best_plain = min(cands, key=lambda c: c[6])
+            self._record_debt_margin(cands, best_plain)
         for c in cands[:self.max_plans_per_pick]:
             tx, ty, ncell, L = float(c[2]), float(c[3]), int(c[4]), c[5]
             path = self.planner.plan(wmap, (x0, y0), (tx, ty))
             if path:
                 self.n_plans += 1
                 if best_plain is not None:
+                    self.last_debt_idle_s = float(c[8])
+                    self.last_debt_f = float(c[9])
                     if float(c[7]) > 0.0:
                         self.n_debt_picks += 1
                     if (abs(best_plain[2] - tx) > 1e-6
                             or abs(best_plain[3] - ty) > 1e-6):
                         self.n_debt_swaps += 1
+                        if len(self.debt_switches) < 40:
+                            self.debt_switches.append(dict(
+                                t=round(self._debt_t, 1),
+                                to=[round(tx, 2), round(ty, 2)],
+                                frm=[round(float(best_plain[2]), 2),
+                                     round(float(best_plain[3]), 2)],
+                                idle_s=round(float(c[8]), 1),
+                                w=round(float(c[9]), 3),
+                                cells=ncell))
                 return tx, ty, path, ncell, L
             self.n_plan_failures += 1
         return None
@@ -1670,7 +1857,12 @@ class FrontierExplorer:
             _k, vx, vy, _nv = best
             if self._is_denied(vx, vy) or self._is_denied(mx, my):
                 continue
-            score = (area + self._debt_bonus(vx, vy)) / (1.0 + d0)
+            # No debt bonus here, deliberately.  A shadow viewpoint is not a
+            # region and has no area of its own -- the first version added the
+            # same window bonus to these candidates as to the sweep's and it only
+            # made the term noisier: a point-like candidate can never express
+            # "a large unfinished region" (see the note on `debt_lambda`).
+            score = area / (1.0 + d0)
             cands.append((self._rank_key(score, d0, vx, vy),
                           vx, vy, mx, my, int(sz[L])))
         cands.sort(key=lambda c: c[0])
@@ -1875,31 +2067,15 @@ class FrontierExplorer:
         if not pool:
             return None, None, 0
 
-        # The frontier's own score is `size / (1 + d)` in **cells**, so the debt
-        # arrives in cells too (`/ cell`) -- same units as the term it is added
-        # to, which keeps every kind of candidate ranking "m2 per metre" and
-        # makes one block of full debt worth exactly the same as one square
-        # metre added to the cluster.
-        cell = wmap.resolution ** 2
-        _bon = {}
-
-        def bonus(i):
-            b = _bon.get(i)
-            if b is None:
-                b = self._debt_bonus(float(wx[i]), float(wy[i]))
-                _bon[i] = b
-            return b
-
+        # No debt bonus here either -- see the note in `_pick_shadow_target`.
+        # A frontier cell is the edge of the *unknown*; the debt is about mapped
+        # floor left unfinished, and there is no region of that kind here to
+        # measure.  In the first version this candidate kind got the same window
+        # bonus as the sweep's, which only made the term a constant.
         def score(i):
             # Quantised: see `_rank_key`.  The frontier score has the same
             # near-tie problem as the sweep and shadow scores -- `size/(1+d)`
             # between a 30-cell and a 31-cell cluster is a coin flip.
-            return self._rank_key((fsize[i] + bonus(i) / cell) / (1.0 + dist[i]),
-                                  float(dist[i]), float(wx[i]), float(wy[i]))
-
-        def plain(i):
-            """The same key with the debt switched off -- the instrument's
-            control arm, used only to say whether the debt changed the pick."""
             return self._rank_key(fsize[i] / (1.0 + dist[i]), float(dist[i]),
                                   float(wx[i]), float(wy[i]))
 
@@ -1917,18 +2093,6 @@ class FrontierExplorer:
         # Only the head of the list is worth a search: each plan is a flood fill
         # in the worst case, and if the ten best-looking frontiers are all
         # unreachable the eleventh will not save the day.
-        best_plain = (min(cand, key=plain) if (cand and self.debt_gain_m2 > 0.0)
-                      else None)
-
-        def take(i: int, route, n_cand: int):
-            """Return the pick, and record what the debt did to it."""
-            if best_plain is not None:
-                if bonus(i) > 0.0:
-                    self.n_debt_picks += 1
-                if int(best_plain) != int(i):
-                    self.n_debt_swaps += 1
-            return i, route, n_cand
-
         n_tried = 0
         for i in cand:
             near = dist[i] <= self.centre_tol
@@ -1936,13 +2100,13 @@ class FrontierExplorer:
                 if int(front[ys[i] - 2:ys[i] + 3, xs[i] - 2:xs[i] + 3].sum()) < 2:
                     continue
             if self._clear(wmap, x0, y0, wx[i], wy[i]):
-                return take(i, None, len(cand))
+                return i, None, len(cand)
             if n_tried >= self.max_plans_per_pick:
                 continue
             n_tried += 1
             path = self._plan(wmap, pose, (float(wx[i]), float(wy[i])))
             if path:
-                return take(i, path, len(cand))
+                return i, path, len(cand)
         return None, None, len(cand)
 
 
@@ -2202,7 +2366,7 @@ class FrontierExplorer:
                               "why": self.n_done_reason,
                               "area_m2": round(area, 1),
                               "fresh_m2": round(knowledge, 1),
-                              "debt_max": round(self.max_debt_m2, 3),
+                              "debt_idle_s": round(self.max_debt_idle_s, 1),
                               "debt_blocks": self.n_debt_blocks}
         inside, facing_out, front = self._usable_frontier(wmap, free, unknown,
                                                          reach, exterior)
@@ -2224,8 +2388,14 @@ class FrontierExplorer:
                       # The debt field, sampled every frame: the shape that
                       # says whether the mechanism is alive.  Rising = a region
                       # is being ignored; falling to zero = it got worked on.
-                      "debt_max": round(self.max_debt_m2, 3),
-                      "debt_blocks": self.n_debt_blocks}
+                      # `debt_idle_s` is in **seconds** (the longest-neglected
+                      # block); the first version wrote m2 here under the name
+                      # `debt_max`, and a column whose unit changed silently
+                      # between builds is a trap for whoever reads the CSV next.
+                      "debt_idle_s": round(self.max_debt_idle_s, 1),
+                      "debt_blocks": self.n_debt_blocks,
+                      "debt_idle_pick_s": round(self.last_debt_idle_s, 1),
+                      "debt_f_pick": round(self.last_debt_f, 3)}
 
         # Barren arrivals only end the run when the leftovers are all small.
         # Evaluated HERE, after the frontier is known, and deliberately after

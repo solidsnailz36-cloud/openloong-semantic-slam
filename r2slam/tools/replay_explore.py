@@ -134,6 +134,18 @@ def main():
                          "of the harness is that a policy change can be compared "
                          "on the same capture; a change that cannot be expressed "
                          "as a parameter has to be compared some other way.")
+    ap.add_argument("--arms", action="append", default=[], metavar="NAME:K=V,K=V",
+                    help="run SEVERAL policies on the *same* map sequence, one "
+                         "explorer per arm, interleaved frame by frame.  This is "
+                         "the zero-variance parameter scan: separate replays are "
+                         "reproducible to ~5e-7 m but not bit-identical, and that "
+                         "is enough to flip a discrete choice (section 17.3), so "
+                         "arms that share one perception pass are strictly better "
+                         "evidence than arms that do not.  Repeatable; with "
+                         "--arms the report becomes a comparison table and --out "
+                         "gets one CSV per arm.  Example: "
+                         "--arms 'T=40:debt_idle_cap_s=40' "
+                         "--arms 'T=120:debt_idle_cap_s=120'")
     a = ap.parse_args()
 
     cfg = load_config(a.config)
@@ -155,15 +167,51 @@ def main():
                                num_threads=rt.detector_threads)
         print("detector    : %s (%s)" % (det.kind, name))
 
-    explorer = FrontierExplorer(v_max=0.55, w_max=0.9,
-                                **parse_overrides(a.set))
+    arms: list = []
+
+    def _parse_arm(spec: str):
+        name, _, kv = spec.partition(":")
+        ov = {}
+        for part in kv.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            k, _, v = part.partition("=")
+            if not k:
+                continue
+            try:
+                ov[k.strip()] = int(v)
+            except ValueError:
+                try:
+                    ov[k.strip()] = float(v)
+                except ValueError:
+                    ov[k.strip()] = v.strip()
+        return name.strip() or "arm", ov
+
+    if a.arms:
+        for spec in a.arms:
+            name, ov = _parse_arm(spec)
+            arms.append((name, FrontierExplorer(v_max=0.55, w_max=0.9, **ov)))
+    else:
+        arms.append(("base", FrontierExplorer(v_max=0.55, w_max=0.9,
+                                              **parse_overrides(a.set))))
+    explorer = arms[0][1]
     # The replay has no driver, so the explorer must be told the same thing the
     # live run told it: a *fresh* instance starts at "init".
     print("explorer    : %s" % ("sweep+shadow" if explorer.sweep else "frontier only"))
+    for name, ex in arms:
+        if len(arms) > 1:
+            print("  arm       : %-14s lambda=%.2f  grace=%.0f s  cap=%.0f s"
+                  % (name, ex.debt_lambda, ex.debt_grace_s, ex.debt_idle_cap_s))
+        else:
+            print("  debt      : lambda=%.2f  grace=%.0f s  cap=%.0f s"
+                  % (ex.debt_lambda, ex.debt_grace_s, ex.debt_idle_cap_s))
     for k, v in parse_overrides(a.set).items():
         print("  override  : %s = %r" % (k, v))
+    if a.arms and a.probe:
+        print("  probe     : ignored with --arms (a probe needs one explorer)")
 
-    rows_out = []
+    rows_out: dict = {}
     pose_rows = []
     prev_stamp = None
     n = 0
@@ -226,6 +274,14 @@ def main():
 
         v, w, ex = explorer.command(wmap, (t[0], t[1]), yaw,
                                     stamp=float(fr.stamp))
+        results = []
+        for name, exr in arms:
+            if exr is explorer:
+                _v, _w, _e = v, w, ex
+            else:
+                _v, _w, _e = exr.command(wmap, (t[0], t[1]), yaw,
+                                         stamp=float(fr.stamp))
+            results.append((name, exr, _v, _w, _e))
 
         if a.poses:
             pose_rows.append((float(fr.stamp), float(t[0]), float(t[1]),
@@ -254,20 +310,24 @@ def main():
                          n_denied=len(getattr(explorer, "_denied", []) or []),
                      )))
 
-        rows_out.append(dict(
-            frame=idx, stamp=float(fr.stamp), x=float(t[0]), y=float(t[1]),
-            yaw=yaw, v=float(v), w=float(w),
-            state=str(ex.get("state", "")), mode=str(ex.get("mode", "")),
-            target_x=(ex.get("target") or ("", ""))[0],
-            target_y=(ex.get("target") or ("", ""))[1],
-            target_kind=str(ex.get("target_kind", "")),
-            heading_err_deg=ex.get("heading_err_deg", ""),
-            ahead_clear=int(bool(ex.get("ahead_clear", False))),
-            wedge=int(bool(ex.get("wedge", False))),
-            routed=int(bool(ex.get("routed", False))),
-            dist=ex.get("dist", ""),
-            nf=ex.get("nf", ""),
-        ))
+        for name, exr, _v, _w, _e in results:
+            rows_out.setdefault(name, []).append(dict(
+                frame=idx, stamp=float(fr.stamp), x=float(t[0]), y=float(t[1]),
+                yaw=yaw, v=float(_v), w=float(_w),
+                state=str(_e.get("state", "")), mode=str(_e.get("mode", "")),
+                target_x=(_e.get("target") or ("", ""))[0],
+                target_y=(_e.get("target") or ("", ""))[1],
+                target_kind=str(_e.get("target_kind", "")),
+                heading_err_deg=_e.get("heading_err_deg", ""),
+                ahead_clear=int(bool(_e.get("ahead_clear", False))),
+                wedge=int(bool(_e.get("wedge", False))),
+                routed=int(bool(_e.get("routed", False))),
+                dist=_e.get("dist", ""),
+                nf=_e.get("nf", ""),
+                debt_idle=_e.get("debt_idle_s", ""),
+                debt_pick=_e.get("debt_idle_pick_s", ""),
+                debt_f=_e.get("debt_f_pick", ""),
+            ))
 
         if a.every > 1 and n % a.every:
             continue
@@ -286,20 +346,25 @@ def main():
               # evidence available before a live run that the mechanism reaches
               # the ranking at all.  Zero swaps on a real capture means the next
               # live A/B would be measuring nothing.
-              "n_debt_updates", "n_debt_blocks", "max_debt_m2",
-              "n_debt_picks", "n_debt_swaps",
+              "n_debt_updates", "n_debt_blocks", "max_debt_idle_s",
+              "n_debt_picks", "n_debt_swaps", "last_debt_idle_s", "last_debt_f",
               "n_plans", "n_plan_failures", "n_blacklisted"):
         v = getattr(explorer, k, None)
         if v is not None:
             print("  %-22s %s" % (k, v))
+    for k, v in (explorer.debt_margin_stats() if hasattr(explorer, "debt_margin_stats")
+                 else {}).items():
+        print("  %-22s %s" % (k, v))
 
+    rows_main = rows_out.get(arms[0][0], [])
     # ---- what boss actually asked about: how long is it told to do nothing? --
-    idle = [r for r in rows_out if abs(r["v"]) < 1e-6 and abs(r["w"]) < 1e-3]
-    hard_zero = [r for r in rows_out if abs(r["v"]) < 1e-6 and abs(r["w"]) < 1e-6]
+    idle = [r for r in rows_main if abs(r["v"]) < 1e-6 and abs(r["w"]) < 1e-3]
+    hard_zero = [r for r in rows_main
+                 if abs(r["v"]) < 1e-6 and abs(r["w"]) < 1e-6]
     print("  frames with v==0         %d (%.1f%%)"
-          % (len(idle), 100.0 * len(idle) / max(1, len(rows_out))))
+          % (len(idle), 100.0 * len(idle) / max(1, len(rows_main))))
     print("  frames with v==0 and w==0 %d (%.1f%%)"
-          % (len(hard_zero), 100.0 * len(hard_zero) / max(1, len(rows_out))))
+          % (len(hard_zero), 100.0 * len(hard_zero) / max(1, len(rows_main))))
 
     if a.poses:
         with open(a.poses, "w", encoding="utf-8", newline="") as fh:
@@ -311,12 +376,63 @@ def main():
         print("  poses written: %s" % a.poses)
 
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="") as fh:
-            wr = csv.DictWriter(fh, fieldnames=list(rows_out[0].keys()))
-            wr.writeheader()
-            for r in rows_out:
-                wr.writerow(r)
-        print("  written      : %s" % a.out)
+        for name, exr in arms:
+            path = a.out if len(arms) == 1 else "%s_%s.csv" % (
+                os.path.splitext(a.out)[0], name)
+            rows = rows_out.get(name, [])
+            if not rows:
+                continue
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                wr = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                wr.writeheader()
+                for r in rows:
+                    wr.writerow(r)
+            print("  written      : %s" % path)
+
+    # ---- multi-arm scan: the comparison, and when the arms first disagreed ---
+    #
+    # Written for the question a parameter sweep has to answer before any of it
+    # is worth a simulator run: **when does this arm first make a different
+    # decision, and what does it change it to?**  A mechanism that never fires is
+    # not worth a live A/B, and one that fires on the first pick is not a
+    # refinement of the current policy, it is a different policy.
+    if len(arms) > 1:
+        print()
+        print("===== arms: the first disagreement against `%s` =====" % arms[0][0])
+        base_rows = rows_out.get(arms[0][0], [])
+        print("  %-14s %7s %7s %7s %9s %9s %-26s"
+              % ("arm", "picks", "swaps", "first@", "idle@s", "f@", "first change"))
+        for name, exr in arms:
+            rows = rows_out.get(name, [])
+            if not rows:
+                continue
+            first_t = None
+            first_desc = ""
+            for i in range(min(len(rows), len(base_rows))):
+                if (rows[i]["target_x"] != base_rows[i]["target_x"]
+                        or rows[i]["target_y"] != base_rows[i]["target_y"]):
+                    first_t = float(rows[i]["stamp"]) - float(rows[0]["stamp"])
+                    first_desc = "(%s,%s) -> (%s,%s)" % (
+                        base_rows[i]["target_x"], base_rows[i]["target_y"],
+                        rows[i]["target_x"], rows[i]["target_y"])
+                    break
+            print("  %-14s %7d %7d %7s %9.0f %9.3f %-26s"
+                  % (name, getattr(exr, "n_picks", 0),
+                     getattr(exr, "n_debt_swaps", 0),
+                     "-" if first_t is None else "%.0fs" % first_t,
+                     getattr(exr, "last_debt_idle_s", 0.0),
+                     getattr(exr, "last_debt_f", 0.0), first_desc))
+        print()
+        print("  %-14s %8s %8s %8s %8s" % ("arm", "arrivals", "survey",
+                                           "deep", "switches"))
+        for name, exr in arms:
+            sw = sum(1 for i in range(1, len(rows_out.get(name, [])))
+                     if rows_out[name][i]["target_x"]
+                     != rows_out[name][i - 1]["target_x"])
+            print("  %-14s %8s %8s %8s %8d"
+                  % (name, getattr(exr, "n_arrivals", "-"),
+                     getattr(exr, "n_first_pass_stops", "-"),
+                     getattr(exr, "n_deep_stops", "-"), sw))
 
     for k, lst in probes.items():
         for p in lst:

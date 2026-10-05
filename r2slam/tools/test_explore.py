@@ -1191,7 +1191,7 @@ def main():
         fails.append("the tie-break is not the documented one: expected the "
                      "south patch (smaller y), got %s" % (picks[0],))
 
-    # --- 23/24. unfinished-region debt ------------------------------------
+    # --- 23/24/25. unfinished-region debt ---------------------------------
     #
     # Boss, 2026-10-05, after the four-run distribution: "do (2) and only (2)"
     # -- a region that is known, still unfinished, and has not been worked on for
@@ -1201,88 +1201,110 @@ def main():
     # >= 40% still undone", the worst 98% undone with 158 s left.  The map knew
     # those rooms throughout -- nothing ever asked about them again.
     #
-    # Two separate things have to be true and they are separately testable:
-    #   23. the debt is *earned* from behaviour (grows while ignored, is
-    #       cancelled by coverage, is capped, and is off at `debt_gain_m2=0`);
-    #   24. it actually reaches the ranking (a field planted on one of two
-    #       otherwise-equal rooms moves the pick, and the instrument says so).
+    # Then the first implementation **failed its four-run A/B** (docs section 20)
+    # and the reason is what these cases now pin down.  It scored each 1 m block
+    # `gain x min(idle / 40 s, 1)` and summed a window: live it changed 3 of 48
+    # picks, and raising the cap x9 gave bit-identical decisions, because the cap
+    # erased the difference between "ignored 45 s" and "ignored 200 s" and every
+    # candidate the sweep offers already sits on never-walked floor.
+    #
+    # So the quantity is now a **region state**, measured on the thing the sweep
+    # already computes -- a fresh patch:
+    #     score = base x (1 + lambda x f(idle_of_patch))
+    # where `base` already carries the unfinished *amount* (the patch area) and
+    # the travel cost, and `f` is linear from a grace period to a cap on **time**.
+    #
+    # Three separately testable claims:
+    #   23. the field is *earned*: it grows while ignored, coverage cancels it in
+    #       the block that was covered only, it is off at `debt_lambda=0`, and a
+    #       caller with no clock accumulates nothing;
+    #   24. `f` orders neglect: below the grace nothing, linear in between, flat
+    #       at the cap -- i.e. 45 s and 200 s are *different* and 200 s and 300 s
+    #       are the same;
+    #   25. it reaches the ranking, and only when the neglect differs: equal
+    #       neglect on two equal rooms must NOT reorder them, and a neglected
+    #       room must beat a freshly-ignored one.
     # A mechanism that runs but never changes an answer is what `wedge_abandons 0`
-    # was one round ago, and the counters exist so that cannot pass unnoticed.
-    print("23) the debt field is earned: grows while ignored, cancelled by "
-          "coverage, capped")
+    # was two rounds ago.
+    print("23) the neglect field is earned: grows while ignored, cancelled by "
+          "coverage in the block that was covered")
     w23 = world(observed_to=8.0)          # 21.7 m2 of reachable floor, 1.1 walked
-    e23 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e23 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                           debt_lambda=1.0)   # off by default, see case 25
     t23 = 0.0
     ramp = []
-    for k in range(0, 451):               # 90 s at 5 Hz: past the 40 s recall
+    for k in range(0, 451):               # 90 s at 5 Hz
         t23 = 0.2 * k
         e23.command(w23, (0.0, 0.0), 0.0, stamp=t23)
-        ramp.append(e23.max_debt_m2)
-    print("    held at the start for %.0f s: blocks %d of %d eligible, "
-          "max debt %.3f m2 (cap %.1f, recall %.0f s)"
-          % (t23, e23.n_debt_blocks, e23.n_debt_eligible, e23.max_debt_m2,
-             e23.debt_gain_m2, e23.debt_recall_s))
+        ramp.append(e23.max_debt_idle_s)
+    print("    held at the start for %.0f s: blocks past grace %d of %d "
+          "eligible, longest neglect %.0f s"
+          % (t23, e23.n_debt_blocks, e23.n_debt_eligible, e23.max_debt_idle_s))
     if e23.n_debt_updates < 20:
-        fails.append("the debt field was barely updated at all (%d times in "
+        fails.append("the neglect field was barely updated at all (%d times in "
                      "%.0f s)" % (e23.n_debt_updates, t23))
-    if e23.n_debt_blocks == 0:
-        fails.append("nothing ever went into debt on a map with 21.7 m2 of "
-                     "reachable floor and 1.1 m2 walked -- the mechanism is "
-                     "inert, whatever the code says")
-    if not (0.9 * e23.debt_gain_m2 <= e23.max_debt_m2 <= e23.debt_gain_m2 + 1e-6):
-        fails.append("after %.0f s (%.1f x the recall time) the largest block "
-                     "should have reached the cap %.2f, it is %.3f"
-                     % (t23, t23 / e23.debt_recall_s, e23.debt_gain_m2,
-                        e23.max_debt_m2))
+    if e23.n_debt_eligible == 0 or e23.n_debt_blocks == 0:
+        fails.append("nothing was ever neglected on a map with 21.7 m2 of "
+                     "reachable floor and 1.1 m2 walked (%d eligible, %d past "
+                     "grace) -- the mechanism is inert, whatever the code says"
+                     % (e23.n_debt_eligible, e23.n_debt_blocks))
+    if abs(e23.max_debt_idle_s - t23) > 3.0:
+        fails.append("after %.0f s of standing still the longest-neglected "
+                     "block reads %.0f s: the clock is not wall time"
+                     % (t23, e23.max_debt_idle_s))
     if any(a > b + 1e-6 for a, b in zip(ramp, ramp[1:])):
-        fails.append("the debt fell while the robot stood still -- the only "
+        fails.append("neglect fell while the robot stood still -- the only "
                      "thing that may cancel it is coverage")
 
     def blk_of(explorer, x, y):
+        if explorer._debt_geo is None:
+            raise AssertionError("the neglect field was never built -- is "
+                                 "debt_lambda still 0?")
         blk_m, extent, _nb = explorer._debt_geo
         return (int(np.floor((x + extent) / blk_m)),
                 int(np.floor((y + extent) / blk_m)))
 
-    def blk_debt(explorer, x, y):
+    def blk_idle(explorer, x, y):
         bx, by = blk_of(explorer, x, y)
-        return float(explorer._debt[by, bx])
+        return float(explorer._debt_idle[by, bx])
 
-    # ... and driving the corridor clears the debt **in the blocks it covered**,
-    # while the blocks further along keep theirs.  Both halves matter: a rule
-    # that cleared everything would be "the robot moved", and coverage is
-    # supposed to cancel debt outright rather than shave it.
-    under_before = blk_debt(e23, 2.0, 0.0)
-    ahead_before = blk_debt(e23, 6.0, 0.0)
+    # ... and driving the corridor clears the neglect **in the blocks it
+    # covered**, while the blocks further along keep theirs.  Both halves matter:
+    # a rule that cleared everything would be "the robot moved", and coverage is
+    # supposed to cancel neglect outright rather than shave it.
+    under_before = blk_idle(e23, 2.0, 0.0)
+    ahead_before = blk_idle(e23, 6.0, 0.0)
     w23.traj.append((2.0, 0.0))
     e23.command(w23, (2.0, 0.0), 0.0, stamp=t23 + 0.2)     # < 1 s: no update yet
     for j in range(6):                                     # force one update
         e23.command(w23, (2.0, 0.0), 0.0, stamp=t23 + 0.4 + 0.2 * j)
-    under_after = blk_debt(e23, 2.0, 0.0)
-    ahead_after = blk_debt(e23, 6.0, 0.0)
-    print("    drove to x=2: the block driven through %.3f -> %.3f, the block "
-          "6 m further on %.3f -> %.3f"
+    under_after = blk_idle(e23, 2.0, 0.0)
+    ahead_after = blk_idle(e23, 6.0, 0.0)
+    print("    drove to x=2: the block driven through %.0f s -> %.0f s, the "
+          "block 4 m further on %.0f s -> %.0f s"
           % (under_before, under_after, ahead_before, ahead_after))
-    if under_before <= 0.0:
+    if under_before < e23.debt_grace_s:
         fails.append("case 23 lost its meaning: the block the robot drove "
-                     "through was not in debt to begin with")
-    elif under_after > 0.0:
-        fails.append("coverage did not cancel the debt in the block the robot "
-                     "drove through (%.3f left of %.3f)"
+                     "through was not past the grace period to begin with "
+                     "(%.1f s)" % under_before)
+    elif under_after > 0.5:
+        fails.append("coverage did not cancel the neglect in the block the "
+                     "robot drove through (%.1f s left of %.1f s)"
                      % (under_after, under_before))
-    if ahead_after <= 0.0:
-        fails.append("driving 2 m into the corridor cleared the debt 4 m "
-                     "further along (%.3f): the rule is cancelling by "
-                     "proximity to the robot, not by coverage"
-                     % ahead_after)
-    # `debt_gain_m2 = 0` is the control arm, on the same binary.
+    if ahead_after < e23.debt_grace_s:
+        fails.append("driving 2 m into the corridor cleared the neglect 4 m "
+                     "further along (%.1f s): the rule is cancelling by "
+                     "proximity to the robot, not by coverage" % ahead_after)
+    # `debt_lambda = 0` is the control arm, on the same binary.
     e23off = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
-                              debt_gain_m2=0.0)
+                              debt_lambda=0.0)
     for k in range(0, 61):
         e23off.command(w23, (0.0, 0.0), 0.0, stamp=0.2 * k)
-    print("    with debt_gain_m2=0: updates %d, blocks %d, max %.3f"
-          % (e23off.n_debt_updates, e23off.n_debt_blocks, e23off.max_debt_m2))
-    if e23off.n_debt_updates or e23off.n_debt_blocks or e23off.max_debt_m2:
-        fails.append("`debt_gain_m2=0` did not turn the mechanism off -- the "
+    print("    with debt_lambda=0: updates %d, blocks %d, longest %.0f s"
+          % (e23off.n_debt_updates, e23off.n_debt_blocks,
+             e23off.max_debt_idle_s))
+    if e23off.n_debt_updates or e23off.n_debt_blocks or e23off.max_debt_idle_s:
+        fails.append("`debt_lambda=0` did not turn the mechanism off -- the "
                      "A/B arm would be measuring nothing")
     # ... and a caller with no clock leaves it alone too, rather than treating
     # frames as seconds.
@@ -1290,69 +1312,99 @@ def main():
     for k in range(0, 61):
         e23nc.command(w23, (0.0, 0.0), 0.0)
     if e23nc.n_debt_updates:
-        fails.append("a caller that passed no timestamp still accumulated debt "
-                     "(%d updates): the recall time would mean 8 s on one "
-                     "dataset and 4 s on another" % e23nc.n_debt_updates)
+        fails.append("a caller that passed no timestamp still accumulated "
+                     "neglect (%d updates): the grace and cap would mean 8 s on "
+                     "one dataset and 4 s on another" % e23nc.n_debt_updates)
 
-    print("24) the debt reaches the ranking: it moves a pick between two "
-          "equal rooms, and says so")
-    w24 = two_rooms()
+    print("24) `f` orders neglect: nothing below the grace, linear between, "
+          "flat at the cap")
+    e24u = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                            debt_lambda=1.0)
+    g, cap = e24u.debt_grace_s, e24u.debt_idle_cap_s
+    pts = [(0.0, 0.0), (g * 0.5, 0.0), (g, 0.0),
+           ((g + cap) / 2.0, 0.5), (cap, 1.0), (cap * 3.0, 1.0)]
+    got = [e24u._debt_f(t) for t, _e in pts]
+    print("    grace %.0f s, cap %.0f s: %s"
+          % (g, cap, "  ".join("%.0f s->%.2f" % (t, v) for t, v in zip(
+              [p[0] for p in pts], got))))
+    for (t, want), have in zip(pts, got):
+        if abs(have - want) > 0.02:
+            fails.append("f(%.0f s) is %.3f, expected %.2f -- the term does not "
+                         "express 'the longer it is ignored the more it is "
+                         "worth, up to the cap'" % (t, have, want))
+    if any(a > b + 1e-9 for a, b in zip(got, got[1:])):
+        fails.append("f is not monotone in time: %.3f" % got)
+    if got[2] != 0.0 or got[3] <= got[2]:
+        fails.append("the grace period is not a dead zone (f(grace)=%r, "
+                     "f(mid)=%r)" % (got[2], got[3]))
+    # The whole point of this version against the last one: 45 s and 200 s must
+    # NOT be worth the same.
+    if abs(e24u._debt_f(45.0) - e24u._debt_f(200.0)) < 0.2:
+        fails.append("a region ignored 45 s and one ignored 200 s are still "
+                     "worth nearly the same (%.2f vs %.2f) -- this is exactly "
+                     "the v21 failure" % (e24u._debt_f(45.0),
+                                          e24u._debt_f(200.0)))
+
+    print("25) it reaches the ranking, and only when the neglect differs")
+    w25 = two_rooms()
     # The unmodified policy: west wins (4.13 m2 at 1.55 m beats 4.07 m2 at
     # 1.65 m -- a 7% edge), and with the mechanism off that must not change.
-    e24 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
-                           debt_gain_m2=0.0)
-    reach24, _ex24 = e24._masks(w24, (0.0, 0.0))
-    p_off = e24._pick_sweep_target(w24, reach24, 0.0, 0.0)
-    print("    debt off  -> %s"
+    e25off = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                              debt_lambda=0.0)
+    reach25, _ex25 = e25off._masks(w25, (0.0, 0.0))
+    p_off = e25off._pick_sweep_target(w25, reach25, 0.0, 0.0)
+    print("    lambda 0        -> %s"
           % (None if p_off is None else "(%.2f, %.2f)" % (p_off[0], p_off[1])))
 
-    def plant(explorer, x_gt=None, x_lt=None):
-        """Fill the debt by hand so the ranking can be tested on its own."""
+    def plant_idle(explorer, east_s, west_s):
+        """Set the neglect field by hand, so the ranking is tested on its own."""
         blk_m, extent, nb = explorer._debt_geo
-        explorer._debt[:] = 0.0
+        explorer._debt_idle[:] = 0.0
         for bx in range(nb):
             for by in range(nb):
                 wx = (bx + 0.5) * blk_m - extent
                 wy = (by + 0.5) * blk_m - extent
                 if abs(wy) >= 2.0:
                     continue
-                if x_gt is not None and wx > x_gt:
-                    explorer._debt[by, bx] = explorer.debt_gain_m2
-                if x_lt is not None and wx < x_lt:
-                    explorer._debt[by, bx] = explorer.debt_gain_m2
-        return int((explorer._debt > 0).sum())
+                if wx > 0.4:
+                    explorer._debt_idle[by, bx] = east_s
+                elif wx < -0.4:
+                    explorer._debt_idle[by, bx] = west_s
 
-    picks24 = []
-    for tag, kw in (("debt on the east room", dict(x_gt=0.4)),
-                    ("debt on the west room", dict(x_lt=-0.4))):
-        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
-        r, _x = e._masks(w24, (0.0, 0.0))
-        e._debt_update(w24, r, 0.2)          # builds the geometry, then:
-        n_blk = plant(e, **kw)
-        p = e._pick_sweep_target(w24, r, 0.0, 0.0)
-        bonus = 0.0 if p is None else e._debt_bonus(p[0], p[1])
-        picks24.append(None if p is None else (round(p[0], 2), round(p[1], 2)))
-        print("    %s (%d blocks) -> %s, bonus %.1f, debt_picks %d, "
-              "debt_swaps %d"
-              % (tag, n_blk, picks24[-1], bonus, e.n_debt_picks,
+    picks25 = []
+    for tag, east_s, west_s in (("both neglected alike", 120.0, 120.0),
+                                ("east neglected only", 120.0, 0.0),
+                                ("west neglected only", 0.0, 120.0)):
+        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                             debt_lambda=1.0)
+        r, _x = e._masks(w25, (0.0, 0.0))
+        e._debt_update(w25, r, 0.2)          # builds the geometry, then:
+        plant_idle(e, east_s, west_s)
+        p = e._pick_sweep_target(w25, r, 0.0, 0.0)
+        picks25.append(None if p is None else (round(p[0], 2), round(p[1], 2)))
+        print("    %-20s -> %s, patch neglect %.0f s, weight %.3f, swaps %d"
+              % (tag, picks25[-1], e.last_debt_idle_s, e.last_debt_f,
                  e.n_debt_swaps))
         if p is None:
             fails.append("%s: no candidate was offered at all" % tag)
     if p_off is None:
-        fails.append("case 24 lost its meaning: the plain policy found no "
+        fails.append("case 25 lost its meaning: the plain policy found no "
                      "sweep target in the two-room fixture")
     else:
-        if picks24[0] is None or picks24[0][0] < 0:
-            fails.append("debt on the east room left the pick in the west room "
-                         "(%s): the bonus never reached the ranking"
-                         % (picks24[0],))
-        if picks24[0] is not None and (abs(picks24[0][0] - p_off[0]) < 0.5
-                                       and abs(picks24[0][1] - p_off[1]) < 0.5):
-            fails.append("the debt did not move the pick at all (%s vs %s)"
-                         % (picks24[0], (round(p_off[0], 2), round(p_off[1], 2))))
-        if picks24[1] is None or picks24[1][0] > 0:
-            fails.append("debt on the west room did not keep the pick in the "
-                         "west room (%s)" % (picks24[1],))
+        # Equal neglect must not reorder: the weight multiplies every candidate
+        # by the same number, and that is the property that makes this version
+        # different from a constant added to everything.
+        if picks25[0] is None or abs(picks25[0][0] - p_off[0]) > 0.5:
+            fails.append("equal neglect on both rooms changed the pick (%s vs "
+                         "%s): the term is adding a constant, not ranking "
+                         "neglect"
+                         % (picks25[0], (round(p_off[0], 2), round(p_off[1], 2))))
+        if picks25[1] is None or picks25[1][0] < 0:
+            fails.append("the neglected east room did not win the pick (%s): "
+                         "the term never reached the ranking" % (picks25[1],))
+        if picks25[2] is None or picks25[2][0] > 0:
+            fails.append("neglect planted on the west room did not keep the "
+                         "pick there (%s)" % (picks25[2],))
 
     print()
     if fails:
@@ -1360,7 +1412,7 @@ def main():
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (24 checks)")
+    print("verdict: PASS (25 checks)")
     return 0
 
 

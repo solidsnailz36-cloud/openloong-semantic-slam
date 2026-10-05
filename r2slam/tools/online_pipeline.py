@@ -893,13 +893,17 @@ def main():
                 # times looks identical to one that backed off three times.
                 "wedge": int(bool((cmd or {}).get("wedge"))),
                 "frontier_cells": (cmd or {}).get("nf"),
-                # The debt field, per frame: `debt_max` is the largest single
-                # block's debt (m2-equivalents, capped by `debt_gain_m2`) and
-                # `debt_blocks` how many blocks are in debt at all.  A run where
-                # `debt_max` never leaves 0 is a run where the mechanism never
-                # had anything to pull on, whatever the summary counters say.
-                "debt_max": (cmd or {}).get("debt_max"),
+                # The debt field, per frame: `debt_idle` is the longest-neglected
+                # block in **seconds**, `debt_pick` the mean neglect of the patch
+                # currently committed to, `debt_f` the weight that earned (0 below
+                # the grace period, 1 at the cap).  A run where `debt_idle` never
+                # passes the grace period is a run where nothing was neglected
+                # long enough for the term to do anything, whatever else the
+                # summary says.
+                "debt_idle": (cmd or {}).get("debt_idle_s"),
                 "debt_blocks": (cmd or {}).get("debt_blocks"),
+                "debt_pick": (cmd or {}).get("debt_idle_pick_s"),
+                "debt_f": (cmd or {}).get("debt_f_pick"),
                 # yaw and the clearance flag are logged because "the robot is
                 # not moving" has two completely different causes -- never
                 # commanded, or commanded but physically stuck -- and only
@@ -1209,20 +1213,33 @@ def main():
                      # `debt_swaps` is the one that must not be zero: it counts
                      # picks where the *debt* changed which target won, i.e.
                      # candidates ranked with and without the bonus disagreeing
-                     # at the head.  `debt_blocks` / `debt_max_m2` say whether
-                     # the field itself is alive (blocks meeting the three
-                     # conditions, and the largest single block's debt).
-                     # `debt_gain_m2 = 0` turns it all off on the same binary.
-                     "debt_gain_m2": explorer.debt_gain_m2,
-                     "debt_recall_s": explorer.debt_recall_s,
+                     # at the head.  `debt_blocks` / `debt_idle_s` say whether
+                     # the field itself is alive (blocks past the grace period,
+                     # and the longest-neglected block in seconds).
+                     # `debt_idle_pick_s` is the mean neglect of the patch the
+                     # robot actually committed to -- the number that has to sit
+                     # *inside* the grace..cap window for the term to be doing
+                     # anything at all.  `debt_lambda = 0` turns it all off on
+                     # the same binary.
+                     "debt_lambda": explorer.debt_lambda,
+                     "debt_grace_s": explorer.debt_grace_s,
+                     "debt_idle_cap_s": explorer.debt_idle_cap_s,
                      "debt_cell_m": explorer.debt_cell_m,
-                     "debt_radius_m": explorer.debt_radius_m,
                      "debt_updates": explorer.n_debt_updates,
                      "debt_blocks": explorer.n_debt_blocks,
                      "debt_eligible": getattr(explorer, "n_debt_eligible", 0),
-                     "debt_max_m2": round(explorer.max_debt_m2, 3),
+                     "debt_idle_max_s": round(explorer.max_debt_idle_s, 1),
                      "debt_picks": explorer.n_debt_picks,
                      "debt_swaps": explorer.n_debt_swaps,
+                     "debt_idle_pick_s": round(explorer.last_debt_idle_s, 1),
+                     "debt_f_pick": round(explorer.last_debt_f, 3),
+                     "debt_switches": explorer.debt_switches,
+                     # ... and the one that decides whether the next round is
+                     # worth a simulator run at all: the pull each pick would
+                     # have needed, in units of `debt_lambda`.  If the smallest
+                     # need over the whole run is > 1, no setting of the strength
+                     # would have changed a single decision.
+                     "debt_margin": explorer.debt_margin_stats(),
                      "done_reason": explorer.n_done_reason,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,
