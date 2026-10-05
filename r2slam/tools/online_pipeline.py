@@ -1267,6 +1267,14 @@ def main():
                      "pick_stats": explorer.pick_stats(),
                      "sweep_cands_per_patch": explorer.sweep_cands_per_patch,
                      "sweep_cand_sep_m": explorer.sweep_cand_sep_m,
+                     # Both of the candidate-generation knobs, not just the two
+                     # that were there first: the live A/B of 2026-10-05 ran with
+                     # `sweep_cand_sectors=12` and the summary did not say so, so
+                     # verifying "one variable" needed the `overrides` block
+                     # instead of the reading.  A summary that cannot state the
+                     # settings it ran under is the same trap as a CSV column
+                     # whose unit changed.
+                     "sweep_cand_sectors": explorer.sweep_cand_sectors,
                      "done_reason": explorer.n_done_reason,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,
