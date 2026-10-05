@@ -59,6 +59,27 @@ from r2slam.worldmap import WorldMap                               # noqa: E402
 from online_pipeline import _resolve_vendor, frames_from_npz       # noqa: E402
 
 
+def parse_overrides(items):
+    """`--set key=value` -> kwargs for FrontierExplorer, with types inferred.
+
+    Types matter because `arc_max_deg = "125"` (a string) would raise inside the
+    comparison rather than at the command line, and a parameter that silently
+    failed to apply is exactly the failure mode this harness exists to catch.
+    """
+    import ast
+    out = {}
+    for it in items:
+        if "=" not in it:
+            raise SystemExit("--set wants key=value, got %r" % it)
+        k, v = it.split("=", 1)
+        k, v = k.strip(), v.strip()
+        try:
+            out[k] = ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            out[k] = v
+    return out
+
+
 def local_map(wmap, x, y, r=3.0):
     """ASCII picture of the map around (x, y): '#' blocked, '.' floor, ' ' unknown."""
     res = wmap.resolution
@@ -107,6 +128,12 @@ def main():
     ap.add_argument("--poses", default=None,
                     help="write full-precision poses here, to compare a replay "
                          "against the live run's tf.csv")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override any FrontierExplorer parameter, e.g. "
+                         "--set arc_max_deg=125 --set arc_scale=0.6.  The point "
+                         "of the harness is that a policy change can be compared "
+                         "on the same capture; a change that cannot be expressed "
+                         "as a parameter has to be compared some other way.")
     a = ap.parse_args()
 
     cfg = load_config(a.config)
@@ -128,10 +155,13 @@ def main():
                                num_threads=rt.detector_threads)
         print("detector    : %s (%s)" % (det.kind, name))
 
-    explorer = FrontierExplorer(v_max=0.55, w_max=0.9)
+    explorer = FrontierExplorer(v_max=0.55, w_max=0.9,
+                                **parse_overrides(a.set))
     # The replay has no driver, so the explorer must be told the same thing the
     # live run told it: a *fresh* instance starts at "init".
     print("explorer    : %s" % ("sweep+shadow" if explorer.sweep else "frontier only"))
+    for k, v in parse_overrides(a.set).items():
+        print("  override  : %s = %r" % (k, v))
 
     rows_out = []
     pose_rows = []

@@ -75,6 +75,29 @@ assert (OBSTACLE_LO, OBSTACLE_HI, GROUND_TOL_BASE, GROUND_TOL_SLOPE) == (
     0.35, 2.00, 0.10, 0.035)
 
 
+def _explore_overrides(items):
+    """`--explore-set key=value` -> kwargs for `FrontierExplorer`.
+
+    Types are inferred by `literal_eval`, so `--explore-set shadow=False` really
+    passes a bool and `--explore-set arc_scale=0.6` really passes a float.  A
+    string where a number was wanted raises inside the comparison it feeds rather
+    than at the command line, and "the flag silently did nothing" is the failure
+    mode this whole flag exists to avoid.
+    """
+    import ast
+    out = {}
+    for it in items or ():
+        if "=" not in it:
+            raise SystemExit("--explore-set wants key=value, got %r" % it)
+        k, v = it.split("=", 1)
+        k, v = k.strip(), v.strip()
+        try:
+            out[k] = ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            out[k] = v
+    return out
+
+
 def _resolve_vendor(explicit: str, filename: str) -> str:
     """Find a vendor file without depending on the caller's working directory.
 
@@ -149,6 +172,16 @@ def parse_args():
                          "motive, leaving only frontier (the A/B control for "
                          "measuring what it is worth)")
     ap.add_argument("--w-max", type=float, default=0.9, help="rad/s")
+    ap.add_argument("--explore-set", action="append", default=[],
+                    metavar="KEY=VALUE",
+                    help="override any FrontierExplorer parameter, e.g. "
+                         "--explore-set arc_max_deg=125 --explore-set arc_scale=0.6. "
+                         "Every exploration behaviour currently lives in the "
+                         "constructor defaults of `r2slam/explore.py`, which means a "
+                         "parameter sweep currently means editing the source -- and "
+                         "then the number in the summary is the only record of which "
+                         "build produced it.  This makes the value part of the "
+                         "command line, so it lands in the run record.")
     ap.add_argument("--out-fps", type=float, default=0.0,
                     help="playback fps; 0 = keep the source rate")
     ap.add_argument("--speed", type=float, default=1.0,
@@ -429,9 +462,12 @@ def main():
         if a.npz:
             raise SystemExit("--explore needs a live source (nothing to drive in --npz mode)")
         explorer = FrontierExplorer(v_max=a.v_max, w_max=a.w_max,
-                                    sweep=not a.no_sweep)
+                                    sweep=not a.no_sweep,
+                                    **_explore_overrides(a.explore_set))
         print("explore     : frontier policy  v_max=%.2f m/s  w_max=%.2f rad/s  "
               "sweep=%s" % (a.v_max, a.w_max, not a.no_sweep))
+        for k, val in _explore_overrides(a.explore_set).items():
+            print("  override  : %s = %r" % (k, val))
     if explorer is not None or navigator is not None:
         sender = VelocitySender().start()
 
@@ -1064,7 +1100,11 @@ def main():
         "deskew": {"enabled": bool(deskewer.enabled),
                    "applied": int(deskewer.n_applied),
                    "skipped_bad_dt": int(deskewer.n_skipped_dt)},
-        "explore": ({"enabled": True, "v_max": a.v_max, "w_max": a.w_max,
+        "explore": ({"enabled": True,
+                     # Which build produced these numbers.  Every exploration
+                     # behaviour is a constructor default, so without this the
+                     # only record of a parameter change is the diff.
+                     "overrides": _explore_overrides(a.explore_set) or None, "v_max": a.v_max, "w_max": a.w_max,
                      "targets_chosen": explorer.n_targets,
                      "search_turns": explorer.n_search_turns,
                      "search_frames": explorer.n_search_frames,
