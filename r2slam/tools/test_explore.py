@@ -899,13 +899,252 @@ def main():
     if e19.n_first_pass_stops <= before:
         fails.append("no survey stop was recorded after the map grew")
 
+    # --- 20. the lookahead must be in line of sight ------------------------
+    #
+    # Boss's report (2026-10-05): "the car still crouches in a corner, and it sat
+    # in two different places next to shelves for a long time".  Measured on the
+    # v16 capture, the robot spent 43 s of a 275 s run at (-7.6, 0.2) with
+    # `state=turn`, `heading_err_deg` 0.0 and **v = w = 0**.
+    #
+    # The cause is in `_lookahead`: a point 1.2 m along the path is *around the
+    # bend* wherever the path turns sharply, so the aim pointed into the shelf.
+    # The throttle then asked "is the way ahead clear", heard no, and -- being
+    # aligned with its own bad aim -- commanded 1.6 * 0 degrees per second.
+    #
+    # The fixture is a corridor with a wall across it that leaves a gap on one
+    # side, i.e. exactly a place where the path has to bend hard.  The assertion
+    # is a sweep over robot poses and goals: the naive lookahead must be found
+    # out of line of sight at some poses (or the fixture has lost its meaning),
+    # the new one must be in line of sight at every pose where any candidate is,
+    # and it must never aim *further* than the naive one.
+    print("20) the lookahead point is in line of sight, not around the corner")
+    w20 = world(block_x=(1.5, 0.0, 1.5), observed_to=6.0)
+    e20 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    los_grid = w20.ground                  # the default `los_grid="floor"`
+    n_naive_bad = n_fixed = n_unavoidable = n_worse = n_poses = 0
+    for gx, gy in ((4.0, -1.2), (4.0, 1.2), (-1.5, 1.2)):
+        for px in np.arange(-1.8, 5.5, 0.3):
+            for py in np.arange(-1.2, 1.21, 0.3):
+                path = e20.planner.plan(w20, (float(px), float(py)), (gx, gy))
+                if not path or len(path) < 4:
+                    continue
+                n_poses += 1
+                e20.los_lookahead = False
+                naive = e20._lookahead(path, (float(px), float(py)), w20)
+                e20.los_lookahead = True
+                aim = e20._lookahead(path, (float(px), float(py)), w20)
+                tries = [q for q in path
+                         if float(np.hypot(q[0] - px, q[1] - py))
+                         <= e20.lookahead_m] or [path[0]]
+                any_ok = any(e20._los_ok(w20, float(px), float(py), q[0], q[1],
+                                         los_grid) for q in tries)
+                n_ok = e20._los_ok(w20, float(px), float(py), naive[0], naive[1],
+                                   los_grid)
+                a_ok = e20._los_ok(w20, float(px), float(py), aim[0], aim[1],
+                                   los_grid)
+                if not n_ok:
+                    n_naive_bad += 1
+                    if a_ok:
+                        n_fixed += 1
+                    elif not any_ok:
+                        n_unavoidable += 1
+                    else:
+                        n_worse += 1
+                if float(np.hypot(aim[0] - px, aim[1] - py)) > \
+                        float(np.hypot(naive[0] - px, naive[1] - py)) + 1e-9:
+                    n_worse += 1
+                if any_ok and not a_ok:
+                    n_worse += 1
+    print("    %d poses: naive aim out of sight %d, of which fixed %d, "
+          "unavoidable %d; regressions %d; lookaheads shortened %d"
+          % (n_poses, n_naive_bad, n_fixed, n_unavoidable, n_worse,
+             e20.n_los_shortened))
+    if n_poses < 100:
+        fails.append("case 20 lost its meaning: only %d usable poses" % n_poses)
+    if n_naive_bad == 0:
+        fails.append("case 20 lost its meaning: the naive lookahead was never "
+                     "out of line of sight, so the fixture no longer reproduces "
+                     "the corner the robot was stuck in")
+    if n_fixed == 0:
+        fails.append("the line-of-sight lookahead fixed nothing -- the aim still "
+                     "points through the wall")
+    if n_worse:
+        fails.append("%d poses got WORSE: the aim is out of sight when another "
+                     "candidate was visible, or it aims further than before"
+                     % n_worse)
+
+    # --- 21. a blocked-and-aligned robot must not be told to do nothing ----
+    #
+    # This is the invariant the whole corner episode reduces to.  `turn` cannot
+    # produce a zero command (w = 1.6 * err and err > turn_only_deg); `drive`
+    # and `arc` drive.  The only state that can is "aligned with the aim and the
+    # aim is blocked", and it used to be folded into `turn`, which is why the
+    # robot sat still: **a command of (0, 0) carries no new information, so the
+    # next frame derives the same command, forever**.  v16 did that for 43 s and
+    # reported no error at all.
+    print("21) blocked and aligned is escaped, never commanded as (0, 0)")
+    w21 = world(block_x=1.5, observed_to=4.0)     # corridor closed by a wall
+    e21 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e21._target = (3.0, 0.0)                      # straight through the wall
+    e21._target_kind = "sweep"
+    e21._target_age = 0
+    zeros = 0
+    for i in range(40):                           # robot pinned: no integration
+        v21, w21_, ex21 = e21.command(w21, (0.8, 0.0), 0.0)
+        if abs(v21) < 1e-9 and abs(w21_) < 1e-9:
+            zeros += 1
+    print("    pinned at (0.80, 0.00) aiming at (3.00, 0.00): "
+          "wedge frames %d, blocked %d, abandons %d, denied %d, exact zeros %d"
+          % (e21.n_wedge_frames, e21.n_goal_blocked_frames, e21.n_goal_abandons,
+             len(e21._denied), zeros))
+    if e21.n_wedge_frames == 0:
+        fails.append("case 21 lost its meaning: the blocked-and-aligned state "
+                     "was never entered")
+    if zeros:
+        fails.append("the controller commanded exactly (0, 0) on %d frames "
+                     "while it had a target -- that is the statue state" % zeros)
+    if e21.n_goal_abandons < 1:
+        fails.append("a goal that stayed blocked for %d frames was never given "
+                     "up on: the same place can cost the run forever"
+                     % e21.goal_blocked_frames)
+    if e21._target is not None and tuple(e21._target) == (3.0, 0.0):
+        fails.append("the wedged goal is still the committed target -- the "
+                     "robot would drive at it again next frame")
+    print("    denied spots: %s" % ", ".join("(%.2f, %.2f)" % p
+                                             for p in e21._denied))
+    # ... and with a crude integrator (so the pose actually changes), still
+    # never a zero command.
+    e21b = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e21b._target = (3.0, 0.0)
+    e21b._target_kind = "sweep"
+    pose = [0.8, 0.0, 0.0]
+    zeros_b = 0
+    for i in range(30):
+        v21b, w21b, ex21b = e21b.command(w21, (pose[0], pose[1]), pose[2])
+        if abs(v21b) < 1e-9 and abs(w21b) < 1e-9:
+            zeros_b += 1
+        pose[0] += v21b * np.cos(pose[2]) * 0.2
+        pose[1] += v21b * np.sin(pose[2]) * 0.2
+        pose[2] += w21b * 0.2
+    print("    with a crude integrator for 30 frames: exact zeros %d, "
+          "final pose (%.2f, %.2f)" % (zeros_b, pose[0], pose[1]))
+    if zeros_b:
+        fails.append("the moving robot was told to do nothing on %d frames"
+                     % zeros_b)
+    # ---- and the budget is per goal, not per streak ----------------------
+    #
+    # This is the v18 pirouette, in one fixture.  The robot spent 40 s of a
+    # 245 s run at (-11.95, -1.95) in a cycle of 7 frames `turn`, 8 of `arc`,
+    # 2 of `drive`, repeat -- distance to the goal never falling -- while the
+    # escape counter sat at 7 for the whole run, because it counted a *streak*
+    # and the cycle kept breaking the streak.  A goal that keeps being blocked
+    # is unusable even if it is never blocked twice in a row, so the budget must
+    # be reset by a new goal (or by progress), and by nothing else.
+    e21c = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e21c._target = (3.0, 0.0)
+    e21c._target_kind = "sweep"
+    e21c._target_age = 0
+    i = 0
+    for i in range(120):
+        px = 0.8 if i % 2 else 0.4        # wedge / not-wedge, alternating
+        e21c.command(w21, (px, 0.0), 0.0)
+        if e21c.n_goal_abandons:
+            break
+    print("    alternating blocked / clear for %d frames: blocked %d, "
+          "abandons %d (budget %d)"
+          % (i + 1, e21c.n_goal_blocked_frames, e21c.n_goal_abandons,
+             e21c.goal_blocked_frames))
+    if e21c.n_goal_abandons < 1:
+        fails.append("a goal that is blocked every other frame was never given "
+                     "up on: the budget is per streak, not per goal, and the "
+                     "robot cycles there for the rest of the run")
+    # ---- and progress must buy a fresh budget ---------------------------
+    #
+    # The opposite failure, and the one that was measured in an earlier round:
+    # a give-up rule that punishes a long journey for being long.  A goal the
+    # robot keeps getting measurably closer to must never be abandoned, however
+    # often it is briefly blocked on the way.
+    e21d = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    e21d._target = (3.0, 0.0)
+    e21d._target_kind = "sweep"
+    e21d._target_age = 0
+    for i in range(70):
+        # blocked the whole time (the wall is at x=1.4 and the front guard looks
+        # 0.75 m), crawling towards the goal at 5 mm a frame.  Stops at 1.15: if
+        # it saturated before the end of the loop the robot would have stopped
+        # closing, and the case would be asserting the opposite of what it says.
+        px = 0.80 + 0.005 * i
+        e21d.command(w21, (px, 0.0), 0.0)
+    print("    blocked while closing on the goal for 70 frames: blocked %d, "
+          "abandons %d" % (e21d.n_goal_blocked_frames, e21d.n_goal_abandons))
+    if e21d.n_goal_blocked_frames == 0:
+        fails.append("case 21d lost its meaning: the robot was never blocked")
+    if e21d.n_goal_abandons:
+        fails.append("a goal the robot was measurably closing on was abandoned "
+                     "-- that is the give-up rule punishing a long journey, "
+                     "which an earlier round already measured as worse")
+
+    # --- 22. the pick must not be decided by the last decimal --------------
+    #
+    # Boss: "it cannot be a lottery every run, it has to be reliably good."
+    # Measured (2026-10-05): replaying one capture reproduces the poses to
+    # 5e-7 m -- KISS-ICP's neighbour search is order-dependent -- and the very
+    # first shadow viewpoint chosen was a *different place 3 m away*.  Over the
+    # whole run the two then agreed on only 49% of their states, 42 backoffs
+    # against 13, 6 sweep targets against 12.  A 1e-7 m perturbation must not do
+    # that, and it can only do it because the ranking is a continuous score
+    # between candidates that are a few percent apart.
+    print("22) ranking is quantised: a 1e-7 m perturbation cannot re-order it")
+    e22 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+    k_a = e22._rank_key(3.000, 3.0, 5.75, -1.15)
+    k_b = e22._rank_key(3.001, 3.0, 5.75, 1.15)      # 0.03% bigger score
+    k_c = e22._rank_key(3.400, 3.0, 5.75, 1.15)      # clearly bigger
+    k_d = e22._rank_key(3.000, 2.0, -1.55, -1.15)    # same score, nearer
+    print("    score 3.000 d3.0 (5.75,-1.15) -> %s" % (k_a,))
+    print("    score 3.001 d3.0 (5.75, 1.15) -> %s   (must tie: %s)"
+          % (k_b, k_a[0] == k_b[0]))
+    print("    score 3.400 d3.0 (5.75, 1.15) -> %s" % (k_c,))
+    print("    score 3.000 d2.0 (-1.55,-1.15) -> %s" % (k_d,))
+    if k_a[0] != k_b[0]:
+        fails.append("a 0.03%% larger score changed the ranking bucket -- that "
+                     "is the coin flip, still there")
+    if not k_c[0] < k_a[0]:
+        fails.append("a 13%% larger score did NOT win -- the quantisation ate a "
+                     "real difference")
+    if not k_d < k_a:
+        fails.append("with equal quantised scores the nearer candidate did not "
+                     "win")
+    # ... and the picker itself: two symmetric patches, the tie must go the same
+    # way both times, to the south one, rather than to whichever won a cell.
+    w22 = world(observed_to=6.0)
+    for x in np.arange(-1.9, 5.6, 0.2):
+        w22.traj.append((float(x), 0.0))
+    picks = []
+    for trial in range(2):
+        e22b = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9)
+        e22b._start_xy = (0.0, 0.0)
+        r22, _ = e22b._masks(w22, (5.5, 0.0))
+        t22 = e22b._pick_sweep_target(w22, r22, 5.5, 0.0)
+        picks.append(None if t22 is None else (round(t22[0], 2), round(t22[1], 2)))
+    print("    two symmetric patches, two independent picks: %s  %s"
+          % (picks[0], picks[1]))
+    if picks[0] is None:
+        fails.append("case 22 lost its meaning: no sweep target in the "
+                     "symmetric fixture")
+    elif picks[0] != picks[1]:
+        fails.append("two identical explorers chose different targets on the "
+                     "same map (%s vs %s)" % (picks[0], picks[1]))
+    elif picks[0][1] > 0:
+        fails.append("the tie-break is not the documented one: expected the "
+                     "south patch (smaller y), got %s" % (picks[0],))
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (19 checks)")
+    print("verdict: PASS (22 checks)")
     return 0
 
 

@@ -849,6 +849,12 @@ def main():
                 "anchor_y": ((cmd or {}).get("anchor") or (None, None))[1],
                 "cmd_v": (cmd or {}).get("v"),
                 "cmd_w": (cmd or {}).get("w"),
+                # "I am aligned with my aim and my aim is blocked" -- the one
+                # state whose command used to be (0, 0).  Logged separately from
+                # `explore_state` because the backoff that answers it overwrites
+                # the state name; without this column a run that wedges three
+                # times looks identical to one that backed off three times.
+                "wedge": int(bool((cmd or {}).get("wedge"))),
                 "frontier_cells": (cmd or {}).get("nf"),
                 # yaw and the clearance flag are logged because "the robot is
                 # not moving" has two completely different causes -- never
@@ -1120,6 +1126,37 @@ def main():
                      # picked again.
                      "blacklist_places": len(explorer._barren_spots),
                      "blacklisted_candidates": explorer.n_blacklisted,
+                     # --- the statue state, and the two things that removed it --
+                     #
+                     # Boss, 2026-10-05: "it still crouches in corners, and it
+                     # sat in two places next to shelves for a long time".
+                     # `frozen_frames` counts commands of exactly (0, 0) issued
+                     # while a target was held -- a command that carries no
+                     # information, so the next frame derives it again.  v16
+                     # spent 161 of its 1378 frames in that state (11.7% of the
+                     # run) and never reported an error.
+                     #
+                     # `los_shortened` is the fix for the *cause*: the lookahead
+                     # point is pulled in whenever the straight line to it is
+                     # not clear, so the aim stops pointing through a shelf.
+                     # `wedge_frames` / `wedge_abandons` are the fix for the
+                     # *symptom*: a robot that is aligned with a blocked aim
+                     # backs off at once, and a goal that survives that for
+                     # `wedge_frames` frames is dropped and denied rather than
+                     # ground at for the rest of the run.  All three must be
+                     # read together: `los_shortened == 0` would mean the
+                     # lookahead never fired, and `wedge_abandons` climbing
+                     # without `los_shortened` would mean the wedge is being
+                     # papered over instead of avoided.
+                     "frozen_frames": explorer.n_frozen_frames,
+                     "los_shortened": explorer.n_los_shortened,
+                     "los_grid": explorer.los_grid,
+                     "lookahead_m": explorer.lookahead_m,
+                     "wedge_frames": explorer.n_wedge_frames,
+                     "blocked_frames": explorer.n_goal_blocked_frames,
+                     "goal_blocked_budget": explorer.goal_blocked_frames,
+                     "goal_abandons": explorer.n_goal_abandons,
+                     "denied_goals": len(explorer._denied),
                      "done_reason": explorer.n_done_reason,
                      "cmd_published": sender.n_sent,
                      "cmd_connections": sender.n_connections,

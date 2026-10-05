@@ -85,7 +85,12 @@ class FrontierExplorer:
                  shadow_blacklist_m: float = 1.00,
                  shadow_max_range_m: float = 10.0,
                  shadow_shore_cells: int = 10,
-                 shadow_viewpoint_tries: int = 12):
+                 shadow_viewpoint_tries: int = 12,
+                 lookahead_m: float = 1.20, los_lookahead: bool = True,
+                 los_grid: str = "floor",
+                 wedge_frames: int = 20, wedge_deny_m: float = 0.90,
+                 goal_blocked_frames: int = 30,
+                 score_quantum_m2: float = 0.25, rank_quantum_m: float = 0.25):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
@@ -278,6 +283,126 @@ class FrontierExplorer:
         self._shadow_spot: Optional[Tuple[float, float]] = None
         self.n_shadow_probes = 0
         self.n_shadow_skipped = 0
+
+        # --- line-of-sight lookahead, and the wedge it prevents --------------
+        #
+        # See `_lookahead` for the measurement (v16: 43 s of a 275 s run spent
+        # commanding v = 0, w = 0 at (-7.6, 0.2)).  Two knobs and two counters:
+        self.lookahead_m = float(lookahead_m)
+        self.los_lookahead = bool(los_lookahead)
+        # Which grid the line-of-sight test reads.
+        #
+        #   "floor" -- known floor with the *confirmed* obstacles cut out
+        #              (`wmap.ground`).  "Is there a wall between me and it".
+        #   "walk"  -- the planner's own eroded free space.  Stricter: also
+        #              rejects a chord that passes closer to a wall than the
+        #              robot radius, which sounds safer and measures worse --
+        #              the erosion shell reaches 0.19 m in from every wall, so
+        #              near a wall *every* direction fails, the aim collapses to
+        #              the adjacent path cell, and the heading error to a point
+        #              0.1 m away is enormous.  Measured on the v16 replay: with
+        #              "walk" the robot spent 585 frames in `turn` against 536
+        #              for the un-fixed policy, i.e. the cure was as expensive as
+        #              the disease.  "floor" keeps the defect (aiming *through* a
+        #              wall) fixed and the intent (aim far ahead) intact, and it
+        #              is consistent with the near-field guard, which has always
+        #              tested the raw blocked layer with no radius margin.
+        self.los_grid = str(los_grid)
+        self.n_los_shortened = 0        # times the lookahead had to be pulled in
+        self.n_frozen_frames = 0        # emitted commands of exactly (0, 0)
+
+        # --- the wedge: aligned with the aim, and the aim is blocked ---------
+        #
+        # This is the one state the throttle can be in that has no exit.  `turn`
+        # has w = 1.6*err and reaches for a clear heading; `arc` drives; `drive`
+        # drives.  But when the robot is *already* pointing where it wants to go
+        # and something is in the way, turning produces w ~ 0 and driving is
+        # forbidden -- so the command is (0, 0) and the robot is a statue with a
+        # target.  Until v16 the only thing that ever broke it was the turn
+        # counter, which needs 18 blocked frames and then produces a backoff
+        # that puts the robot back where it started (measured: 42 backoffs in
+        # one 275 s run, no net movement from a stretch of 43 s).
+        #
+        # So a wedge triggers the backoff **immediately** rather than waiting the
+        # turn counter out: the state is not "turn harder", it is "back off and
+        # look again", and a robot that reverses is at least not a statue.
+        #
+        # --- the blocked budget: how long a goal may cost, once it is stuck --
+        #
+        # Two symptoms, one cause.  The statue (v16: `v = w = 0` for 43 s) and
+        # the pirouette (v18: 40 s at (-11.95, -1.95) spent in a
+        # turn/arc/drive/turn cycle, 5.5 revolutions, the distance to the goal
+        # never falling) are both "the robot is being asked for something this
+        # pose cannot deliver, and nothing gives up".
+        #
+        # The escape that existed was a frame counter, `_n_turn`, and it had the
+        # defect that makes counters useless here: **it counted a streak, not a
+        # goal**.  In v18 the cycle was 7 frames of `turn`, 8 of `arc`, 2 of
+        # `drive`, repeat -- so `_n_turn` was reset every 17 frames and the
+        # backoff that is supposed to break the cycle fired 7 times in the whole
+        # run while the robot turned through five and a half revolutions.  A
+        # streak counter answers "is it blocked right now"; what decides whether
+        # to give up is "how much of this goal's budget has been spent blocked".
+        #
+        # So: `goal_blocked_frames` frames in which the robot was blocked
+        # (`turn` or `wedge`) **and made no measurable progress toward the goal**
+        # ends the goal -- it is dropped, denied (`wedge_deny_m` around it) and a
+        # new one is chosen.  Progress resets the budget, which is what
+        # distinguishes this from the distance-based give-up that was measured to
+        # be *worse* in an earlier round (`sweep_stuck_frames`): that one
+        # punished a long journey for being long, while this one only counts the
+        # frames in which the robot could not do what it was told.
+        #
+        # 30 frames = 6 s of being blocked with nothing to show for it.  On the
+        # v18 trace that is reached 4 cycles in, i.e. ~30 s before the run's own
+        # limit did it.
+        self.goal_blocked_frames = int(goal_blocked_frames)
+        # How much closer counts as progress.  Deliberately much smaller than
+        # `sweep_stuck_improve_m` (0.5 m), because the two questions are
+        # different: that one asks "is this journey still going anywhere", this
+        # one asks "is the robot stuck".  A robot crawling towards its goal at
+        # 5 mm a frame IS getting there, and a 0.5 m threshold would spend the
+        # whole 30-frame budget before it earned a reset -- which is precisely
+        # the "punishes a long journey" defect an earlier round measured. 2 cm is
+        # above the pose noise (0.12 m p50 on this map, but the *difference*
+        # between consecutive frames is what is compared here) and small enough
+        # that any real closure clears it.
+        self.progress_eps_m = 0.02
+        self._n_blocked = 0                # blocked frames, this goal
+        self._block_best = float("inf")    # closest this goal has been
+        self.n_goal_blocked_frames = 0
+        self.n_goal_abandons = 0
+
+        # `wedge_deny_m` is how big a place to write off.  It is a radius around
+        # the *abandoned target*, not around the robot: what is unusable is that
+        # goal, not the floor the robot is standing on.
+        self.wedge_deny_m = float(wedge_deny_m)
+        self.n_wedge_frames = 0
+        self.wedge_frames = int(wedge_frames)   # only used by the unit test now
+        self._denied: List[Tuple[float, float]] = []
+
+        # --- ranking has to survive a 1e-7 m perturbation --------------------
+        #
+        # Measured, and it is the whole of boss's "every run is a lottery"
+        # (2026-10-05).  Replaying one capture through the pipeline reproduces
+        # the poses to **5e-7 m** -- not bit-exact, because KISS-ICP's neighbour
+        # search is order-dependent -- and the very first shadow viewpoint it
+        # chose was a different place 3 m away.  From there the two runs agree on
+        # only 49% of their states: 42 backoffs against 13, 6 sweep targets
+        # against 12.  A 1e-7 m difference must not be able to do that.
+        #
+        # It can, because the pickers rank by a continuous score and the top two
+        # candidates here are within a few percent of each other: `-size/(1+d)`
+        # with 1.02 m2 against 1.05 m2 is a coin flip decided by which pocket
+        # gained a cell.  Quantising the score -- and then the tie-break -- makes
+        # the choice a function of the *structure* of the map rather than of its
+        # last decimal: two candidates within `score_quantum_m2` of each other
+        # are declared equal and the nearer one wins, and if they are equal in
+        # distance too, the one further south-west does.  Both are arbitrary but
+        # both are *stable*, which is the property that was missing.
+        self.score_quantum_m2 = float(score_quantum_m2)
+        self.rank_quantum_m = float(rank_quantum_m)
+
         self.n_sweep_abandoned = 0
         self._sw_best = float("inf")
         self._sw_since = 0
@@ -1034,6 +1159,34 @@ class FrontierExplorer:
                 break
         return None
 
+    def _is_denied(self, x: float, y: float) -> bool:
+        """Has this goal been written off by the wedge rule?"""
+        if not self._denied:
+            return False
+        r2 = self.wedge_deny_m ** 2
+        return any((x - bx) ** 2 + (y - by) ** 2 <= r2 for bx, by in self._denied)
+
+    def _deny(self, x: float, y: float) -> None:
+        self._denied.append((float(x), float(y)))
+
+    def _rank_key(self, score: float, d: float, px: float, py: float) -> tuple:
+        """A five-cent coin instead of a thousandth of a millimetre.
+
+        `score` is descending-is-better (m2), `d` is metres from the start,
+        `(px, py)` is the target.  Everything is quantised, and the quantisation
+        is the point -- see the note on `score_quantum_m2` in `__init__`: a
+        1e-7 m perturbation of the pose reached the target picker through the
+        map and changed the goal by 3 m, because two candidates 3% apart in
+        score were being ordered by which one won a cell.  After this they are
+        ordered by size, then by distance, then by position, all to a fixed
+        resolution -- so a difference below that resolution is *declared* equal
+        instead of silently deciding the run.
+        """
+        q = max(self.score_quantum_m2, 1e-9)
+        qm = max(self.rank_quantum_m, 1e-9)
+        return (-int(round(score / q)), int(round(d / qm)),
+                int(round(px / qm)), int(round(py / qm)))
+
     def _pick_sweep_target(self, wmap, reach, x0, y0):
         """A sizeable reachable patch of floor the robot has never been near.
 
@@ -1145,9 +1298,14 @@ class FrontierExplorer:
                     continue
                 d0 = float(d_start.min())
                 ncell = int(sz[L])
-                out.append((-ncell / (1.0 + d0), d0, float(wx[j]), float(wy[j]),
+                tx, ty = float(wx[j]), float(wy[j])
+                if self._is_denied(tx, ty):
+                    continue
+                score = ncell * cell / (1.0 + d0)
+                out.append((self._rank_key(score, d0, tx, ty), d0, tx, ty,
                             ncell, L))
-            # Biggest-and-nearest first: `-size/(1+d)`, see the docstring.
+            # Biggest-and-nearest first, quantised so that two patches a few
+            # percent apart do not change places on a floating-point hiccup.
             out.sort(key=lambda c: c[0])
             return out
 
@@ -1332,7 +1490,11 @@ class FrontierExplorer:
                 self.n_shadow_skipped += 1
                 continue
             _k, vx, vy, _nv = best
-            cands.append((-area / (1.0 + d0), vx, vy, mx, my, int(sz[L])))
+            if self._is_denied(vx, vy) or self._is_denied(mx, my):
+                continue
+            score = area / (1.0 + d0)
+            cands.append((self._rank_key(score, d0, vx, vy),
+                          vx, vy, mx, my, int(sz[L])))
         cands.sort(key=lambda c: c[0])
         for _s, vx, vy, mx, my, ncell in cands[:self.max_plans_per_pick]:
             path = self.planner.plan(wmap, (x0, y0), (vx, vy))
@@ -1527,21 +1689,29 @@ class FrontierExplorer:
                     continue
                 keep.append(i)
             pool = keep
+        # ... and anything the wedge rule has written off: a frontier the robot
+        # physically could not get to is not a frontier, whatever the grid says.
+        if self._denied and pool:
+            pool = [i for i in pool if not self._is_denied(float(wx[i]),
+                                                           float(wy[i]))]
         if not pool:
             return None, None, 0
 
         def score(i):
-            return fsize[i] / (1.0 + dist[i])
+            # Quantised: see `_rank_key`.  The frontier score has the same
+            # near-tie problem as the sweep and shadow scores -- `size/(1+d)`
+            # between a 30-cell and a 31-cell cluster is a coin flip.
+            return self._rank_key(fsize[i] / (1.0 + dist[i]), float(dist[i]),
+                                  float(wx[i]), float(wy[i]))
 
         reps = {}
         for i in pool:                      # one per sector, best-scoring first
             s = int(sec[i])
-            if s not in reps or score(i) > score(reps[s]):
+            if s not in reps or score(i) < score(reps[s]):
                 reps[s] = i
-        first = sorted(reps.values(), key=lambda i: -score(i))
+        first = sorted(reps.values(), key=score)
         chosen = set(first)
-        rest = sorted((i for i in pool if i not in chosen),
-                      key=lambda i: -score(i))
+        rest = sorted((i for i in pool if i not in chosen), key=score)
         cand = first + rest[:self.max_candidates]
         self.last_candidates = cand
 
@@ -1605,22 +1775,96 @@ class FrontierExplorer:
             r += wmap.resolution
         return tx, ty, False                   # nowhere walkable: keep the frontier
 
+    def _los_ok(self, wmap, x0, y0, x1, y1, grid=None) -> bool:
+        """Is the straight segment (x0,y0)->(x1,y1) free on `grid`?
+
+        `grid` is the grid the caller wants the question asked on -- see
+        `los_grid` in `__init__` for which one and why.  With `grid=None` the
+        raw blocked layer is used, which is what the near-field guard has always
+        done.
+
+        The first sample is skipped: the robot's own cell is allowed to sit
+        inside the inflation shell (see `_masks`), so requiring free space
+        *under* the robot would reject every segment.
+        """
+        d = float(np.hypot(x1 - x0, y1 - y0))
+        if d <= 1e-9:
+            return True
+        n = max(int(d / self.clearance_step), 3)
+        ts = np.linspace(0.0, 1.0, n)[1:]
+        xs = x0 + (x1 - x0) * ts
+        ys = y0 + (y1 - y0) * ts
+        cx, cy = wmap.cell_of(xs, ys)
+        ok = wmap._in(cx, cy)
+        if not ok.all():
+            # off the map: the unknown ahead is not proof of a blockage, and
+            # refusing to drive into unmapped space would freeze the robot at
+            # the rim of its own map, which is where it starts.
+            return True
+        if grid is None:
+            return not bool(wmap.blocked()[cy[ok], cx[ok]].any())
+        return bool(grid[cy[ok], cx[ok]].all())
+
     def _lookahead(self, path: Sequence[Tuple[float, float]],
-                   pose_xy) -> Tuple[float, float]:
-        """Furthest waypoint within 1.2 m of the robot.
+                   pose_xy, wmap=None) -> Tuple[float, float]:
+        """Furthest waypoint within `lookahead_m` that is **in line of sight**.
 
         Aiming at the next cell of a 0.1 m grid makes the base weave; aiming at
         the point 1.2 m along the route keeps it on a straight line while still
-        cutting the corner it is about to reach.  Same rule as the navigator's,
-        deliberately -- two followers with different lookaheads would make the
-        handover visible in the video.
+        cutting the corner it is about to reach.  That was the original rule and
+        the first half of it is still right.
+
+        The second half is what was wrong, and it cost the whole run.  A point
+        1.2 m along the path is *around the bend* whenever the path turns
+        sharply, and on this map that happens exactly where the robot has to
+        squeeze past furniture.  The aim then points into the shelf; the
+        throttle asks `_ahead_clear` about the direction it is pointing, hears
+        "blocked", and -- because the heading error is now *zero*, the robot
+        being aligned with its own bad aim -- commands `v = 0, w = 1.6*0 = 0`.
+
+        Measured on v16 (t = 211.7-254.9 s, 43 s of a 275 s run): the robot sat
+        at (-7.6, 0.2) with `state=turn`, `heading_err_deg` 0.0-0.1 and
+        `v = w = 0`, re-approaching and re-freezing after every backoff, and
+        arrived at **8** targets in the whole run.  Nothing reported an error,
+        because nothing was wrong by the letter of the controller -- it was
+        doing exactly what it had been told.
+
+        The classic fix, and the one used here, is **line-of-sight lookahead**:
+        return the furthest path point within `lookahead_m` whose straight
+        segment from the robot is drivable, and shorten the lookahead until one
+        is.  The aim then always points along a direction the robot can actually
+        drive, so the throttle's "blocked" case stops being reachable by
+        construction rather than by luck.
         """
-        best = path[0]
-        for p in path[1:]:
-            if float(np.hypot(p[0] - pose_xy[0], p[1] - pose_xy[1])) > 1.2:
+        if not path:
+            return pose_xy
+        tries = []
+        for p in path:
+            if float(np.hypot(p[0] - pose_xy[0],
+                              p[1] - pose_xy[1])) > self.lookahead_m:
                 break
-            best = p
-        return best
+            tries.append(p)
+        if not tries:
+            tries = [path[0]]
+        grid = None
+        if wmap is not None and self.los_lookahead:
+            grid = (wmap.ground if self.los_grid == "floor"
+                    else self.planner.free_space(wmap))
+        if not tries:
+            return pose_xy if not path else path[0]
+        if grid is None:
+            return tries[-1]
+        for p in reversed(tries):
+            if self._los_ok(wmap, pose_xy[0], pose_xy[1], p[0], p[1], grid):
+                if p is not tries[-1]:
+                    self.n_los_shortened += 1
+                return p
+        # Nothing on the path is in line of sight -- the robot is inside the
+        # inflation shell of something, or the path starts behind it.  Steering
+        # at the nearest waypoint is still the best available answer; the
+        # throttle's wedge handling (see `command`) is what gets us out.
+        self.n_los_shortened += 1
+        return tries[0]
 
     def _clear(self, wmap, x0, y0, x1, y1) -> bool:
         """Ray-march the occupancy grid; False if the line hits an obstacle."""
@@ -2058,6 +2302,10 @@ class FrontierExplorer:
             if prev_target is not None and target_res != prev_target:
                 self.n_switches += 1
             self._target = target_res
+            # The blocked budget belongs to the goal, so this -- and not "the
+            # front happened to be clear this frame" -- is where it resets.
+            self._n_blocked = 0
+            self._block_best = float("inf")
             # For a frontier the anchor was already set to the cluster centroid
             # (the viewpoint is not what gets retired); for the other kinds the
             # target *is* the anchor.
@@ -2086,7 +2334,7 @@ class FrontierExplorer:
         if route:
             self.n_routed += 1
             route = self._plan(wmap, (x0, y0), (tx, ty)) or route
-            aim = self._lookahead(route, (x0, y0))
+            aim = self._lookahead(route, (x0, y0), wmap)
             self._path = route
         else:
             self.n_straight += 1
@@ -2098,7 +2346,7 @@ class FrontierExplorer:
                 if planned:
                     route = planned
                     self._path = planned
-                    aim = self._lookahead(planned, (x0, y0))
+                    aim = self._lookahead(planned, (x0, y0), wmap)
             else:
                 self._path = []
 
@@ -2109,23 +2357,31 @@ class FrontierExplorer:
         # slow down near the target so it does not overshoot into the unknown
         scale = min(1.0, max(float(np.hypot(tx - x0, ty - y0)) / 1.5, 0.35))
 
-        # --- throttle: three cases, not two --------------------------------
-        # `turn` is now reserved for "the way I am pointing is blocked".  When
-        # the heading is merely *wrong* and the direction being turned towards
-        # is clear, the base arcs instead of stopping -- see `arc_scale`.
+        # --- throttle: four cases, and the fourth exists to be escaped --------
+        # `turn` is reserved for "the way I am pointing is blocked".  When the
+        # heading is merely *wrong* and the direction being turned towards is
+        # clear, the base arcs instead of stopping -- see `arc_scale`.
+        #
+        # `wedge` is the case that used to be folded into `turn` and must not
+        # be: **aligned with the aim, and the aim is blocked**.  Folding it in
+        # produced `v = 0` with `w = 1.6 * 0 = 0` -- a command to do nothing --
+        # and it is the state that gave boss a robot parked in a corner for 43
+        # seconds of a 275 s run.  It is named, counted and escaped; see
+        # `wedge_frames` in `__init__`.
         ahead = self._ahead_clear(wmap, x0, y0, yaw)
         turn_sign = 1.0 if err > 0 else -1.0
-        if not ahead:
-            mode, v = "turn", 0.0
-        elif err_deg <= self.turn_only_deg:
+        aligned = err_deg <= self.turn_only_deg
+        if aligned and ahead:
             mode, v = "drive", self.v_max * scale
+        elif aligned:
+            mode, v = "wedge", 0.0
         elif err_deg <= self.arc_max_deg and self._ahead_clear(
                 wmap, x0, y0,
                 yaw + turn_sign * np.radians(min(err_deg, self.arc_probe_deg))):
             mode, v = "arc", self.v_max * self.arc_scale * scale
         else:
             mode, v = "turn", 0.0
-        blocked = (mode == "turn")
+        blocked = (mode in ("turn", "wedge"))
         if mode == "arc":
             self.n_arc_frames += 1
 
@@ -2142,17 +2398,64 @@ class FrontierExplorer:
                      "dist": round(float(np.hypot(tx - x0, ty - y0)), 2),
                      "heading_err_deg": round(float(np.degrees(err)), 1),
                      "ahead_clear": bool(ahead),
+                     # `wedge` is reported separately from `mode` because the
+                     # backoff block below overwrites `state`: the *motion* is a
+                     # backoff, but the *reason* is a wedge, and only the reason
+                     # tells you whether to go and read the map around the robot.
+                     "wedge": bool(mode == "wedge"),
                      "route_m": round(path_length(route), 2) if route else 0.0,
                      "routed": bool(route)})
 
         # --- stuck recovery -------------------------------------------------
+        #
+        # Two independent things happen here, and they are worth keeping apart:
+        #
+        #   1. **Motion.** A blocked frame is answered by a backoff -- at once
+        #      for a wedge (turning cannot help), after `max_turn_frames` for a
+        #      turn (turning is exactly the right thing, so give it a moment).
+        #   2. **Bookkeeping.** `_n_blocked` counts the blocked frames *of this
+        #      goal*, and the goal is dropped when its budget runs out.  The
+        #      budget is reset by a new goal and by measurable progress toward
+        #      the current one -- never by a frame that merely was not blocked,
+        #      which is the bug that made v18 pirouette for 40 s with a counter
+        #      sitting at 7.
         if blocked:
             self._n_turn += 1
-            if self._n_turn > self.max_turn_frames and self._backoff <= 0:
+            self.n_goal_blocked_frames += 1
+            if mode == "wedge":
+                self.n_wedge_frames += 1
+                if self._backoff <= 0:
+                    self._backoff = self.backoff_frames
+                    self._backoff_sign = -self._backoff_sign
+                    self.n_backoffs += 1
+            elif self._n_turn > self.max_turn_frames and self._backoff <= 0:
                 self._backoff = self.backoff_frames
                 self._backoff_sign = -self._backoff_sign
                 self._n_turn = 0
                 self.n_backoffs += 1
+
+            d_now = float(np.hypot(tx - x0, ty - y0))
+            if d_now < self._block_best - self.progress_eps_m:
+                self._block_best = d_now          # getting somewhere: new budget
+                self._n_blocked = 0
+            else:
+                self._n_blocked += 1
+                if self._n_blocked >= self.goal_blocked_frames:
+                    # Spent.  What is unusable is the *goal*, not the floor the
+                    # robot is standing on, so the goal is dropped and written
+                    # off -- otherwise the next frame picks it again and the next
+                    # 6 s look exactly like the last 6 s.
+                    self._deny(tx, ty)
+                    self.n_goal_abandons += 1
+                    self.n_sweep_abandoned += 1
+                    self._target = None
+                    self._target_anchor = None
+                    self._target_standoff = False
+                    self._path = []
+                    self._since_plan = 10 ** 9
+                    self._n_blocked = 0
+                    self._block_best = float("inf")
+                    self._sw_best = float("inf")
         else:
             self._n_turn = 0
 
@@ -2163,6 +2466,14 @@ class FrontierExplorer:
             info["v"] = round(-self.v_max * 0.45, 3)
             info["w"] = round(self.w_max * 0.55 * self._backoff_sign, 3)
             return info["v"], info["w"], info
+
+        # An invariant, counted rather than assumed: with a target in hand, the
+        # controller must never ask the base to do nothing.  "Do nothing" is not
+        # a state the robot can recover from on its own -- it has no new
+        # information, so it re-derives the same command next frame, forever.
+        # v16 spent 43 s that way and reported no error at all.
+        if abs(v) < 1e-9 and abs(w) < 1e-9:
+            self.n_frozen_frames += 1
 
         return v, w, info
 
