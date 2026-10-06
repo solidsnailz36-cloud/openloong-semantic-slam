@@ -835,6 +835,20 @@ class FrontierExplorer:
         self.n_gate_bad = 0             # ... of which not
         self.n_gate_all_bad = 0         # decisions where nothing was routable
         self.n_gate_top_rejected = 0    # decisions where the ungated head was unroutable
+        # --- section 30's mechanism check ------------------------------------
+        #
+        # Boss, 2026-10-06: "confirm that after `survey filter -> region rank`,
+        # the candidate entering `_plan_first` still carries the **best legal
+        # rank in the current candidate set**".  That is `head rank` below, and
+        # it has to be 0 on every decision.  It is a different reading from
+        # `fallthrough` (the rank of the place finally *taken*), because a pick
+        # can legitimately fall through for a routing reason -- the head was
+        # unroutable.  Keeping them apart is the difference between "the ranking
+        # was rewritten" and "the map had no route".
+        self.n_head_rank_nonzero = 0
+        self.first_head_rank_t = None
+        self.n_rfirst_offrank = 0       # picks whose taken region was not rank 0
+        self.first_offrank_t = None
         self.gate_hist: List[dict] = []  # per decision, for the report
         # One decision's plan results, keyed by target.  The gate plans each
         # region's representative and `_plan_first` then tries the same places
@@ -1589,6 +1603,20 @@ class FrontierExplorer:
         self.pick_sizes.append(rec)
         if len(self.pick_sizes) > 600:
             del self.pick_sizes[:300]
+        # --- section 30's mechanism check, at the point of handover ----------
+        #
+        # This is the head of the list `_plan_first` is about to walk, so it is
+        # exactly boss's "the candidate entering `_plan_first`".  With the survey
+        # constraint applied before the ranking it must be 0 on **every** decision;
+        # with the constraint applied after (the old order) it was 4 on a list of
+        # five places.
+        if self.rfirst and cands:
+            head_rank = int(cands[0][-1])
+            if head_rank != 0:
+                self.n_head_rank_nonzero += 1
+                if self.first_head_rank_t is None:
+                    self.first_head_rank_t = round(
+                        float(self._last_stamp or 0.0), 1)
         # Which rule produced the list `_plan_first` is about to walk.  Kept so a
         # pick can be attributed to the rule that built its candidate set, which
         # is the difference between "the region layer chose this" and "the survey
@@ -1791,7 +1819,23 @@ class FrontierExplorer:
         if self.rfirst:
             out.update(n_rfirst_picks=self.n_rfirst_picks,
                        n_rfirst_top=self.n_rfirst_top_used,
-                       rfirst_score_mode=self.rfirst_score_mode)
+                       rfirst_score_mode=self.rfirst_score_mode,
+                       # --- section 30's two readings, kept apart on purpose ---
+                       # `head rank != 0` means the ranking was rewritten before
+                       # the list reached the picker (the defect of section 29,
+                       # must now be 0 on every decision).
+                       # `off-rank picks` means the place finally taken was not in
+                       # the first region -- legitimate when the head could not be
+                       # routed, and the two are told apart by whether the head
+                       # rank was 0.
+                       n_head_rank_nonzero=self.n_head_rank_nonzero,
+                       first_head_rank_t=(self.first_head_rank_t
+                                          if self.first_head_rank_t is not None
+                                          else -1.0),
+                       n_rfirst_offrank=self.n_rfirst_offrank,
+                       first_offrank_t=(self.first_offrank_t
+                                        if self.first_offrank_t is not None
+                                        else -1.0))
         # --- Gate 5: does the region layer actually decide? ------------------
         #
         # Boss, 2026-10-06: "acceptance is hard -- `fallthrough -> 0`, and the
@@ -2747,7 +2791,7 @@ class FrontierExplorer:
                 return 0.0
             return float(fresh[ys_i[ok], xs_i[ok]].sum()) * cell
 
-        def gather(labels, min_area):
+        def gather(labels, min_area, keep=None):
             out = []
             rows = []
             for L in labels:
@@ -2792,6 +2836,13 @@ class FrontierExplorer:
                 # places do I go to first" -- nearest, since the expected gain is
                 # the same patch.
                 for px, py in patch_points(ys, xs, dep, wx, wy):
+                    # The eligibility constraint belongs **here**, before any
+                    # ranking exists.  See the note at the call site: applying it
+                    # to an already-ranked list is what let a filtered-out head
+                    # (rank 4 in a 5-place list) be handed to `_plan_first` as if
+                    # it were the region winner.
+                    if keep is not None and not keep(float(px), float(py)):
+                        continue
                     cd = float(np.hypot(px - x0, py - y0))
                     # The candidate-level extra.  Which travel cost it carries is
                     # the whole of section 24 -- see `cand_local_dist_mode`:
@@ -2973,22 +3024,53 @@ class FrontierExplorer:
         #
         # Both are the same mistake in different clothes: treating "there is
         # nothing to do *yet*" as "there is nothing to do".
-        all_c = gather(range(1, n), self.sweep_min_m2)
-        new_c = []
-        if self.sweep_survey:
+        # --- the survey constraint, applied **before** any ranking ------------
+        #
+        # Boss, 2026-10-06 (docs section 30): "move the survey filter ahead of the
+        # region ranking.  Not 'recompute the rank after filtering' -- that is
+        # semantically 'decide who should win, then delete the losers, then decide
+        # again'.  The clean definition is: **the region rank must be defined on
+        # the candidate set that is actually eligible to compete**:
+        #
+        #     gather -> survey constraint -> region ranking -> point ranking
+        #
+        # What was wrong before: the filter ran over an already-ranked list and the
+        # ranks were never recomputed, so the executing set was B while the ranking
+        # had been computed on A.  Measured on the frozen capture (section 29), a
+        # pick with five candidates was decided by one whose region rank was **4**.
+        #
+        # Only the **order** changes here.  `fresh`, `patch_points`,
+        # `sweep_cands_per_patch` and `sweep_stop_spread_m` are untouched -- the
+        # same constraint, with the same radius, applied one step earlier.
+        survey_keep = None
+        if self.sweep_survey and self._survey_stops:
             spread = self.sweep_stop_spread_m ** 2
-            new_c = [c for c in all_c
-                     if all((c[2] - bx) ** 2 + (c[3] - by) ** 2 > spread
-                            for bx, by in self._survey_stops)]
-        survey_pick = bool(new_c)
+            stops = [(float(a), float(b)) for a, b in self._survey_stops]
+
+            def survey_keep(px, py):
+                return all((px - bx) ** 2 + (py - by) ** 2 > spread
+                           for bx, by in stops)
+
+        first_c = gather(range(1, n), self.sweep_min_m2, survey_keep)
+        # With no survey stops there is nothing to filter, so `first_c` is already
+        # the unfiltered list and the fallbacks below reuse it instead of paying
+        # for a second pass over the map.
+        unfiltered = first_c if survey_keep is None else None
+        # "The survey is on offer" has to keep meaning the same thing it did when
+        # the filter was a list comprehension: with `sweep_survey` off the old
+        # code built an empty `new_c` and this was False, **not** `bool(all_c)`.
+        # Getting that wrong drops the patch lock and opens a new patch while the
+        # first still has floor -- which is exactly what case 17 caught.
+        survey_pick = bool(first_c) if self.sweep_survey else False
         self.sweep_first_pass = survey_pick      # reported: was it on offer
         if survey_pick:
-            cands = new_c
+            cands = first_c
             locked = 0
         elif locked:
             cands = gather([locked], self.sweep_patch_keep_m2)
         else:
-            cands = all_c
+            cands = (unfiltered if unfiltered is not None
+                     else gather(range(1, n), self.sweep_min_m2))
         self._note_pick_size("survey" if survey_pick else
                              ("locked" if locked else "global"),
                              cands, x0, y0)
@@ -3230,6 +3312,16 @@ class FrontierExplorer:
                     self.n_rfirst_picks += 1
                     if cr == 0:
                         self.n_rfirst_top_used += 1
+                    else:
+                        # The place taken is not in the region the layer ranked
+                        # first.  With the constraint moved ahead of the ranking
+                        # the only remaining cause is routing (the head was
+                        # unplannable), which is why this is counted separately
+                        # from `n_head_rank_nonzero`.
+                        self.n_rfirst_offrank += 1
+                        if self.first_offrank_t is None:
+                            self.first_offrank_t = round(
+                                float(self._last_stamp or 0.0), 1)
                     if len(self.rfirst_picks) < 60:
                         self.rfirst_picks.append(dict(
                             t=round(float(self._last_stamp or 0.0), 1),
