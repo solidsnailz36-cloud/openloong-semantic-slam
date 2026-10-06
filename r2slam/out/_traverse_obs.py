@@ -109,6 +109,8 @@ def main():
                     help="also write per-frame (stamp, pose, new m2 by room) "
                          "as .npy -- this is what `_vantage_obs.py` turns into "
                          "an observation-value map")
+    ap.add_argument("--dump-cells", default=None,
+                    help="also write per-cell first-seen frame indices as .npz")
     a = ap.parse_args()
 
     fr = load_frames(os.path.join(a.run, "frames.csv"))
@@ -145,6 +147,17 @@ def main():
     # abandoned: that layer carries speckle around the robot itself (median
     # first-hit 0.20 m over 360 rays), so it is not a wall map.
     framerec = []
+    # Per-cell first-seen bookkeeping.  Every floor cell is first seen exactly
+    # once, so these two arrays together have one element per cell of the final
+    # `ground_ever` -- a few tens of thousands of int32, i.e. free.  They exist
+    # because `V` computed from a *static* per-pose new-area is wrong in a
+    # specific way: the same high-value cell keeps paying out at every decision
+    # point, so a ranking that always walks to it looks optimal and in fact
+    # collapses onto one target.  With the cell's first-seen time in hand,
+    # "value still available at time t" becomes a question the data can answer.
+    cell_flat = []
+    cell_fr = []
+    n_side = int(wmap.ground_ever.shape[0])
     n_matched = n_lost = 0
     tot_new = 0.0
 
@@ -186,6 +199,9 @@ def main():
         my_room = room_of(rec["px"], rec["py"])
         cnt = {n: 0 for n in ROOM_KEYS}
         if n_new:
+            cell_flat.append((niy.astype(np.int64) * n_side
+                              + nix.astype(np.int64)).astype(np.int64))
+            cell_fr.append(np.full(n_new, len(framerec), dtype=np.int32))
             inbox = np.zeros(n_new, bool)
             for nm, cx, cy, h in ROOMS:
                 x0, x1, y0, y1 = box_cells(cx, cy, h)
@@ -286,6 +302,16 @@ def main():
         np.save(a.dump_frames, np.array(framerec, dtype=np.float64))
         print("  -> %s  列: stamp, px, py, pose_room, target_room, %s"
               % (a.dump_frames, ", ".join("new_" + k for k in ROOM_KEYS)))
+    if a.dump_cells:
+        np.savez(a.dump_cells,
+                 cell=(np.concatenate(cell_flat) if cell_flat
+                       else np.zeros(0, np.int64)),
+                 frame=(np.concatenate(cell_fr) if cell_fr
+                        else np.zeros(0, np.int32)),
+                 n_side=np.int32(n_side), resolution=np.float64(wmap.resolution),
+                 extent=np.float64(wmap.extent))
+        print("  -> %s  (%d 格首见记录；row = iy*n_side + ix)"
+              % (a.dump_cells, sum(len(c) for c in cell_flat)))
     return 0
 
 
