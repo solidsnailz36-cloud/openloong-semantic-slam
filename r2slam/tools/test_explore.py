@@ -1684,13 +1684,175 @@ def main():
                      "cost the term carries (term lists %r vs %r)"
                      % (t_cand[:3], t_patch[:3]))
 
+    print("29) region-level starvation: the object is the tile of the map, not "
+          "the patch")
+    # Boss, 2026-10-06: "the map already knows there is something there, the
+    # candidate already exists, and the planner still does not give the long-
+    # unhandled region a chance.  Build the region-level prototype, not a
+    # hard-coded 'first N targets must be rooms'."
+    #
+    # The distinction being tested is one of **identity**.  A fresh patch is
+    # re-cut on every pick and its label changes with every frame, so it cannot
+    # carry a clock; a tile of the map has the same name on frame 1 and frame
+    # 900, which is what makes "how long has this been neglected" answerable.
+    w29 = two_rooms()
+
+    def build29(**kw):
+        """Six frames so the region table exists, on a robot that never moves.
+
+        Standing still is deliberate: it means the only source of a gradient in
+        this fixture is the one the case injects, so the assertions below are
+        about the mechanism and not about the fixture's geometry.
+        """
+        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                             sweep_cands_per_patch=4, **kw)
+        t = 0.0
+        for _ in range(6):
+            t += 1.0
+            e.command(w29, (0.0, 0.0), 0.0, stamp=t)
+        return e
+
+    def pick29(e):
+        # Reset the two latches, or the second pick in a row is answered from
+        # the first one's commitment rather than from the ranking.
+        e._survey_stops = []
+        e._sweep_patch_mask = None
+        e._sweep_patch_stops = 0
+        r, _x = e._masks(w29, (0.0, 0.0))
+        p = e._pick_sweep_target(w29, r, 0.0, 0.0)
+        return None if p is None else (round(p[0], 2), round(p[1], 2))
+
+    def age_tiles(e, side, age):
+        """Push every tile on one side of the corridor `age` seconds back.
+
+        White box, and honestly so: the fixture's robot does not move and the
+        fixture's trajectory is empty, so nothing in the fixture can make one
+        tile older than another.  A real run's gradient comes from the robot
+        actually working some tiles and driving past others, which is exactly
+        what `_region_update` measures there.
+        """
+        res = w29.resolution
+        b = e._region_px(w29)
+        n = 0
+        for (ry, rx), st in list(e._region.items()):
+            cx = (rx * b + b / 2.0) * res - w29.extent
+            cy = (ry * b + b / 2.0) * res - w29.extent
+            if abs(cy) > 1.4:
+                continue                      # the corridor's own walls
+            if (cx > 0.9 and side == "east") or (cx < -0.9 and side == "west"):
+                st["att_t"] -= age
+                n += 1
+        return n
+
+    # (a) the control arm must be an exact no-op: no table, no history, and the
+    # standing pick.  This is boss's acceptance condition 4 at the top level --
+    # the layer may not run at all at lambda = 0.
+    e29_off = build29(region_lambda=0.0)
+    p29_off = pick29(e29_off)
+    if e29_off.n_region_live or e29_off.region_hist:
+        fails.append("region_lambda=0 built region state (%d tiles, %d picks): "
+                     "the control arm has to be an exact no-op"
+                     % (e29_off.n_region_live, len(e29_off.region_hist)))
+    if e29_off.pick_stats().get("r_rid_med") is not None:
+        fails.append("the region instrument reported on the lambda=0 arm")
+
+    e29 = build29(region_lambda=2.0)
+    print("    region table after 6 s: %d tiles live, %d starved (grace %.0f s)"
+          % (e29.n_region_live, e29.n_region_starved, e29.region_grace_s))
+    if e29.n_region_live < 4:
+        fails.append("only %d tiles in the table on a two-room map: the state "
+                     "layer is not covering the floor" % e29.n_region_live)
+
+    # (b) no gradient means no change.  Every tile's clock started when the map
+    # learned it, so on a robot that has not moved they are all equally old and
+    # the term must be inert.  Asserted because this is the *same shape* that
+    # made the patch debt useless (every candidate shares one weight), and the
+    # layer has to be honest about when it has nothing to say.
+    p29_flat = pick29(e29)
+    sw_before = e29.n_region_swaps
+    if p29_flat != p29_off or sw_before:
+        fails.append("with every tile equally old the term changed the pick "
+                     "(%s vs %s, %d swaps): a flat clock must be a no-op"
+                     % (p29_flat, p29_off, sw_before))
+
+    # (c) age one side only.  The pick must move to that side, and only that
+    # side: a term that promotes the neglected region but also fires when the
+    # *other* region is the neglected one is not measuring neglect.
+    n_east = age_tiles(e29, "east", 200.0)
+    p29_east = pick29(e29)
+    h29 = e29.region_hist[-1] if e29.region_hist else {}
+    print("    aged the east side only (%d tiles): %s -> %s  |  #rid %s, "
+          "dhat spread %s, swaps %d, bad %d"
+          % (n_east, p29_flat, p29_east, h29.get("n_rid"),
+             h29.get("dhat_spread"), e29.n_region_swaps - sw_before,
+             e29.n_region_swaps_bad))
+    if not n_east:
+        fails.append("the fixture aged no tiles at all: the case is testing "
+                     "nothing")
+    if p29_east == p29_flat:
+        fails.append("the neglected region was not promoted (%s stayed %s): "
+                     "either the term never reaches the ranking or the tables "
+                     "are not in different tiles" % (p29_east, p29_flat))
+    elif not (p29_east[0] > 0.9 and p29_flat[0] < 0.9):
+        fails.append("the term moved the goal to the *wrong* side: %s -> %s"
+                     % (p29_flat, p29_east))
+    if e29.n_region_swaps_bad:
+        fails.append("%d region swaps went to a less neglected tile: the "
+                     "direction condition (boss's Gate B) is inverted"
+                     % e29.n_region_swaps_bad)
+    if not h29.get("n_rid", 0) >= 2:
+        fails.append("Gate A: the pick only ever saw %r distinct regions, so a "
+                     "region-level term had nothing to order"
+                     % (h29.get("n_rid"),))
+    st29 = e29.pick_stats()
+    if float(st29.get("rsw_dist_max", 0.0)) <= 0.0:
+        fails.append("Gate C: the swap recorded no displacement -- the "
+                     "instrument is only recording direction, which is the "
+                     "mistake section 23 was written to avoid")
+    print("    Gate C: %d swap(s), distance med %s / max %s m, neglect bought "
+          "med %s s, absurd %s"
+          % (st29.get("rsw_n"), st29.get("rsw_dist_med"),
+             st29.get("rsw_dist_max"), st29.get("rsw_idle_med"),
+             st29.get("rsw_n_absurd")))
+
+    # (d) the other side being the neglected one is the mirror image, and it
+    # must NOT move the goal (the standing pick is already there) -- otherwise
+    # "promote the neglected region" is really "always flip".
+    e29b = build29(region_lambda=2.0)
+    p29b_flat = pick29(e29b)
+    age_tiles(e29b, "west", 200.0)
+    p29b_west = pick29(e29b)
+    print("    aged the west side only: %s -> %s  (swaps %d)"
+          % (p29b_flat, p29b_west, e29b.n_region_swaps))
+    if p29b_west != p29b_flat:
+        fails.append("with the side the standing policy already prefers aged, "
+                     "the pick moved anyway (%s -> %s): the term is flipping, "
+                     "not measuring" % (p29b_flat, p29b_west))
+
+    # (e) both shapes run, and `add` is boss's written form.  They do not have
+    # to agree -- they are two arms of the replay, not a setting -- but each has
+    # to be able to move the goal on the same fixture, or one of them is dead
+    # code.
+    e29c = build29(region_lambda=2.0, region_mode="add")
+    p29c_flat = pick29(e29c)
+    age_tiles(e29c, "east", 200.0)
+    p29c_east = pick29(e29c)
+    print("    region_mode=add: %s -> %s  (swaps %d, bad %d)"
+          % (p29c_flat, p29c_east, e29c.n_region_swaps, e29c.n_region_swaps_bad))
+    if p29c_east == p29c_flat:
+        fails.append("`region_mode=\"add\"` could not move the pick on the "
+                     "fixture that `mul` moved it on")
+    if e29c.n_region_swaps_bad:
+        fails.append("`region_mode=\"add\"` moved the goal to a less neglected "
+                     "tile")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (28 checks)")
+    print("verdict: PASS (29 checks)")
     return 0
 
 

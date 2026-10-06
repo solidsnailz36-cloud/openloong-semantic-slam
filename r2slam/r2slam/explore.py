@@ -101,7 +101,13 @@ class FrontierExplorer:
                  debt_lambda: float = 0.0, debt_grace_s: float = 20.0,
                  debt_idle_cap_s: float = 120.0, debt_cell_m: float = 1.0,
                  debt_known_m2: float = 0.50, debt_fresh_m2: float = 0.25,
-                 debt_cover_eps_m2: float = 0.10, debt_period_s: float = 1.0):
+                 debt_cover_eps_m2: float = 0.10, debt_period_s: float = 1.0,
+                 region_lambda: float = 0.0, region_mode: str = "mul",
+                 region_cell_m: float = 2.00, region_min_m2: float = 0.60,
+                 region_done_m2: float = 0.40, region_brief_m2: float = 1.00,
+                 region_progress_eps_m2: float = 0.15,
+                 region_grace_s: float = 25.0, region_idle_cap_s: float = 120.0,
+                 region_period_s: float = 1.0):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
@@ -620,6 +626,116 @@ class FrontierExplorer:
         self.debt_margin: List[dict] = []     # per pick: the lambda it needed
         self.pick_sizes: List[dict] = []      # per pick: how many candidates
         self.last_sweep_cands: list = []      # the ranked list, for probes
+
+        # --- region-level starvation: the same idea one layer above ----------
+        #
+        # Boss, 2026-10-06, after section 26 closed the Discover question:
+        #
+        #   "the map already knows there is something there, the candidate
+        #    already exists, and the planner still does not give the long-
+        #    unhandled region a chance.  Do (1), but do not hard-code 'the first
+        #    N targets must be rooms'.  Build a minimal, replay-only prototype
+        #    of a **region-level** starvation debt.  The object this time is not
+        #    the patch and not the candidate -- it is the room/region, and that
+        #    is the granularity the evidence actually supports."
+        #
+        # Why the two existing attempts could not have worked, in one line each:
+        #
+        #   * the **patch** debt (section 14) put the value on `base`, which is
+        #     one number shared by every place in a patch, and every candidate
+        #     the sweep offers sits on floor that has never been walked -- so
+        #     every candidate collected the same saturated bonus and the term
+        #     cancelled out of the ranking;
+        #   * the **candidate** term (sections 23-25) either ignored travel cost
+        #     (and bought 0.85 m2 for a 14 m walk) or included it (and changed
+        #     nothing at all).
+        #
+        # What was missing in both is not a weight, it is an **identity**.  A
+        # `reach & ~visited` patch has no persistent name -- its shape and its
+        # label change every frame, and it is *re-cut from scratch on every
+        # pick*.  You cannot ask a thing "how long have you been neglected" if
+        # the thing does not survive from one frame to the next.  The 1 m blocks
+        # in `_debt_update` do have identity, but they are then averaged over
+        # the patch, which puts the number back into the patch-level bucket.
+        #
+        # So the state here is a **tile of the map**: a fixed `region_cell_m`
+        # square with an integer id `(row // b, col // b)` that is the same
+        # object on frame 1 and frame 900.  That is what makes three of boss's
+        # quantities well defined:
+        #
+        #     unfinished_area(region)     m2 of reachable, never-visited floor
+        #                                 still inside the tile        (live)
+        #     last_progress_t(region)     when that number last *fell*
+        #     last_enter_t(region)        when the robot's pose was inside it
+        #
+        # and `last_attention_t = max(last_progress_t, last_enter_t)` is the
+        # clock the debt reads:  `idle = now - last_attention_t`.
+        #
+        # Four stages, because "unvisited" is not the only way to be finished
+        # with a region and treating it as two-valued is how a policy starts
+        # entering rooms purely to have entered them:
+        #
+        #     never    the pose has never been inside the tile
+        #     done     unfinished area has fallen below `region_done_m2`
+        #     brief    entered, but has never accumulated `region_brief_m2` of
+        #              new coverage -- a room driven *through* on the way
+        #              somewhere else.  Section 26 measured that this is a real
+        #              category: five rooms that were never a target still ended
+        #              the run at >= 20% coverage, because the main path went
+        #              through them.
+        #     starved  real work has been done here and there is still work
+        #              left, and nobody has touched it for a while
+        #
+        # Coverage is deliberately **not** in this state.  Boss: "do not use
+        # coverage as the debt -- the denominator has already been wrong once,
+        # and 'has the robot actually been here recently' is both more stable
+        # and the thing that transfers to an unknown map."
+        #
+        # The tile is a *proxy* for a room, not a room: it cuts a 4.5 m room
+        # into four to six pieces.  That is deliberate for the first prototype --
+        # a tile needs no door detection, no morphology, no naming, and it can
+        # be computed from the map the policy already keeps.  What it costs is
+        # that "the room is starved" is expressed as "its tiles are starved",
+        # which is why `_record_region_margin` reports how many *distinct*
+        # regions are on the table at each pick: a debt that can only ever see
+        # one tile per pick is the section-21 failure all over again.
+        #
+        # `region_lambda = 0` is the standing behaviour exactly -- see the two
+        # branches in `gather()`; the term is multiplied by lambda.  It is the
+        # default, and case 29 in `tools/test_explore.py` holds that the
+        # decisions are bit-identical.
+        self.region_lambda = float(region_lambda)
+        # `"mul"` (default) scales the base score: `score = base x (1 + l x d)`,
+        # the same shape as the patch debt, so the two are a one-variable
+        # comparison.  `"add"` is boss's written form, `U = base + l x D`, with
+        # `D = unfinished_area x f(idle)` riding the same `1/(1+d0)` travel-cost
+        # denominator as everything else.  They are two arms, not a setting:
+        # section 24 is the record of what an uncoupled additive term does.
+        self.region_mode = str(region_mode)
+        self.region_cell_m = max(float(region_cell_m), 1e-3)
+        self.region_min_m2 = float(region_min_m2)
+        self.region_done_m2 = float(region_done_m2)
+        self.region_brief_m2 = float(region_brief_m2)
+        self.region_progress_eps_m2 = float(region_progress_eps_m2)
+        self.region_grace_s = max(float(region_grace_s), 0.0)
+        self.region_idle_cap_s = max(float(region_idle_cap_s),
+                                     self.region_grace_s + 1e-3)
+        self.region_period_s = max(float(region_period_s), 1e-3)
+        self._region: dict = {}          # (ry, rx) -> the tile's own state
+        self._region_dt_acc = 0.0        # seconds since the last scan
+        self._region_t = 0.0             # exploration clock, seconds
+        self.n_region_updates = 0
+        self.n_region_live = 0           # tiles currently in the table
+        self.n_region_starved = 0        # tiles past the grace with work left
+        self.max_region_idle_s = 0.0
+        self.n_region_picks = 0          # decisions the term actually made
+        self.n_region_swaps = 0          # ... and it differed from the plain pick
+        self.n_region_swaps_bad = 0      # ... and went to a *less* starved region
+        self.n_region_fallthrough = 0    # picks decided by routing, not ranking
+        self.last_region_idle_s = 0.0    # the chosen place's region neglect
+        self.last_region_dhat = 0.0      # and the weight it earned
+        self.region_hist: List[dict] = []      # per pick: Gate A, the gradient
+        self.region_switches: List[dict] = []  # the swaps, with Gate C's numbers
 
         self.n_sweep_abandoned = 0
         self._sw_best = float("inf")
@@ -1472,6 +1588,59 @@ class FrontierExplorer:
                     (dd > self.cand_local_scope_m + 1e-6).sum())
         if self.cand_local_scope_m > 0.0:
             out["scope_blocked"] = self.n_local_scope_blocked
+        # --- Gate A / B / C for the region-level starvation term ------------
+        #
+        # These read off the **live** arm only: the region table is maintained
+        # only while the term is switched on, same rule as the patch debt, so a
+        # control arm has no state to read.  Gate A is a property of the
+        # candidate set, and the candidate set does not depend on the term --
+        # `pick_sizes` is dumped for every arm so that claim is *checked*, not
+        # asserted (boss's acceptance condition 4: "lambda = 0 and lambda > 0
+        # must keep candidate generation exactly identical").
+        if self.region_hist:
+            n_rid = np.array([h["n_rid"] for h in self.region_hist], float)
+            spread = np.array([h["dhat_spread"] for h in self.region_hist], float)
+            idles = np.array([h["idle_max"] for h in self.region_hist], float)
+            us = np.array([h["u_max"] for h in self.region_hist], float)
+            out.update(n_region_seen=len(self.region_hist),
+                       r_rid_med=round(float(np.median(n_rid)), 2),
+                       r_rid_ge2=round(float((n_rid >= 2).mean()), 3),
+                       r_dhat_spread_med=round(float(np.median(spread)), 4),
+                       r_dhat_spread_p90=round(float(np.percentile(spread, 90)), 4),
+                       r_dhat_flat_frac=round(float((spread <= 1e-9).mean()), 3),
+                       r_idle_med=round(float(np.median(idles)), 1),
+                       r_idle_max=round(float(idles.max()), 1),
+                       r_u_max_med=round(float(np.median(us)), 2))
+            needs = [h["need_lam"] for h in self.region_hist
+                     if h["need_lam"] >= 0.0]
+            if needs:
+                a = np.array(needs, dtype=np.float64)
+                out.update(need_region_min=round(float(a.min()), 3),
+                           need_region_med=round(float(np.median(a)), 3),
+                           need_region_p90=round(float(np.percentile(a, 90)), 3),
+                           need_region_le1=round(float((a <= 1.0).mean()), 3))
+            else:
+                out["need_region_inf"] = True
+        if self.region_lambda > 0.0:
+            out.update(region_live=self.n_region_live,
+                       region_starved=self.n_region_starved,
+                       region_max_idle_s=round(float(self.max_region_idle_s), 1),
+                       n_region_picks=self.n_region_picks,
+                       n_region_swaps=self.n_region_swaps,
+                       n_region_swaps_bad=self.n_region_swaps_bad,
+                       n_region_fallthrough=self.n_region_fallthrough)
+        if self.region_switches:
+            dd = np.array([s["dist"] for s in self.region_switches], float)
+            di = np.array([s["didle"] for s in self.region_switches], float)
+            un = np.array([s["unit"] for s in self.region_switches], float)
+            out.update(rsw_n=len(dd),
+                       rsw_dist_med=round(float(np.median(dd)), 2),
+                       rsw_dist_p90=round(float(np.percentile(dd, 90)), 2),
+                       rsw_dist_max=round(float(dd.max()), 2),
+                       rsw_idle_med=round(float(np.median(di)), 1),
+                       rsw_unit_med=round(float(np.median(un)), 3),
+                       rsw_n_far=int((dd >= 5.0).sum()),
+                       rsw_n_absurd=int(((dd >= 5.0) & (di <= 25.0)).sum()))
         if not self.debt_margin:
             return out
         needs = [m["need_lam"] for m in self.debt_margin if m["need_lam"] >= 0.0]
@@ -1599,6 +1768,214 @@ class FrontierExplorer:
         self.n_debt_blocks = int((self._debt_idle >= self.debt_grace_s).sum())
         self.n_debt_eligible = int(eligible.sum())
         self.max_debt_idle_s = float(self._debt_idle.max())
+
+    # ---- region-level starvation debt ------------------------------------
+    def _region_f(self, idle_s: float) -> float:
+        """Map "how long this region has been left alone" onto [0, 1].
+
+        Linear between `region_grace_s` (below it, being ignored is queueing,
+        not neglect) and `region_idle_cap_s` (above it, neglect stops growing).
+        The cap is on the **time**, not on the score: that is the whole
+        difference from the first debt, where a cap on the score made "ignored
+        45 s" and "ignored 200 s" worth the same and the term could not order
+        anything (docs section 14).
+        """
+        span = max(self.region_idle_cap_s - self.region_grace_s, 1e-6)
+        return float(np.clip((idle_s - self.region_grace_s) / span, 0.0, 1.0))
+
+    def _region_px(self, wmap) -> int:
+        """Tile size in cells.  One definition, used by `id` and by `update`."""
+        return max(1, int(round(self.region_cell_m / wmap.resolution)))
+
+    def _region_id(self, px: float, py: float, wmap) -> tuple:
+        """The tile's name -- `(row block, col block)`, stable for the run.
+
+        This is the whole point of the layer: unlike a fresh patch, the same
+        place has the same name on frame 1 and frame 900, so a clock can be
+        kept against it.
+        """
+        cx, cy = wmap.cell_of(px, py)
+        b = self._region_px(wmap)
+        return (int(cy) // b, int(cx) // b)
+
+    def _region_update(self, wmap, reach, x0, y0, dt) -> None:
+        """Once per frame, scanned at most every `region_period_s`.
+
+        What is stored is **state**, not a score: for each tile that has been
+        seen at all, when it was last entered, when its unfinished area last
+        fell, how much of that has accumulated, and where that leaves it.  The
+        value of the neglect is decided later, per candidate, by `_region_f` --
+        because "how bad is 90 s of neglect" depends on how much is left to do
+        there, and that is a property of the tile, not of the clock.
+
+        `eligible` is `ground_ever >= region_min_m2`: a tile is only tracked
+        once the map actually knows floor inside it.  A tile that the scanner
+        glimpsed from across the house is therefore in the table from that
+        moment -- which is exactly the situation boss's diagnosis is about ("the
+        map already knows there is something there").
+
+        `dt is None` (a caller with no clock) updates nothing, same rule as the
+        patch debt: an unknown time step silently turns seconds into frame
+        counts and makes the same code mean 8 s on one dataset and 4 s on
+        another.
+        """
+        if self.region_lambda <= 0.0 or dt is None:
+            return
+        dt = float(dt)
+        if not np.isfinite(dt) or dt <= 0.0:
+            return
+        self._region_t += dt
+        self._region_dt_acc += dt
+        if self._region and self._region_dt_acc < self.region_period_s:
+            return
+        self._region_dt_acc = 0.0
+        now = self._region_t
+
+        res = float(wmap.resolution)
+        cell = res * res
+        n = wmap.ground.shape[0]
+        b = max(1, int(round(self.region_cell_m / res)))
+        nb = int(np.ceil(n / b))
+        pad = nb * b - n
+        vis = self._visited_mask(wmap)
+        fresh = reach & ~vis
+
+        def blk(mask: np.ndarray) -> np.ndarray:
+            m = mask.astype(np.float32)
+            if pad:
+                m = np.pad(m, ((0, pad), (0, pad)))
+            return m.reshape(nb, b, nb, b).sum(axis=(1, 3)) * cell
+
+        known_a = blk(wmap.ground_ever)
+        unfin_a = blk(fresh)
+        cx, cy = wmap.cell_of(x0, y0)
+        rr, rc = int(cy) // b, int(cx) // b
+
+        rys, rxs = np.nonzero(known_a >= self.region_min_m2)
+        for ry, rx in zip(rys.tolist(), rxs.tolist()):
+            key = (ry, rx)
+            u = float(unfin_a[ry, rx])
+            inside = (ry == rr and rx == rc)
+            st = self._region.get(key)
+            if st is None:
+                # A tile enters the table the moment the map knows floor in it,
+                # and its clock starts **there**, not at zero: a region that has
+                # been visible and ignored for 40 s is neglected, one that came
+                # into view a second ago is not.
+                st = dict(att_t=now, ent_t=(now if inside else None),
+                          was_in=inside, n_enter=(1 if inside else 0),
+                          unfin_prev=u, unfin_m2=u, prog_m2=0.0)
+                self._region[key] = st
+            else:
+                gained = float(st["unfin_prev"]) - u
+                if gained > self.region_progress_eps_m2:
+                    st["att_t"] = now
+                    st["prog_m2"] = float(st["prog_m2"]) + gained
+                if inside:
+                    if not st["was_in"]:
+                        st["n_enter"] = int(st["n_enter"]) + 1
+                    st["ent_t"] = now
+                    st["att_t"] = now
+                st["was_in"] = inside
+                st["unfin_m2"] = u
+                st["unfin_prev"] = u
+
+        self.n_region_updates += 1
+        self.n_region_live = len(self._region)
+        self.n_region_starved = sum(
+            1 for s in self._region.values()
+            if s["unfin_m2"] >= self.region_min_m2
+            and (now - s["att_t"]) >= self.region_grace_s)
+        self.max_region_idle_s = (max(now - s["att_t"]
+                                      for s in self._region.values())
+                                  if self._region else 0.0)
+
+    def _region_state(self, px: float, py: float, wmap) -> tuple:
+        """`(idle_s, unfinished_m2, dhat, stage)` for the tile holding a place.
+
+        `dhat` is the raw time weight, **before** the "is there anything left
+        here" gate; `gather()` applies that gate and records both numbers, so
+        Gate A can tell "the time dimension does not vary across the candidates"
+        (which is what killed the patch debt) apart from "there is nothing left
+        in these regions to justify the time" (which would be a fixture
+        problem, not a mechanism problem).
+        """
+        if self.region_lambda <= 0.0:
+            return (0.0, 0.0, 0.0, "off")
+        st = self._region.get(self._region_id(px, py, wmap))
+        if st is None:
+            return (0.0, 0.0, 0.0, "none")
+        idle = max(self._region_t - float(st["att_t"]), 0.0)
+        u = float(st["unfin_m2"])
+        if st["ent_t"] is None:
+            stage = "never"
+        elif u < self.region_done_m2:
+            stage = "done"
+        elif float(st["prog_m2"]) < self.region_brief_m2:
+            stage = "brief"
+        else:
+            stage = "starved"
+        return (idle, u, self._region_f(idle), stage)
+
+    def _record_region_margin(self, cands, best_noregion) -> None:
+        """Gate A: is there a gradient to act on, and between how many regions?
+
+        Boss, 2026-10-06: *"for every candidate region record unfinished area,
+        time since last entry / last meaningful progress, current base score and
+        the debt score -- and show that different regions really do order
+        differently."*
+
+        The number that decides whether the rest of the experiment is worth
+        running is `n_rid`: how many **distinct regions** are on the table at
+        one decision.  If every candidate of a pick sits inside one tile then a
+        region-level debt has exactly one number to add to all of them, which is
+        section 21's "one candidate on the table" one layer up, and no lambda can
+        matter.  `dhat_spread` is the same question about the time dimension
+        alone.
+
+        `need_lam` is the pull this pick would have needed, in units of the
+        parameter.  Both shapes are linear in lambda --
+        `mul` gives `score = base + l x (base x dhat)`, `add` gives
+        `score = base + l x (unfinished x dhat / (1 + d0))` -- so the code
+        stores the realised slope `c[20]` and the no-region score `c[21]` and
+        one formula covers both.  A median far above 1 means the shape is
+        wrong, not the strength; that was the patch debt's lesson, one layer
+        down.
+        """
+        if len(cands) < 2:
+            return
+        rids, dhats, idles, us = [], [], [], []
+        stages: dict = {}
+        for c in cands:
+            rids.append(tuple(c[19]))
+            dhats.append(float(c[15]))
+            idles.append(float(c[17]))
+            us.append(float(c[16]))
+            k = str(c[18])
+            stages[k] = stages.get(k, 0) + 1
+        b_i, t_i = float(best_noregion[21]), float(best_noregion[20])
+        need = float("inf")
+        for c in cands:
+            if c is best_noregion:
+                continue
+            b_j, t_j = float(c[21]), float(c[20])
+            if t_j - t_i > 1e-12:
+                need = min(need, max((b_i - b_j) / (t_j - t_i), 0.0))
+        self.region_hist.append(dict(
+            # The frame's own stamp: `_region_t` only advances while the term is
+            # switched on, so a control arm would read t = 0 everywhere and the
+            # "when did it first fire" question would be unanswerable.
+            t=round(float(self._last_stamp or 0.0), 1), n=len(cands),
+            n_rid=len(set(rids)),
+            idle_min=round(min(idles), 1), idle_max=round(max(idles), 1),
+            dhat_spread=round(max(dhats) - min(dhats), 4),
+            dhat_plain=round(float(best_noregion[15]), 4),
+            dhat_max=round(max(dhats), 4),
+            u_max=round(max(us), 2),
+            stage=stages,
+            need_lam=(round(need, 3) if np.isfinite(need) else -1.0)))
+        if len(self.region_hist) > 400:
+            del self.region_hist[:200]
 
     def _fresh_area(self, wmap, reach, x0, y0) -> float:
         """Walkable floor the robot has never been near, in m2.
@@ -2015,11 +2392,43 @@ class FrontierExplorer:
                         u_term = lu / (cd + 1e-6)
                     else:
                         u_term = lu / (1.0 + d0)
+                    # --- the region-level term ---------------------------------
+                    #
+                    # One number per place, read off the **tile of the map** the
+                    # place sits in rather than off the patch it belongs to (see
+                    # the note on `region_lambda` in `__init__` for why that
+                    # distinction is the whole experiment).  It is deliberately
+                    # the only new quantity: no coverage, no door, no room
+                    # label -- just "how long has this part of the map been
+                    # sitting there with work left in it, and has anybody been
+                    # there".
+                    #
+                    # `r_dhat_raw` is gated, not clamped: a tile whose
+                    # unfinished area has fallen below `region_min_m2` has
+                    # nothing left to be starved about, so it earns exactly
+                    # zero.  Both numbers are recorded, because "the term is
+                    # flat" and "the term was gated off" are different findings
+                    # with different fixes.
+                    r_idle, r_u, r_dhat_raw, r_stage = self._region_state(
+                        px, py, wmap)
+                    r_dhat = r_dhat_raw if r_u >= self.region_min_m2 else 0.0
+                    if self.region_mode == "add":
+                        # boss's written form: `U = base + lambda_R x D`,
+                        # `D = unfinished x f(idle)`, riding the same
+                        # `1/(1+d0)` travel cost as every other term.
+                        r_t = r_u * r_dhat / (1.0 + d0)
+                    else:
+                        # `score x (1 + lambda_R x dhat)` -- the same shape as
+                        # the patch debt, so the two are one variable apart.
+                        r_t = score * r_dhat
                     rows.append(dict(px=px, py=py, cd=cd, lu=lu, u_term=u_term,
                                      d0=d0, ncell=ncell, L=L, base=base,
                                      ax=tx_anchor, ay=ty_anchor, bonus=bonus,
                                      idle_s=idle_s, w=w, score=score,
-                                     u_eff=u_term))
+                                     score_r=score + self.region_lambda * r_t,
+                                     u_eff=u_term, r_t=r_t, r_dhat=r_dhat,
+                                     r_u=r_u, r_idle=r_idle, r_stage=r_stage,
+                                     rid=self._region_id(px, py, wmap)))
 
             # --- who is allowed to compete with whom ------------------------
             #
@@ -2030,6 +2439,10 @@ class FrontierExplorer:
             # other end of the house -- which is the failure this is fixing.
             if (self.cand_local_scope_m > 0.0 and self.cand_local_lambda > 0.0
                     and len(rows) >= 2):
+                # Anchored on `score`, not `score_r`: the scope rule is section
+                # 25's mechanism and its anchor must stay "what the policy would
+                # have taken before this round's term", or two unvalidated terms
+                # end up defining each other's scope.
                 plain = min(rows, key=lambda r: self._rank_key(
                     r["score"], r["d0"], r["ax"], r["ay"], r["px"], r["py"],
                     r["cd"]))
@@ -2042,9 +2455,9 @@ class FrontierExplorer:
 
             for r in rows:
                 out.append((
-                    self._rank_key(r["score"] + self.cand_local_lambda * r["u_eff"],
-                                   r["d0"], r["ax"], r["ay"], r["px"], r["py"],
-                                   r["cd"]),
+                    self._rank_key(
+                        r["score_r"] + self.cand_local_lambda * r["u_eff"],
+                        r["d0"], r["ax"], r["ay"], r["px"], r["py"], r["cd"]),
                     r["d0"], r["px"], r["py"], r["ncell"], r["L"],
                     self._rank_key(r["base"], r["d0"], r["ax"], r["ay"],
                                    r["px"], r["py"], r["cd"]),
@@ -2061,8 +2474,32 @@ class FrontierExplorer:
                     # have had with `cand_local_lambda = 0`.  Only used to answer
                     # "did the term change the answer", which is the difference
                     # between the mechanism running and the mechanism mattering.
-                    self._rank_key(r["score"], r["d0"], r["ax"], r["ay"],
-                                   r["px"], r["py"], r["cd"])))
+                    # It carries the region term, exactly as it carries the debt
+                    # -- the term under test is the local one here.
+                    self._rank_key(r["score_r"], r["d0"], r["ax"], r["ay"],
+                                   r["px"], r["py"], r["cd"]),
+                    # --- c[14]: the comparator for the *region* term ----------
+                    # The key this place would have had with `region_lambda = 0`,
+                    # every other term (debt, local) left exactly as it is.  That
+                    # is the only way "the mechanism ran" and "the mechanism
+                    # mattered" can be told apart for a term that only ever adds
+                    # one number to each candidate.
+                    self._rank_key(
+                        r["score"] + self.cand_local_lambda * r["u_eff"],
+                        r["d0"], r["ax"], r["ay"], r["px"], r["py"], r["cd"]),
+                    # --- c[15..21]: the region instrument ---------------------
+                    # What Gate A reads (does the time dimension vary across the
+                    # candidates, and across how many distinct tiles) and what
+                    # Gate B reads (the realised slope and the no-region score,
+                    # from which the lambda this pick would have needed is
+                    # arithmetic rather than a model of the code).
+                    r["r_dhat"],      # 15  time weight actually applied, after the gate
+                    r["r_u"],         # 16  unfinished m2 in that tile
+                    r["r_idle"],      # 17  seconds since it was last touched
+                    r["r_stage"],     # 18  never / brief / starved / done
+                    r["rid"],         # 19  the tile's identity
+                    r["r_t"],         # 20  d(score)/d(lambda): the slope
+                    r["score"]))      # 21  the score with no region term
             # Biggest-and-nearest first, quantised so that two patches a few
             # percent apart do not change places on a floating-point hiccup.
             out.sort(key=lambda c: c[0])
@@ -2171,6 +2608,19 @@ class FrontierExplorer:
             self._record_local_margin(cands, best_local)
             if self.cand_local_lambda > 0.0:
                 top_used = min(cands, key=lambda c: c[0])
+        # The region term's own comparator and margin.  Unlike the local pair
+        # this is skipped at `region_lambda = 0`, because the region table is
+        # only maintained while the term is switched on (same rule as the patch
+        # debt) -- so a control arm has no region state to read.  Gate A is a
+        # property of the **candidate set**, and the candidate set is identical
+        # between the arms by construction, so reading it off the live arm is
+        # the same measurement; `pick_sizes` is what proves the sets matched.
+        best_region = None
+        top_used_r = None
+        if len(cands) >= 2 and self.region_lambda > 0.0:
+            best_region = min(cands, key=lambda c: c[14])
+            self._record_region_margin(cands, best_region)
+            top_used_r = min(cands, key=lambda c: c[0])
         for c in cands[:self.max_plans_per_pick]:
             tx, ty, ncell, L = float(c[2]), float(c[3]), int(c[4]), c[5]
             path = self.planner.plan(wmap, (x0, y0), (tx, ty))
@@ -2250,6 +2700,66 @@ class FrontierExplorer:
                                     unit=round(du / max(dist, 1e-6), 4)))
                     elif self.cand_local_lambda > 0.0:
                         self.n_local_fallthrough += 1
+                if best_region is not None:
+                    self.last_region_idle_s = float(c[17])
+                    self.last_region_dhat = float(c[15])
+                    # Same rule as the local term: a swap may only be counted
+                    # when the term's own first choice is the one that was
+                    # taken.  Otherwise the pick fell through to a lower rank
+                    # for **routing** reasons and both arms would have fallen
+                    # through together -- counting it would report a decision
+                    # the term never made.
+                    taken_is_top_r = (
+                        top_used_r is not None
+                        and abs(float(top_used_r[2]) - tx) < 1e-6
+                        and abs(float(top_used_r[3]) - ty) < 1e-6)
+                    if taken_is_top_r:
+                        if float(c[15]) > 0.0:
+                            self.n_region_picks += 1
+                        if (abs(best_region[2] - tx) > 1e-6
+                                or abs(best_region[3] - ty) > 1e-6):
+                            self.n_region_swaps += 1
+                            idle_to = float(c[17])
+                            idle_frm = float(best_region[17])
+                            # ---- Gate B's direction condition, written as
+                            # boss asked: "the promoted target must come from a
+                            # known, reachable, long-unvisited region".  If the
+                            # term moves the goal to a region that has been
+                            # *less* neglected, the term is upside down.
+                            if idle_to <= idle_frm + 1e-9:
+                                self.n_region_swaps_bad += 1
+                            if len(self.region_switches) < 40:
+                                fx, fy = float(best_region[2]), float(best_region[3])
+                                dist = float(np.hypot(tx - fx, ty - fy))
+                                self.region_switches.append(dict(
+                                    t=round(float(self._last_stamp or 0.0), 1),
+                                    n=len(cands),
+                                    to=[round(tx, 2), round(ty, 2)],
+                                    frm=[round(fx, 2), round(fy, 2)],
+                                    rid_to=list(c[19]),
+                                    rid_frm=list(best_region[19]),
+                                    idle_to=round(idle_to, 1),
+                                    idle_frm=round(idle_frm, 1),
+                                    u_to=round(float(c[16]), 2),
+                                    u_frm=round(float(best_region[16]), 2),
+                                    stage_to=str(c[18]),
+                                    stage_frm=str(best_region[18]),
+                                    # ---- Gate C: the economics of the move ----
+                                    # ">= 10% of decisions changed is not enough"
+                                    # (section 25).  Every swap carries how far
+                                    # the goal moved and what that bought, in
+                                    # seconds of neglect per metre.  A long move
+                                    # for a small gain is the shape that killed
+                                    # both previous attempts and it must be
+                                    # visible in the record.
+                                    dist=round(dist, 3),
+                                    d_frm=round(float(np.hypot(fx - x0, fy - y0)), 3),
+                                    d_to=round(float(np.hypot(tx - x0, ty - y0)), 3),
+                                    didle=round(idle_to - idle_frm, 1),
+                                    unit=round((idle_to - idle_frm)
+                                               / max(dist, 1e-6), 3)))
+                    elif self.region_lambda > 0.0:
+                        self.n_region_fallthrough += 1
                 return tx, ty, path, ncell, L
             self.n_plan_failures += 1
         return None
@@ -2816,6 +3326,11 @@ class FrontierExplorer:
             dt = None if self._last_stamp is None else (s_now - self._last_stamp)
             self._last_stamp = s_now
             self._debt_update(wmap, reach, dt)
+            # The region state shares the clock but not the object: the patch
+            # debt measures the fresh patch the candidate sits on, this one
+            # measures the **tile of the map** it sits on, which survives from
+            # frame to frame.  See the note on `region_lambda` in `__init__`.
+            self._region_update(wmap, reach, x0, y0, dt)
 
         # What counts as "learning nothing"?  With `sweep` on, the honest answer
         # is *unvisited walkable floor*, not *seen floor*.  Driving over ground

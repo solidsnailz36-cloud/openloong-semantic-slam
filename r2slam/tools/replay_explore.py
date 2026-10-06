@@ -111,6 +111,28 @@ def mark(rows, c0, r0, px, py, ch):
     return rows  # kept simple: ASCII is for eyeballing shape, not annotations
 
 
+def _target_of(row):
+    """A frame's committed target, in the same rendered form the CSV holds.
+
+    Compared as text, not as numbers, and that is not stylistic: the first
+    version compared the raw values, and on the region arm it reported an arm as
+    diverging at `174 s` while `md5sum` of that arm's per-frame CSV matched the
+    baseline **exactly** -- a contradiction between an instrument and its own
+    artefact, which is the one kind of disagreement this project does not
+    tolerate.  Rendering first (the same way `csv` renders it on the way out)
+    removed the false reading on a re-run of the same framing.
+
+    The likely mechanism is a value that is unequal to itself under float
+    comparison -- `nan` is the standard case, and a missing target is exactly
+    where it would appear -- but that was not confirmed on this capture, so it
+    is stated as a suspicion rather than a diagnosis.  What *is* confirmed is
+    the property that matters: this function reads the same thing the file
+    holds, so "the arms agree" can be checked against `md5sum` instead of
+    believed.
+    """
+    return (str(row["target_x"]), str(row["target_y"]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
@@ -356,6 +378,9 @@ def main():
               # to a place with *less* left, i.e. the quantiser eating the term.
               "n_local_picks", "n_local_swaps", "n_local_swaps_bad",
               "last_local_u_pick", "last_local_term_pick",
+              "n_region_picks", "n_region_swaps", "n_region_swaps_bad",
+              "n_region_fallthrough", "n_region_live", "n_region_starved",
+              "max_region_idle_s",
               "n_plans", "n_plan_failures", "n_blacklisted"):
         v = getattr(explorer, k, None)
         if v is not None:
@@ -417,8 +442,7 @@ def main():
             first_t = None
             first_desc = ""
             for i in range(min(len(rows), len(base_rows))):
-                if (rows[i]["target_x"] != base_rows[i]["target_x"]
-                        or rows[i]["target_y"] != base_rows[i]["target_y"]):
+                if _target_of(rows[i]) != _target_of(base_rows[i]):
                     first_t = float(rows[i]["stamp"]) - float(rows[0]["stamp"])
                     first_desc = "(%s,%s) -> (%s,%s)" % (
                         base_rows[i]["target_x"], base_rows[i]["target_y"],
@@ -481,6 +505,65 @@ def main():
                      getattr(exr, "n_local_fallthrough", 0)))
         print("  （local sw / decisions 就是判据；`-> less` 若不为 0，说明量子在吃掉这一项）")
 
+        # ---- the region-level starvation term's own instrument -------------
+        #
+        # Boss, 2026-10-06: three gates, all of which have to be read off the
+        # replay before any simulator run is worth paying for.
+        #
+        #   A  is there a gradient?  How many distinct **tiles** are on the
+        #      table at a pick, and does the neglect weight vary between them?
+        #      One tile per pick is section 21's "one candidate on the table",
+        #      one layer up, and no lambda can matter.
+        #   B  >= 10% of the decisions the term actually made, and every move
+        #      must go to a *more* neglected region (`-> less` must be 0).
+        #   C  the moves must be local.  Distance, and what it bought, per swap.
+        print()
+        print("===== region-level starvation (A: gradient, B: decisions, "
+              "C: locality) =====")
+        print("  %-14s %8s %8s %9s %10s %9s"
+              % ("arm", "picks", "med #rid", "P(#rid>=2)", "spread med",
+                 "flat frac"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %8s %8s %9s %10s %9s"
+                  % (name, st.get("n_region_seen", "-"), st.get("r_rid_med", "-"),
+                     st.get("r_rid_ge2", "-"), st.get("r_dhat_spread_med", "-"),
+                     st.get("r_dhat_flat_frac", "-")))
+        print("  （A：`med #rid` 是每次决策桌上**不同的区域格**数；`spread med` 是"
+              "同一决策里 dhat 的极差）")
+        print("  %-14s %10s %9s %10s %9s %10s"
+              % ("arm", "decisions", "region sw", "-> less", "fallthru",
+                 "need_lam p90"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %10s %9s %10s %9s %10s"
+                  % (name, st.get("n_region_picks", "0"),
+                     st.get("n_region_swaps", "0"),
+                     st.get("n_region_swaps_bad", "0"),
+                     st.get("n_region_fallthrough", "0"),
+                     st.get("need_region_p90", "-")))
+        print("  （B：region sw / decisions 就是判据；`-> less` 若不为 0，"
+              "说明它把目标搬去**更不被冷落**的区域）")
+        print("  %-14s %7s %10s %10s %10s %9s %8s"
+              % ("arm", "swaps", "dist med", "dist p90", "dist max",
+                 "d_idle med", "far/absurd"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %7s %10s %10s %10s %9s %8s"
+                  % (name, st.get("rsw_n", "0"), st.get("rsw_dist_med", "-"),
+                     st.get("rsw_dist_p90", "-"), st.get("rsw_dist_max", "-"),
+                     st.get("rsw_idle_med", "-"),
+                     "%s/%s" % (st.get("rsw_n_far", "-"),
+                                st.get("rsw_n_absurd", "-"))))
+        print("  （C：`far` = 位移 >= 5 m；`absurd` = 走了 >= 5 m 却只买到 <= 25 s "
+              "的冷落差 —— 就是 §24 里那种形状）")
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            if st.get("region_live") is not None:
+                print("  %-14s live %s / starved %s tiles, max idle %.1f s"
+                      % (name, st.get("region_live"), st.get("region_starved"),
+                         float(st.get("region_max_idle_s", 0.0))))
+
         if a.out:
             import json
             for name, exr in arms:
@@ -500,6 +583,33 @@ def main():
                                    # readable from the frozen control arm alone.
                                    local_margin=getattr(exr, "local_margin", []),
                                    local_switches=getattr(exr, "local_switches", []),
+                                   # Gate A / B / C for the region-level
+                                   # starvation term.  Dumped on every arm so
+                                   # the control arm's `pick_sizes` sits next
+                                   # to the live arm's, which is how "candidate
+                                   # generation is unchanged" is checked.
+                                   region_margin=getattr(exr, "region_hist", []),
+                                   region_switches=getattr(exr,
+                                                           "region_switches", []),
+                                   region=dict(
+                                       lambda_=getattr(exr, "region_lambda", 0.0),
+                                       mode=getattr(exr, "region_mode", "mul"),
+                                       cell_m=getattr(exr, "region_cell_m", 0.0),
+                                       min_m2=getattr(exr, "region_min_m2", 0.0),
+                                       done_m2=getattr(exr, "region_done_m2", 0.0),
+                                       brief_m2=getattr(exr, "region_brief_m2", 0.0),
+                                       grace_s=getattr(exr, "region_grace_s", 0.0),
+                                       cap_s=getattr(exr, "region_idle_cap_s", 0.0),
+                                       live=getattr(exr, "n_region_live", 0),
+                                       starved=getattr(exr, "n_region_starved", 0),
+                                       max_idle_s=getattr(exr,
+                                                          "max_region_idle_s", 0.0),
+                                       decisions=getattr(exr, "n_region_picks", 0),
+                                       swaps=getattr(exr, "n_region_swaps", 0),
+                                       swaps_bad=getattr(exr,
+                                                         "n_region_swaps_bad", 0),
+                                       fallthrough=getattr(exr,
+                                                           "n_region_fallthrough", 0)),
                                    local=dict(
                                        decisions=getattr(exr, "n_local_picks", 0),
                                        swaps=getattr(exr, "n_local_swaps", 0),
