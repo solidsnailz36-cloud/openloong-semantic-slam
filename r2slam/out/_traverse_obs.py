@@ -50,12 +50,28 @@ ROOMS = [("右上", 5.3, 3.4, 2.25), ("左下", -8.0, -6.4, 2.60),
          ("左上", -8.9, 2.8, 2.25), ("帘子", -11.2, -6.6, 1.60)]
 CORRIDOR = "走廊"
 
+# Grid geometry.  Kept as constants (and asserted against `meta.json` in
+# `main`) because `box_cells` is called from a plain loop, but a silent
+# disagreement with the map's own resolution would move every room box by
+# several cells -- a failure that produces a plausible table, not an error.
+RES, EXTENT = 0.10, 30.0
+
 
 def room_of(x, y):
     for n, cx, cy, h in ROOMS:
         if abs(x - cx) <= h and abs(y - cy) <= h:
             return n
     return CORRIDOR
+
+
+def box_cells(cx, cy, h):
+    """Cell index ranges of one axis-aligned room box (inclusive)."""
+    def c_of(v):
+        return int(np.floor((v + EXTENT) / RES))
+    return c_of(cx - h), c_of(cx + h), c_of(cy - h), c_of(cy + h)
+
+
+ROOM_KEYS = [n for n, *_ in ROOMS] + [CORRIDOR]
 
 
 def load_frames(path):
@@ -89,6 +105,10 @@ def main():
                     help="dir holding ground_ever.npy, for the calibration")
     ap.add_argument("--out", default=None)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--dump-frames", default=None,
+                    help="also write per-frame (stamp, pose, new m2 by room) "
+                         "as .npy -- this is what `_vantage_obs.py` turns into "
+                         "an observation-value map")
     a = ap.parse_args()
 
     fr = load_frames(os.path.join(a.run, "frames.csv"))
@@ -98,6 +118,11 @@ def main():
     print("cap frames %d ; frames.csv rows %d" % (len(files), len(fr)))
 
     wmap = WorldMap()
+    if (abs(wmap.resolution - RES) > 1e-9) or (abs(wmap.extent - EXTENT) > 1e-9):
+        raise SystemExit("grid geometry mismatch: WorldMap says %.3f/%.1f, this "
+                         "script assumes %.3f/%.1f -- room boxes would be off by "
+                         "whole cells" % (wmap.resolution, wmap.extent, RES,
+                                          EXTENT))
     prev = wmap.ground_ever.copy()
     cells_area = wmap.resolution ** 2
 
@@ -112,6 +137,14 @@ def main():
     # reaches, the loss is in the *route*.
     by_pose = {}
     per_frame = []
+    # (stamp, px, py, pose_room_i, target_room_i, new_m2_<each room>) per frame.
+    # This is the raw material of the observation-value map: it carries, for
+    # every position the robot ever occupied, how much *new* floor it saw from
+    # there and in which rooms.  Measured, not simulated -- the alternative
+    # (2D ray-casting on the finished obstacle layer) was tried first and
+    # abandoned: that layer carries speckle around the robot itself (median
+    # first-hit 0.20 m over 360 rays), so it is not a wall map.
+    framerec = []
     n_matched = n_lost = 0
     tot_new = 0.0
 
@@ -146,24 +179,34 @@ def main():
         # and the calibration still passed, because the calibration only reads
         # the *last* frame.  The total is the check that catches it.
         np.copyto(prev, wmap.ground_ever)
-        n_new = int(new.sum())
+        niy, nix = np.nonzero(new)
+        n_new = int(niy.size)
+        tgt_room = CORRIDOR if rec["tx"] is None else room_of(rec["tx"],
+                                                              rec["ty"])
+        my_room = room_of(rec["px"], rec["py"])
+        cnt = {n: 0 for n in ROOM_KEYS}
         if n_new:
-            iy, ix = np.nonzero(new)
-            wx = ix * wmap.resolution - wmap.extent + wmap.resolution / 2.0
-            wy = iy * wmap.resolution - wmap.extent + wmap.resolution / 2.0
-            tgt_room = CORRIDOR if rec["tx"] is None else room_of(rec["tx"],
-                                                                  rec["ty"])
-            my_room = room_of(rec["px"], rec["py"])
-            for a_, b_ in zip(wx, wy):
-                ob = room_of(a_, b_)
-                d = tally.setdefault(tgt_room, {})
-                d[ob] = d.get(ob, 0.0) + cells_area
-                d2 = by_pose.setdefault(my_room, {})
-                d2[ob] = d2.get(ob, 0.0) + cells_area
+            inbox = np.zeros(n_new, bool)
+            for nm, cx, cy, h in ROOMS:
+                x0, x1, y0, y1 = box_cells(cx, cy, h)
+                m = ((nix >= x0) & (nix <= x1) & (niy >= y0) & (niy <= y1))
+                cnt[nm] = int(m.sum())
+                inbox |= m
+            cnt[CORRIDOR] = n_new - int(inbox.sum())
+            for nm in ROOM_KEYS:
+                if cnt[nm]:
+                    d = tally.setdefault(tgt_room, {})
+                    d[nm] = d.get(nm, 0.0) + cnt[nm] * cells_area
+                    d2 = by_pose.setdefault(my_room, {})
+                    d2[nm] = d2.get(nm, 0.0) + cnt[nm] * cells_area
             tot_new += n_new * cells_area
-            per_frame.append(dict(t=float(z["stamp"]), new_m2=round(n_new
-                                                                     * cells_area, 4),
+            per_frame.append(dict(t=float(z["stamp"]),
+                                  new_m2=round(n_new * cells_area, 4),
                                   target=tgt_room))
+        framerec.append((round(float(z["stamp"]), 3), rec["px"], rec["py"],
+                         ROOM_KEYS.index(my_room), ROOM_KEYS.index(tgt_room))
+                        + tuple(round(cnt[n] * cells_area, 4)
+                                for n in ROOM_KEYS))
         if (i + 1) % 400 == 0:
             print("  ... %d/%d  ground_ever %.1f m2"
                   % (i + 1, len(files), wmap.ground_ever.sum() * cells_area))
@@ -239,6 +282,10 @@ def main():
         with open(a.out, "w", encoding="utf-8") as fh:
             json.dump(res, fh, ensure_ascii=False, indent=1)
         print("  -> %s" % a.out)
+    if a.dump_frames:
+        np.save(a.dump_frames, np.array(framerec, dtype=np.float64))
+        print("  -> %s  列: stamp, px, py, pose_room, target_room, %s"
+              % (a.dump_frames, ", ".join("new_" + k for k in ROOM_KEYS)))
     return 0
 
 
