@@ -40,6 +40,7 @@ import os
 import sys
 
 import numpy as np
+import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -133,6 +134,16 @@ def main():
     ap.add_argument("--npz", required=True)
     ap.add_argument("--config", default="config/sim_house.yaml")
     ap.add_argument("--out", default=None, help="write per-frame decisions here")
+    ap.add_argument("--dump-patches", default=None,
+                    help="per patch, the representative place each candidate "
+                         "rule would pick (see `--patch-every`).  Answers "
+                         "'how many ways can this patch be represented, and do "
+                         "they point the same way'.  Read-only: it recomputes "
+                         "the patch partition from the explorer's own parts "
+                         "(reach / visited / fresh-depth) and never feeds "
+                         "anything back.")
+    ap.add_argument("--patch-every", type=int, default=25,
+                    help="sample every N frames for --dump-patches")
     ap.add_argument("--dump-cands", default=None,
                     help="also write the ranked sweep candidate table per frame "
                          "(one row per candidate).  Read it from an arm whose "
@@ -234,6 +245,7 @@ def main():
 
     rows_out: dict = {}
     cand_rows: list = []        # only filled with --dump-cands
+    patch_rows: list = []       # only filled with --dump-patches
     pose_rows = []
     prev_stamp = None
     n = 0
@@ -333,6 +345,70 @@ def main():
                      )))
 
         for name, exr, _v, _w, _e in results:
+            if a.dump_patches and exr is explorer and \
+                    (idx % max(1, a.patch_every) == 0):
+                # Reproduce the sweep's own patch partition from its own parts.
+                # Kept identical to `gather` on purpose (same connectivity, same
+                # robot-radius hole, same min_depth gate) -- a comparator that
+                # partitions differently would be answering a different question.
+                try:
+                    reach = getattr(exr, "_reach", None)
+                    if reach is not None and reach.any():
+                        vis = exr._visited_mask(wmap)
+                        fresh = (reach & ~vis).copy()
+                        if fresh.any():
+                            k = max(1, int(round(exr.sweep_radius
+                                                 / wmap.resolution)))
+                            cc = wmap.cell_of(t[0], t[1])
+                            cv2.circle(fresh.view(np.uint8),
+                                       (int(cc[0]), int(cc[1])), k, 0, -1)
+                        n_lab, lab = cv2.connectedComponents(
+                            fresh.astype(np.uint8), connectivity=8)
+                        depth = exr._fresh_depth(wmap)
+                        min_depth = exr.sweep_min_dist / wmap.resolution
+                        sx, sy = (exr._start_xy if exr._start_xy
+                                  else (t[0], t[1]))
+                        cell = wmap.resolution ** 2
+                        # `Lb`, not `L`: this module does
+                        # `from r2slam import labels as L`, and binding `L`
+                        # inside the function makes it a *local* name for the
+                        # whole function -- so `L.PERSON` further down raised
+                        # UnboundLocalError.  Cost: one run.
+                        for Lb in range(1, n_lab):
+                            ys, xs = np.nonzero(lab == Lb)
+                            if ys.size * cell < exr.sweep_min_m2:
+                                continue
+                            wx = (xs + 0.5) * wmap.resolution - wmap.extent
+                            wy = (ys + 0.5) * wmap.resolution - wmap.extent
+                            dep = depth[ys, xs]
+                            if dep.max() < min_depth:
+                                continue
+                            d_rob = np.hypot(wx - t[0], wy - t[1])
+                            d_sta = np.hypot(wx - sx, wy - sy)
+                            cx_, cy_ = float(wx.mean()), float(wy.mean())
+                            d_cen = np.hypot(wx - cx_, wy - cy_)
+                            reps = {
+                                "deepest": int(np.argmax(dep)),
+                                "near_robot": int(np.argmin(d_rob)),
+                                "far_robot": int(np.argmax(d_rob)),
+                                "near_start": int(np.argmin(d_sta)),
+                                "far_start": int(np.argmax(d_sta)),
+                                "centroid": int(np.argmin(d_cen)),
+                            }
+                            rec = dict(frame=idx, stamp=float(fr.stamp),
+                                       robot_x=round(float(t[0]), 2),
+                                       robot_y=round(float(t[1]), 2),
+                                       start_x=round(float(sx), 2),
+                                       start_y=round(float(sy), 2),
+                                       patch=int(Lb), ncell=int(ys.size),
+                                       area_m2=round(ys.size * cell, 2))
+                            for nm, j in reps.items():
+                                rec[nm + "_x"] = round(float(wx[j]), 2)
+                                rec[nm + "_y"] = round(float(wy[j]), 2)
+                                rec[nm + "_cd"] = round(float(d_rob[j]), 2)
+                            patch_rows.append(rec)
+                except Exception as exc:                 # a probe never crashes a run
+                    print("  (patch dump skipped at frame %d: %s)" % (idx, exc))
             if a.dump_cands:
                 kind = str(_e.get("target_kind", ""))
                 for c in (getattr(exr, "last_sweep_cands", None) or [])[:80]:
@@ -424,6 +500,16 @@ def main():
             for row in pose_rows:
                 wr.writerow([repr(v) for v in row])
         print("  poses written: %s" % a.poses)
+
+    if a.dump_patches:
+        with open(a.dump_patches, "w", encoding="utf-8", newline="") as fh:
+            if patch_rows:
+                wr = csv.DictWriter(fh, fieldnames=list(patch_rows[0].keys()))
+                wr.writeheader()
+                for r in patch_rows:
+                    wr.writerow(r)
+        print("  patches      : %s  (%d rows)"
+              % (a.dump_patches, len(patch_rows)))
 
     if a.dump_cands:
         with open(a.dump_cands, "w", encoding="utf-8", newline="") as fh:
