@@ -144,6 +144,12 @@ def main():
                          "anything back.")
     ap.add_argument("--patch-every", type=int, default=25,
                     help="sample every N frames for --dump-patches")
+    ap.add_argument("--seed-radii", default="1.0,1.5,2.0,3.0,6.0",
+                    help="for --dump-patches: offline patch-scale probe.  Greedy "
+                         "disc cover of each patch at these radii (metres); "
+                         "records how many sub-patches a block would become and "
+                         "whether `deepest` and `near_robot` land in the same "
+                         "one.  Diagnostic only -- nothing is fed back.")
     ap.add_argument("--dump-cands", default=None,
                     help="also write the ranked sweep candidate table per frame "
                          "(one row per candidate).  Read it from an arm whose "
@@ -244,6 +250,7 @@ def main():
         print("  probe     : ignored with --arms (a probe needs one explorer)")
 
     rows_out: dict = {}
+    seed_radii = [float(v) for v in str(a.seed_radii).split(",") if v.strip()]
     cand_rows: list = []        # only filled with --dump-cands
     patch_rows: list = []       # only filled with --dump-patches
     pose_rows = []
@@ -406,6 +413,123 @@ def main():
                                 rec[nm + "_x"] = round(float(wx[j]), 2)
                                 rec[nm + "_y"] = round(float(wy[j]), 2)
                                 rec[nm + "_cd"] = round(float(d_rob[j]), 2)
+
+                            # ---- offline patch-scale probe ----------------
+                            # Question (boss, §36): if a giant connected patch is
+                            # cut into sub-patches of a sane spatial scale, do the
+                            # two directions it currently hides (east / west)
+                            # become **separate decision objects**?  Cheap proxy:
+                            # cover the block greedily with discs of radius r
+                            # (deepest first), then ask whether `deepest` and
+                            # `near_robot` fall under the same seed.  If they
+                            # separate at some r, the block *is* two places.
+                            bbox_d = float(np.hypot(wx.max() - wx.min(),
+                                                    wy.max() - wy.min()))
+                            # `max_inscribed_r`: the block's own width scale --
+                            # a disc of this radius fits inside it.  Reported so
+                            # the seed radii below can be read against something
+                            # the block itself provides, rather than against an
+                            # arbitrary absolute number.
+                            dt = cv2.distanceTransform((lab == Lb).astype(np.uint8),
+                                                       cv2.DIST_L2, 5)
+                            sub_dt = np.where(lab == Lb, dt, 0.0).astype(np.float32)
+                            rec["diameter_m"] = round(bbox_d, 2)
+                            rec["max_inscribed_r"] = round(
+                                float(dt[ys, xs].max()) * wmap.resolution, 2)
+
+                            # ---- is the block actually two places? ----------
+                            # The decisive number.  `deepest` and `near_robot`
+                            # are metres apart, but that only matters if there
+                            # is a **narrow neck** between them.  If the widest
+                            # path joining them is as wide as the block itself,
+                            # the two points are two corners of one open space
+                            # and "splitting the patch" is an arbitrary cut, not
+                            # a recovery of structure.
+                            # Computed as a maximin (widest-path) radius: the
+                            # largest `r` such that both points stay connected
+                            # through cells with `dt >= r`.
+                            sub_full = (lab == Lb)
+                            dj_, nj_ = reps["deepest"], reps["near_robot"]
+                            los, his = 0.0, float(sub_dt[ys, xs].max())
+                            for _ in range(12):
+                                mid = 0.5 * (los + his)
+                                m_ = (sub_full & (dt >= mid)).astype(np.uint8)
+                                _n2, l2 = cv2.connectedComponents(
+                                    m_, connectivity=8)
+                                if (l2[ys[dj_], xs[dj_]] == l2[ys[nj_], xs[nj_]]
+                                        and l2[ys[dj_], xs[dj_]] > 0):
+                                    los = mid
+                                else:
+                                    his = mid
+                            rec["bottleneck_r"] = round(los * wmap.resolution, 2)
+                            rec["neck_ratio"] = round(
+                                los / max(float(sub_dt[ys, xs].max()), 1e-6), 3)
+
+                            # ---- is the patch even one connected region? ----
+                            # `gather` builds patches with **8-connectivity**,
+                            # which treats two regions touching only at a corner
+                            # as one.  Measured here: the widest path joining
+                            # `deepest` and `near_robot` is **one cell** wide
+                            # (`bottleneck_r` = 0.10 m) while the block's own
+                            # widest point is ~2 m -- i.e. the two points are
+                            # joined by a diagonal touch, not by open floor.  So
+                            # the comparison 4- vs 8-connectivity answers
+                            # "is this patch one place or several" without
+                            # inventing any scale parameter at all.
+                            n4, lab4 = cv2.connectedComponents(
+                                sub_full.astype(np.uint8), connectivity=4)
+                            tags4 = np.unique(lab4[ys, xs])
+                            rec["nblob_4"] = int((tags4 > 0).sum())
+                            rec["same_4"] = int(lab4[ys[dj_], xs[dj_]]
+                                                == lab4[ys[nj_], xs[nj_]])
+
+                            # ---- eroded connectivity: the actual scale test --
+                            # If a block is several open areas stitched together
+                            # by one-cell-wide gaps in the map, then eroding it
+                            # by a couple of cells must break it apart.  Report,
+                            # per erosion level, how many blobs remain **and
+                            # whether the two representative places are still in
+                            # the same one** (1 = same, 0 = different,
+                            # -1 = one of them was eroded away entirely, i.e.
+                            # "this place is not even 2 cells from open space").
+                            for lv in (2, 3, 4, 6):
+                                m_ = (sub_full & (dt >= lv)).astype(np.uint8)
+                                _n3, l3 = cv2.connectedComponents(
+                                    m_, connectivity=8)
+                                t3 = np.unique(l3[ys, xs])
+                                rec["nblob_e%d" % lv] = int((t3 > 0).sum())
+                                a3 = l3[ys[dj_], xs[dj_]]
+                                b3 = l3[ys[nj_], xs[nj_]]
+                                rec["same_e%d" % lv] = (
+                                    -1 if (a3 == 0 or b3 == 0)
+                                    else int(a3 == b3))
+                            for r_ in seed_radii:
+                                # Local maxima of the block's own distance
+                                # transform at window `2r`, i.e. "how many
+                                # width-peaks does this block have at scale r".
+                                # This is the natural sub-patch decomposition --
+                                # a first attempt used greedy disc cover and
+                                # over-counted badly on long thin blocks
+                                # (a 29.6 m² strip came out as 3 blobs at r = 6 m,
+                                # where one disc plainly covers it).
+                                kr = max(1, int(round(r_ / wmap.resolution)))
+                                ksz = 2 * kr + 1
+                                mx = cv2.dilate(sub_dt, np.ones((ksz, ksz),
+                                                                np.uint8))
+                                peaks = (sub_dt >= mx - 1e-6) & (sub_dt > 0)
+                                np_lab, p_lab = cv2.connectedComponents(
+                                    peaks.astype(np.uint8), connectivity=8)
+                                tag = "%g" % r_
+                                rec["nseed_" + tag] = int(max(0, np_lab - 1))
+                                if np_lab > 1:
+                                    dj = reps["deepest"]
+                                    nj = reps["near_robot"]
+                                    # `p_lab` is a full-map image; index by cell
+                                    rec["same_" + tag] = int(
+                                        p_lab[ys[dj], xs[dj]]
+                                        == p_lab[ys[nj], xs[nj]])
+                                else:
+                                    rec["same_" + tag] = 0
                             patch_rows.append(rec)
                 except Exception as exc:                 # a probe never crashes a run
                     print("  (patch dump skipped at frame %d: %s)" % (idx, exc))
