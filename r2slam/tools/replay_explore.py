@@ -133,6 +133,14 @@ def main():
     ap.add_argument("--npz", required=True)
     ap.add_argument("--config", default="config/sim_house.yaml")
     ap.add_argument("--out", default=None, help="write per-frame decisions here")
+    ap.add_argument("--dump-cands", default=None,
+                    help="also write the ranked sweep candidate table per frame "
+                         "(one row per candidate).  Read it from an arm whose "
+                         "sweep actually runs every frame -- with "
+                         "`shadow=False` that is every frame -- because "
+                         "`last_sweep_cands` is only rebound when the sweep "
+                         "path is taken, so on a `shadow` frame it still holds "
+                         "the previous decision's list.")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-detect", action="store_true",
                     help="skip the detector (faster, but the obstacle layer then "
@@ -225,6 +233,7 @@ def main():
         print("  probe     : ignored with --arms (a probe needs one explorer)")
 
     rows_out: dict = {}
+    cand_rows: list = []        # only filled with --dump-cands
     pose_rows = []
     prev_stamp = None
     n = 0
@@ -324,6 +333,23 @@ def main():
                      )))
 
         for name, exr, _v, _w, _e in results:
+            if a.dump_cands:
+                kind = str(_e.get("target_kind", ""))
+                for c in (getattr(exr, "last_sweep_cands", None) or [])[:80]:
+                    # Field layout of a sweep candidate tuple is documented at
+                    # its construction site in `explore.py`; [2]/[3] are the
+                    # place, [21] the score before any region term and [22] the
+                    # rank of its region.  Guarded because this is a probe and a
+                    # probe must never be the thing that crashes a run.
+                    try:
+                        cand_rows.append(dict(
+                            arm=name, frame=idx, stamp=float(fr.stamp), kind=kind,
+                            px=round(float(c[2]), 3), py=round(float(c[3]), 3),
+                            score=round(float(c[21]), 4),
+                            reg_rank=int(c[22]),
+                            ncell=int(c[4])))
+                    except (TypeError, ValueError, IndexError):
+                        continue
             rows_out.setdefault(name, []).append(dict(
                 frame=idx, stamp=float(fr.stamp), x=float(t[0]), y=float(t[1]),
                 yaw=yaw, v=float(_v), w=float(_w),
@@ -398,6 +424,16 @@ def main():
             for row in pose_rows:
                 wr.writerow([repr(v) for v in row])
         print("  poses written: %s" % a.poses)
+
+    if a.dump_cands:
+        with open(a.dump_cands, "w", encoding="utf-8", newline="") as fh:
+            wr = csv.DictWriter(fh, fieldnames=[
+                "arm", "frame", "stamp", "kind", "px", "py", "score",
+                "reg_rank", "ncell"])
+            wr.writeheader()
+            for r in cand_rows:
+                wr.writerow(r)
+        print("  candidates   : %s  (%d rows)" % (a.dump_cands, len(cand_rows)))
 
     if a.out:
         for name, exr in arms:
