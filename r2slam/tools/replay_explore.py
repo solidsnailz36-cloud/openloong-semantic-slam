@@ -65,19 +65,14 @@ def parse_overrides(items):
     Types matter because `arc_max_deg = "125"` (a string) would raise inside the
     comparison rather than at the command line, and a parameter that silently
     failed to apply is exactly the failure mode this harness exists to catch.
+
+    The rule itself lives in `r2slam.overrides` so that `--set`, `--arms` and the
+    online `--explore-set` cannot drift apart; they did, and the `--arms` copy
+    could not produce a bool, which silently turned a control arm into a
+    treatment arm (see that module's docstring).
     """
-    import ast
-    out = {}
-    for it in items:
-        if "=" not in it:
-            raise SystemExit("--set wants key=value, got %r" % it)
-        k, v = it.split("=", 1)
-        k, v = k.strip(), v.strip()
-        try:
-            out[k] = ast.literal_eval(v)
-        except (ValueError, SyntaxError):
-            out[k] = v
-    return out
+    from r2slam.overrides import parse_kv_overrides
+    return parse_kv_overrides(items)
 
 
 def local_map(wmap, x, y, r=3.0):
@@ -192,23 +187,19 @@ def main():
     arms: list = []
 
     def _parse_arm(spec: str):
+        """`NAME:k=v,k=v` -> `(name, kwargs)`.
+
+        The values go through the same rule as `--set` and `--explore-set` (see
+        `r2slam.overrides`).  They used to go through an `int -> float -> str`
+        chain, which cannot produce a **bool**: `--arms "off:rfirst=False"`
+        arrived as the string `"False"`, `bool("False")` is `True`, and the arm
+        meant to be the control ran with the feature switched on.  It did not
+        crash and it printed no warning -- it just answered a different question,
+        which is the worst kind of harness bug.
+        """
         name, _, kv = spec.partition(":")
-        ov = {}
-        for part in kv.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            k, _, v = part.partition("=")
-            if not k:
-                continue
-            try:
-                ov[k.strip()] = int(v)
-            except ValueError:
-                try:
-                    ov[k.strip()] = float(v)
-                except ValueError:
-                    ov[k.strip()] = v.strip()
-        return name.strip() or "arm", ov
+        return (name.strip() or "arm",
+                parse_overrides([p for p in kv.split(",") if p.strip()]))
 
     if a.arms:
         for spec in a.arms:
@@ -588,6 +579,25 @@ def main():
                                    # the control arm's `pick_sizes` sits next
                                    # to the live arm's, which is how "candidate
                                    # generation is unchanged" is checked.
+                                   # Gate 4: the two-level decision's own
+                                   # record -- the clusters of every decision,
+                                   # the worst span inside one, and which
+                                   # region each pick actually took.
+                                   rfirst_hist=getattr(exr, "rfirst_hist", []),
+                                   rfirst_picks=getattr(exr, "rfirst_picks", []),
+                                   rfirst=dict(
+                                       on=getattr(exr, "rfirst", False),
+                                       link_m=getattr(exr, "rfirst_link_m", 0.0),
+                                       radius_m=getattr(exr,
+                                                        "rfirst_radius_m", 0.0),
+                                       score_mode=getattr(exr,
+                                                          "rfirst_score_mode",
+                                                          "area"),
+                                       max_span=getattr(exr,
+                                                        "rfirst_max_span", 0.0),
+                                       picks=getattr(exr, "n_rfirst_picks", 0),
+                                       top_used=getattr(exr,
+                                                        "n_rfirst_top_used", 0)),
                                    region_margin=getattr(exr, "region_hist", []),
                                    region_switches=getattr(exr,
                                                            "region_switches", []),

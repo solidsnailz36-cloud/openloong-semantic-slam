@@ -1846,13 +1846,149 @@ def main():
         fails.append("`region_mode=\"add\"` moved the goal to a less neglected "
                      "tile")
 
+    print("30) region-first: choose the region, then the place inside it")
+    # Boss, 2026-10-06: on the control arm the candidates of one decision are
+    # `sep_min_med = 6.33 m` and `az_span_med = 157 deg` apart, so a single
+    # `rank_key` over them is really choosing between rooms -- every ranking term
+    # tried so far was doing a region-level job with a point-level instrument.
+    # The fix is not another scalar, it is to stop flattening two questions into
+    # one.  This case pins the structural properties that carry the design.
+    #
+    # What it deliberately does *not* pin: that a cross-region move is blocked
+    # in practice.  On this fixture the candidates are only ~1 m apart, so both
+    # arms stay inside `link_m` and the bound is not exercised -- that is
+    # measured on the frozen replay instead (docs section 28), and claiming a
+    # pass here would be claiming a test that was never run.
+    w30 = two_rooms()
+
+    def pick30(**kw):
+        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                             sweep_cands_per_patch=4, **kw)
+        e._survey_stops = []
+        e._sweep_patch_mask = None
+        e._sweep_patch_stops = 0
+        r, _x = e._masks(w30, (0.0, 0.0))
+        p = e._pick_sweep_target(w30, r, 0.0, 0.0)
+        return e, (None if p is None else (round(p[0], 2), round(p[1], 2)))
+
+    e30off, p30_flat = pick30()
+    e30, p30_rf = pick30(rfirst=True)
+    st30 = e30.pick_stats()
+    print("    flat -> %s | region-first -> %s  |  regions per decision: "
+          "med %s, P(>=2) %s, max %s"
+          % (p30_flat, p30_rf, st30.get("n_reg_med"), st30.get("p_ge2_reg"),
+             st30.get("n_reg_max")))
+    # (a) `rfirst = False` must leave no trace at all: no region history, no
+    # region picks, and the pick is the standing one.
+    if e30off.rfirst_hist or e30off.rfirst_picks:
+        fails.append("rfirst=0 recorded region state (%d histories, %d picks): "
+                     "the control arm has to be an exact no-op"
+                     % (len(e30off.rfirst_hist), len(e30off.rfirst_picks)))
+    if e30off.pick_stats().get("n_reg_med") is not None:
+        fails.append("the region-first instrument reported on the rfirst=0 arm")
+    # (b) the region layer has an object.  `two_rooms` puts the two rooms 4.3 m
+    # apart, so with link_m = 3.0 they must come out as two separate regions --
+    # this is Gate 4's first reading, and a region layer with one region is
+    # section 21's "one candidate" one level up.
+    if not st30.get("n_rfirst_seen"):
+        fails.append("region-first recorded no decisions at all: the layer "
+                     "never ran")
+    elif int(st30.get("n_reg_max", 0)) < 2:
+        fails.append("two rooms 4.3 m apart came out as at most %r region(s): "
+                     "there is nothing for the region layer to choose between"
+                     % (st30.get("n_reg_max"),))
+    # (c) purity.  Complete linkage is what makes the point layer's budget a
+    # property of the code rather than a hope: single linkage would let a chain
+    # of close pairs call two rooms one region, and that chain is the mechanism
+    # behind section 23's 18.12 m swap.
+    if float(st30.get("span_max", 99.0)) > 3.0 + 1e-6:
+        fails.append("a region spans %.2f m with link_m = 3.0: complete linkage "
+                     "is not holding the point layer's budget"
+                     % float(st30.get("span_max", 0.0)))
+    # (d) the control for the layer itself.  Scoring a region by its best place
+    # collapses the two-level order onto the standing global one, so it must
+    # reproduce the baseline pick exactly; if it does not, the region layer is
+    # doing something other than ordering regions and every reading taken from
+    # it would be suspect.
+    _e30m, p30_max = pick30(rfirst=True, rfirst_score_mode="maxpoint")
+    print("    region score = best place in the region -> %s" % (p30_max,))
+    if p30_max != p30_flat:
+        fails.append("the `maxpoint` region score did not reproduce the plain "
+                     "pick (%s vs %s): the two levels do not collapse onto the "
+                     "global order" % (p30_max, p30_flat))
+    # (e) ... and the split survives an absurd point-level term: whatever the
+    # local weight does, the result must still sit inside the region's budget.
+    e30h, p30_hot = pick30(rfirst=True, cand_local_lambda=50.0)
+    sth = e30h.pick_stats()
+    dd_hot = (0.0 if (p30_rf is None or p30_hot is None) else
+              float(np.hypot(p30_hot[0] - p30_rf[0], p30_hot[1] - p30_rf[1])))
+    print("    local term at 50x inside a region: %s  (%.2f m from the "
+          "lambda=0 pick; swaps %s, max swap %s m)"
+          % (p30_hot, dd_hot, sth.get("sw_n"), sth.get("sw_dist_max")))
+    if dd_hot > 3.0 + 1e-6:
+        fails.append("a point-level term at 50x moved the goal %.2f m, past "
+                     "the region's own link radius" % dd_hot)
+    if sth.get("sw_n") and float(sth.get("sw_dist_max", 99.0)) > 3.0 + 1e-6:
+        fails.append("a counted point swap moved %.2f m with link_m = 3.0"
+                     % float(sth["sw_dist_max"]))
+    if not sth.get("sw_n"):
+        print("      (no point-level swap on this fixture, so the bound is not "
+              "exercised here -- it is measured on the replay)")
+
+    print("31) the three parameter entry points agree, and a flag cannot stick")
+    # Found by running an experiment that came out wrong: `--arms
+    # "off:rfirst=False"` reached the constructor as the **string** `"False"`,
+    # and `bool("False")` is `True` -- so the arm that was meant to be the control
+    # ran with the feature switched on.  No error, no warning, just an answer to
+    # a different question.  The rule now lives in one place (`r2slam.overrides`)
+    # and this case pins both halves: the parser produces real types, and the
+    # constructor cannot be fooled by text.
+    from r2slam.overrides import parse_kv_overrides, as_bool
+    parsed = parse_kv_overrides(["rfirst=False", "cand_local_lambda=2.0",
+                                 "sweep_cands_per_patch=4", "region_mode=add"])
+    print("    parse_kv_overrides -> %s" % (parsed,))
+    if parsed.get("rfirst") is not False:
+        fails.append("`rfirst=False` parsed to %r, not the bool False: a control "
+                     "arm written on the command line would silently run as the "
+                     "treatment" % (parsed.get("rfirst"),))
+    if parsed.get("cand_local_lambda") != 2.0:
+        fails.append("`2.0` did not parse to a float (%r)"
+                     % (parsed.get("cand_local_lambda"),))
+    if parsed.get("sweep_cands_per_patch") != 4:
+        fails.append("`4` did not parse to an int (%r)"
+                     % (parsed.get("sweep_cands_per_patch"),))
+    if parsed.get("region_mode") != "add":
+        fails.append("a bare word did not stay a string (%r)"
+                     % (parsed.get("region_mode"),))
+    for text, want in (("False", False), ("0", False), ("off", False),
+                       ("true", True), ("1", True)):
+        if as_bool(text) is not want:
+            fails.append("as_bool(%r) is %r, expected %r" % (text, as_bool(text),
+                                                             want))
+    e31 = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9, rfirst="False")
+    if e31.rfirst is not False:
+        fails.append("FrontierExplorer(rfirst=\"False\").rfirst is %r: the flag "
+                     "sticks on when it is written as text" % (e31.rfirst,))
+    e31b = FrontierExplorer(stagnate_frames=10 ** 9, sweep="0")
+    if e31b.sweep is not False:
+        fails.append("FrontierExplorer(sweep=\"0\").sweep is %r" % (e31b.sweep,))
+    # ... and the text form must behave like the real one, which is the point of
+    # the whole exercise: an arm named the same way must run the same way.
+    e31c = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                            sweep_cands_per_patch=4, rfirst="False")
+    _r31, _x31 = e31c._masks(w30, (0.0, 0.0))
+    e31c._pick_sweep_target(w30, _r31, 0.0, 0.0)
+    if e31c.rfirst_hist:
+        fails.append("rfirst written as the text \"False\" still built region "
+                     "state: the two spellings do not agree")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (29 checks)")
+    print("verdict: PASS (31 checks)")
     return 0
 
 

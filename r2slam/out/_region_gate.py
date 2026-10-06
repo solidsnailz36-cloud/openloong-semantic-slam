@@ -43,6 +43,21 @@ import sys
 import numpy as np
 
 
+# The same boxes every earlier round used (`_room_cover.py`, `_diverge_scan.py`,
+# `_discover_timeline.py`).  Kept identical on purpose: the point of the column
+# below is to sit next to the coverage numbers already published.
+ROOMS = [("右上", 5.3, 3.4, 2.25), ("左下", -8.0, -6.4, 2.60),
+         ("左上", -8.9, 2.8, 2.25), ("帘子", -11.2, -6.6, 1.60)]
+
+
+def inbox(x, y):
+    """Which room a world point falls in, or None for a corridor."""
+    for name, cx, cy, half in ROOMS:
+        if abs(x - cx) <= half and abs(y - cy) <= half:
+            return name
+    return None
+
+
 def read_rows(path):
     with open(path, "r", encoding="utf-8", newline="") as fh:
         return list(csv.DictReader(fh))
@@ -124,6 +139,28 @@ def main():
     print()
 
     # ---- B. did the goal move, and which way -------------------------------
+    # Where the committed targets actually are.  Boss, 2026-10-06: "the direction
+    # condition has to hang on the target *class*, not on the optimised scalar
+    # getting bigger" -- a term can move the goal on every one of its own
+    # conditions and still never put it in a room.  This is the column that says
+    # whether that happened.
+    def room_share(r):
+        tot, hit, seen = 0, 0, []
+        for row in r:
+            if row["target_x"] == "":
+                continue
+            try:
+                x, y = float(row["target_x"]), float(row["target_y"])
+            except ValueError:
+                continue
+            tot += 1
+            if inbox(x, y):
+                hit += 1
+            seen.append((x, y))
+        uniq = len(set(seen))
+        uin = len({(x, y) for x, y in seen if inbox(x, y)})
+        return (hit, tot, uin, uniq)
+
     print("===== B. did the decision change? =====")
     print("  %-10s %7s %8s %8s %9s %9s %s"
           % ("arm", "frames", "diff fr", "segments", "first@", "term sw",
@@ -161,6 +198,59 @@ def main():
                  first_desc))
     print("  （`diff fr`/`segments` 来自逐帧记录；`term sw` 来自策略内部计数 —— "
           "两者不一致时以逐帧记录为准）")
+    print()
+    print("  %-10s %19s %21s" % ("arm", "target in a room (frames)",
+                                 "distinct targets in a room"))
+    for name in a.arms:
+        if name not in rows:
+            continue
+        hit, tot, uin, uniq = room_share(rows[name])
+        print("  %-10s %19s %21s"
+              % (name, "%d/%d = %.1f%%" % (hit, tot, 100.0 * hit / max(tot, 1)),
+                 "%d/%d = %.1f%%" % (uin, uniq, 100.0 * uin / max(uniq, 1))))
+    print("  （分母写在格子里。这一列挂在**目标类别**上，不挂在被优化的标量上 ——"
+          " 一个项可以让它自己的每个条件都成立，却一次都没把目标放进房间）")
+    print()
+
+    # ---- D. Gate 4: the two-level decision ---------------------------------
+    #
+    # Boss, 2026-10-06: "the region selector may change the choice, but it may
+    # not smuggle a cross-region move in as a locally better point."  Read in
+    # the order the acceptance has to be checked: does the region layer have an
+    # object, what is the point layer's budget, and which region was taken.
+    print("===== D. Gate 4: region purity =====")
+    print("  %-10s %8s %9s %10s %10s %11s %8s"
+          % ("arm", "picks", "med #reg", "P(#reg>=2)", "span med", "span max",
+             "link m"))
+    for name in a.arms:
+        st = (stats.get(name) or {}).get("stats", {})
+        if not st.get("n_rfirst_seen"):
+            print("  %-10s %8s %9s %10s %10s %11s %8s"
+                  % (name, "-", "-", "-", "-", "-", "-"))
+            continue
+        print("  %-10s %8s %9s %10s %10s %11s %8s"
+              % (name, st.get("n_rfirst_seen"), st.get("n_reg_med"),
+                 st.get("p_ge2_reg"), st.get("span_med"), st.get("span_max"),
+                 st.get("link_m")))
+    print("  （`span max` 是**整跑**里最大的簇内跨度；必须 ≤ link m，"
+          "否则「点层无法跨区」只是希望而不是事实）")
+    print("  %-10s %10s %10s %11s %12s %s"
+          % ("arm", "region picks", "took top", "fallthrough", "rank med",
+             "reg score"))
+    for name in a.arms:
+        d = stats.get(name) or {}
+        st, rf = d.get("stats", {}), d.get("rfirst", {})
+        if not rf.get("on"):
+            print("  %-10s %10s %10s %11s %12s %s"
+                  % (name, "-", "-", "-", "-", "-"))
+            continue
+        print("  %-10s %10s %10s %11s %12s %s"
+              % (name, rf.get("picks"), rf.get("top_used"),
+                 st.get("rf_rank_gt0_frac", "-"), st.get("rf_rank_med", "-"),
+                 rf.get("score_mode")))
+    print("  （`took top` = 选中的就是区域层排第一的那个；`fallthrough` = "
+          "区域层排第一的簇在本图上无路可走、落到下一个区域 —— 这是**路由**原因，"
+          "不是区域层的决定）")
     print()
 
     # ---- the segments themselves, so a long move cannot hide in a median ---

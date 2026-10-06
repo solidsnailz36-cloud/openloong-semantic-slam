@@ -51,6 +51,7 @@ import cv2
 import numpy as np
 
 from .nav import PathPlanner, path_length
+from .overrides import as_bool
 
 
 class FrontierExplorer:
@@ -107,7 +108,10 @@ class FrontierExplorer:
                  region_done_m2: float = 0.40, region_brief_m2: float = 1.00,
                  region_progress_eps_m2: float = 0.15,
                  region_grace_s: float = 25.0, region_idle_cap_s: float = 120.0,
-                 region_period_s: float = 1.0):
+                 region_period_s: float = 1.0,
+                 rfirst: bool = False, rfirst_link_m: float = 3.00,
+                 rfirst_radius_m: float = 1.50,
+                 rfirst_score_mode: str = "area"):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
@@ -149,7 +153,7 @@ class FrontierExplorer:
         # `sweep` adds the missing motive: prefer a reachable patch of floor the
         # robot has never been near.  Frontier remains the fallback, so nothing
         # is lost when there is genuinely unexplored space at the rim.
-        self.sweep = bool(sweep)
+        self.sweep = as_bool(sweep)
         self.sweep_radius = float(sweep_radius)    # "has been near" radius
         self.sweep_min_m2 = float(sweep_min_m2)    # smallest patch worth a trip
         # How far *inside* untouched ground a candidate has to be, in metres.
@@ -345,7 +349,7 @@ class FrontierExplorer:
         # pick actually did.  Keeping them as one variable is how the first cut
         # of this ended up with a switch that did nothing: the picker wrote its
         # own answer over the configuration.
-        self.sweep_survey = bool(sweep_first_pass)
+        self.sweep_survey = as_bool(sweep_first_pass)
         self.sweep_first_pass = False
         self.sweep_stop_spread_m = float(sweep_stop_spread_m)
         # ... and the ledger is the *survey* stops only.  Deep stops must not go
@@ -375,7 +379,7 @@ class FrontierExplorer:
         # spot.  This is the `viewpoint generation` half of FUEL / TARE, reduced
         # to what a 2-D occupancy grid can support -- no ray casting into the
         # future, just "is the line to it clear from here".
-        self.shadow = bool(shadow)
+        self.shadow = as_bool(shadow)
         self.shadow_min_m2 = float(shadow_min_m2)
         # --- how near the robot must have got, for this to be a blind spot ---
         #
@@ -421,7 +425,7 @@ class FrontierExplorer:
         # See `_lookahead` for the measurement (v16: 43 s of a 275 s run spent
         # commanding v = 0, w = 0 at (-7.6, 0.2)).  Two knobs and two counters:
         self.lookahead_m = float(lookahead_m)
-        self.los_lookahead = bool(los_lookahead)
+        self.los_lookahead = as_bool(los_lookahead)
         # Which grid the line-of-sight test reads.
         #
         #   "floor" -- known floor with the *confirmed* obstacles cut out
@@ -736,6 +740,67 @@ class FrontierExplorer:
         self.last_region_dhat = 0.0      # and the weight it earned
         self.region_hist: List[dict] = []      # per pick: Gate A, the gradient
         self.region_switches: List[dict] = []  # the swaps, with Gate C's numbers
+
+        # --- region-first: the two-level decision ----------------------------
+        #
+        # Boss, 2026-10-06, after section 27 closed the ranking-layer line:
+        #
+        #   "The real thing to solve is that **choosing which region** and
+        #    **choosing which point inside it** have to be two different levels.
+        #    Build the minimal region-first prototype: cluster the candidates
+        #    spatially, let the region layer answer only 'is there a region worth
+        #    going to', and once a region is chosen use the original point
+        #    picker inside it.  Then the question you can finally ask is: **once
+        #    the cross-room jump is taken out of point ranking, does the old
+        #    local ranking have any value at all?**  Do not add another ranking
+        #    term."
+        #
+        # Why this is the right next step, stated as the thing section 27
+        # measured: on the control arm the candidates of one decision are
+        # `sep_min_med = 6.33 m` and `az_span_med = 157 deg` apart, i.e. the
+        # "candidate set" is a list of *house-scale work sites*, and a single
+        # `rank_key` over it must choose between rooms.  Every ranking term tried
+        # so far was therefore doing a region-level job with a point-level
+        # instrument, and the only two outcomes available were "does nothing"
+        # (sections 25, and `region_mode="add"` in 27) or "jumps 13-19 m"
+        # (sections 23/24, and `region_mode="mul"` in 27).  The fix is not a
+        # better scalar; it is to stop flattening two questions into one.
+        #
+        # Note on vocabulary: "region" here means **a cluster of candidates of
+        # one decision**, which is NOT the 2 m map tile of the `region_*`
+        # parameters above.  The tile was a clock carrier (it has to keep its
+        # identity across frames to accumulate neglect); a cluster is a
+        # within-one-decision grouping and deliberately has no history at all --
+        # boss's first-stage rule is "no complicated region score", and putting a
+        # starvation term in this layer would re-open the line section 27 closed.
+        #
+        # `rfirst = False` is the standing behaviour exactly: a constant prefix
+        # on a tuple does not change any comparison (see `_ckey`), and case 30
+        # holds that the picks are bit-identical.
+        self.rfirst = as_bool(rfirst)
+        # Complete linkage, and the number is doing double duty: it is both the
+        # definition of "one region" and the **hard bound on how far the point
+        # layer may move the goal**.  Single linkage would let a chain of
+        # close pairs hand one "region" across the house -- that is exactly the
+        # mechanism behind the 18 m jump of section 23, so it is excluded by
+        # construction rather than by a gate.
+        self.rfirst_link_m = max(float(rfirst_link_m), 1e-3)
+        # Radius used to estimate how much never-visited floor a region holds.
+        # The union over the cluster's places, not the sum: four places 1 m apart
+        # are one 3 m working area, and summing would count it four times.
+        self.rfirst_radius_m = max(float(rfirst_radius_m), 1e-3)
+        # "area" scores a region by `unfinished floor it holds / (1 + distance
+        # from the start)` -- geometric only, no clock, no history, no knob.
+        # "maxpoint" scores it by its best candidate's own score, which makes the
+        # two-level order collapse onto the standing global order; it exists as
+        # the control that tests the clustering layer itself (case 30).
+        self.rfirst_score_mode = str(rfirst_score_mode)
+        self.rfirst_hist: List[dict] = []    # per pick: clusters, spans, scores
+        self.rfirst_picks: List[dict] = []   # per pick: which cluster was taken
+        self.n_rfirst_picks = 0              # picks where a cluster was chosen
+        self.n_rfirst_top_used = 0           # ... and it was the top-ranked one
+        self.rfirst_max_span = 0.0           # worst within-cluster span seen
+        self._last_n_regions = 0
 
         self.n_sweep_abandoned = 0
         self._sw_best = float("inf")
@@ -1641,6 +1706,45 @@ class FrontierExplorer:
                        rsw_unit_med=round(float(np.median(un)), 3),
                        rsw_n_far=int((dd >= 5.0).sum()),
                        rsw_n_absurd=int(((dd >= 5.0) & (di <= 25.0)).sum()))
+        # --- Gate 4: the two-level decision's own instrument ----------------
+        #
+        # Boss, 2026-10-06: "the region selector may change the choice, but it
+        # may not smuggle a cross-region move in as a locally better point."
+        # Three readings, in the order the acceptance has to be checked:
+        #
+        #   1  does the region layer even have an object?  `n_reg_med` /
+        #      `p_ge2_reg` -- a region layer with one region is section 21's
+        #      "one candidate", one level up, and no region score can matter;
+        #   2  what is the point layer's budget?  `span_max` -- the **worst**
+        #      within-region span over the whole run.  It has to stay under
+        #      `rfirst_link_m` for "the cross-region jump is impossible" to be a
+        #      property of the code rather than a hope about the map.  A running
+        #      maximum and not a mean, because the failure this is guarding
+        #      against is a single group of two far-apart places being called one
+        #      region (section 23's 18.12 m swap, which a median would hide);
+        #   3  which region was taken, and how often the head had to be skipped
+        #      for a routing reason (`rf_rank_gt0_frac`).
+        if self.rfirst_hist:
+            nreg = np.array([h["n_reg"] for h in self.rfirst_hist], float)
+            spans = np.array([h["span_max"] for h in self.rfirst_hist], float)
+            areas = np.array([max(h["areas"]) if h["areas"] else 0.0
+                              for h in self.rfirst_hist], float)
+            out.update(n_rfirst_seen=len(self.rfirst_hist),
+                       n_reg_med=round(float(np.median(nreg)), 2),
+                       n_reg_max=int(nreg.max()),
+                       p_ge2_reg=round(float((nreg >= 2).mean()), 3),
+                       span_max=round(float(self.rfirst_max_span), 2),
+                       span_med=round(float(np.median(spans)), 2),
+                       reg_area_max_med=round(float(np.median(areas)), 2),
+                       link_m=round(float(self.rfirst_link_m), 2))
+        if self.rfirst:
+            out.update(n_rfirst_picks=self.n_rfirst_picks,
+                       n_rfirst_top=self.n_rfirst_top_used,
+                       rfirst_score_mode=self.rfirst_score_mode)
+        if self.rfirst_picks:
+            rr = np.array([p["reg_rank"] for p in self.rfirst_picks], float)
+            out.update(rf_rank_med=float(np.median(rr)),
+                       rf_rank_gt0_frac=round(float((rr > 0).mean()), 3))
         if not self.debt_margin:
             return out
         needs = [m["need_lam"] for m in self.debt_margin if m["need_lam"] >= 0.0]
@@ -1977,6 +2081,138 @@ class FrontierExplorer:
         if len(self.region_hist) > 400:
             del self.region_hist[:200]
 
+    # ---- region-first: the first of the two levels ------------------------
+    def _cluster_rows(self, rows, link_m: float) -> List[list]:
+        """Group the candidates of one decision into spatial regions.
+
+        Complete linkage: every pair inside a region is within `link_m`, not just
+        neighbours in a chain.  The distinction is not academic -- a chain of
+        close pairs lets one "region" walk across the house one hop at a time,
+        and that is precisely the mechanism behind the section-23 result (a
+        local term moving the goal 18.12 m to buy 0.40 m2).  With complete
+        linkage, `link_m` is *also* the hard bound on how far the point layer
+        may move the goal inside a region, which is what makes Gate 4 checkable
+        by construction rather than by measurement.
+
+        Greedy first-fit in a **fixed** order (the point ranking), so the
+        grouping is a deterministic function of the candidate set.  That matters
+        for the same reason `_rank_key` exists: a 1e-7 m wobble in the input must
+        not be able to regroup the candidates and change the run (section 19).
+        """
+        n = len(rows)
+        order = sorted(range(n), key=lambda i: self._rank_key(
+            rows[i]["score_r"], rows[i]["d0"], rows[i]["ax"], rows[i]["ay"],
+            rows[i]["px"], rows[i]["py"], rows[i]["cd"]))
+        clusters: List[list] = []
+        for i in order:
+            pi, pj = rows[i]["px"], rows[i]["py"]
+            for c in clusters:
+                if all(float(np.hypot(pi - rows[j]["px"], pj - rows[j]["py"]))
+                       <= link_m + 1e-9 for j in c):
+                    c.append(i)
+                    break
+            else:
+                clusters.append([i])
+        return clusters
+
+    def _region_first_crank(self, rows, clusters, fresh, wmap, cell, sx, sy):
+        """Rank the regions, and hand every candidate its region's rank.
+
+        The score is **geometric only**: the never-visited floor the region holds
+        (union over its places, disc of `rfirst_radius_m`) over the distance from
+        the start.  No clock, no history, no new tuning knob -- boss's rule for
+        the first stage is "do not design a complicated region score", and adding
+        a starvation term here would re-open the line section 27 closed.
+
+        `"maxpoint"` scores a region by its best candidate instead, which makes
+        the region order collapse onto the standing global point order.  That
+        arm is the control for the clustering layer itself: if a region layer
+        that cannot disagree with the plain order produces different decisions,
+        the layer has a bug, not a finding (case 30).
+
+        The ranking is quantised with the same two quanta the point key uses,
+        for the same reason -- ties must be *declared* equal, not decided by
+        which region happened to win a floating-point comparison.
+        """
+        res = float(wmap.resolution)
+        r_px = max(1, int(round(self.rfirst_radius_m / res)))
+        q = max(self.score_quantum_m2, 1e-9)
+        qm = max(self.rank_quantum_m, 1e-9)
+
+        def area_of(c) -> float:
+            m = np.zeros(fresh.shape, np.uint8)
+            for i in c:
+                cc = wmap.cell_of(rows[i]["px"], rows[i]["py"])
+                cv2.circle(m, (int(cc[0]), int(cc[1])), r_px, 1, -1)
+            return float(((m > 0) & fresh).sum()) * cell
+
+        info = []
+        for c in clusters:
+            pts = [(float(rows[i]["px"]), float(rows[i]["py"])) for i in c]
+            d_c = min(float(np.hypot(px - sx, py - sy)) for px, py in pts)
+            area = area_of(c)
+            if self.rfirst_score_mode == "maxpoint":
+                s_c = max(float(rows[i]["score_r"]) for i in c)
+            else:
+                s_c = area / (1.0 + d_c)
+            if len(pts) >= 2:
+                a = np.array(pts, dtype=np.float64)
+                dm = np.hypot(a[:, 0][:, None] - a[:, 0][None, :],
+                              a[:, 1][:, None] - a[:, 1][None, :])
+                span = float(dm.max())
+            else:
+                span = 0.0
+            info.append(dict(idx=list(c), score=float(s_c), d=float(d_c),
+                             area=float(area), span=span,
+                             cx=float(np.mean([p[0] for p in pts])),
+                             cy=float(np.mean([p[1] for p in pts]))))
+
+        keyed = [((-int(round(it["score"] / q)), int(round(it["d"] / qm)),
+                   int(round(it["cx"] / qm)), int(round(it["cy"] / qm))), k)
+                 for k, it in enumerate(info)]
+        keyed.sort()
+        for rk, (_, k) in enumerate(keyed):
+            info[k]["rank"] = rk
+        crank = [0] * len(rows)
+        for it in info:
+            for i in it["idx"]:
+                crank[i] = it["rank"]
+        return crank, info
+
+    def _record_region_purity(self, rows, info) -> None:
+        """Gate 4: the region layer's own instrument, and it records no score.
+
+        Boss, 2026-10-06: "the region selector may change the choice, but it may
+        not smuggle a cross-region move in as a locally better point."  Three
+        things make that checkable, and all three are counts or distances:
+
+        * **how many regions were on the table** -- a region layer with one
+          object is section 21's "one candidate", one level up, and no amount of
+          region scoring can matter;
+        * **the worst span inside one region** -- the point layer's budget.  It
+          has to stay under `rfirst_link_m` for "the cross-room jump is gone" to
+          be a fact rather than a hope, and it is recorded as a running maximum
+          so the bound cannot be met on average while being broken once;
+        * **which region was taken** -- so a move of 13 m can be *attributed* to
+          the region choice (see `rfirst_picks`) instead of showing up as an
+          unexplained point-level swap, which is how section 23's 14.2 m swap
+          got written up as a feature.
+        """
+        span_max = 0.0
+        for it in info:
+            span_max = max(span_max, float(it.get("span", 0.0)))
+        self.rfirst_max_span = max(self.rfirst_max_span, span_max)
+        self._last_n_regions = len(info)
+        self.rfirst_hist.append(dict(
+            t=round(float(self._last_stamp or 0.0), 1),
+            n_cand=len(rows), n_reg=len(info), span_max=round(span_max, 2),
+            sizes=[len(it["idx"]) for it in info],
+            areas=[round(float(it["area"]), 2) for it in info],
+            scores=[round(float(it["score"]), 3) for it in info],
+            d_start=[round(float(it["d"]), 2) for it in info]))
+        if len(self.rfirst_hist) > 400:
+            del self.rfirst_hist[:200]
+
     def _fresh_area(self, wmap, reach, x0, y0) -> float:
         """Walkable floor the robot has never been near, in m2.
 
@@ -2176,6 +2412,27 @@ class FrontierExplorer:
             return key
         return key + (int(round(cd / qm)), int(round(cx / qm)),
                       int(round(cy / qm)))
+
+    def _ckey(self, crank: int, key: tuple) -> tuple:
+        """Prefix a rank key with the rank of the region its place belongs to.
+
+        This is the whole of the two-level decision, and it is one line because
+        the *only* thing that changes is which question is asked first: with
+        `rfirst` on, two places in different regions are separated by the region
+        order before the point key ever gets a say, so no point-level term can
+        move the goal from one region to another.  That is boss's Gate 4 read
+        forwards -- "a 13 m move may happen, but only as the result of an
+        explicit choice of another region, never smuggled in as a locally better
+        point".
+
+        `rfirst = False` returns the key unchanged, so the standing behaviour is
+        bit-for-bit what it was (a constant prefix would do the same for
+        comparisons, but returning the same object is one less thing to argue
+        about).
+        """
+        if not self.rfirst:
+            return key
+        return (int(crank),) + key
 
     def _pick_sweep_target(self, wmap, reach, x0, y0):
         """A sizeable reachable patch of floor the robot has never been near.
@@ -2453,14 +2710,37 @@ class FrontierExplorer:
                         r["u_eff"] = 0.0        # out of scope: no local opinion
                         self.n_local_scope_blocked += 1
 
-            for r in rows:
+            # --- level one: which region? -----------------------------------
+            #
+            # Everything above this line is unchanged and lives one level down:
+            # it decides *which place inside the candidate set* is best.  What
+            # happens here is the split boss asked for -- group the places of
+            # this decision into spatial regions, order the **regions**, and let
+            # the region order be the first thing the final key compares.  A
+            # point-level term can then no longer move the goal from one region
+            # to another, however large its score gets: it can only reorder
+            # places that are already in the same cluster.
+            #
+            # See the note on `rfirst` in `__init__` for why this is the next
+            # thing to try and not another scoring term, and `_ckey` for the
+            # one-line mechanism.
+            crank = [0] * len(rows)
+            if self.rfirst and len(rows) >= 2:
+                rclusters = self._cluster_rows(rows, self.rfirst_link_m)
+                crank, rinfo = self._region_first_crank(
+                    rows, rclusters, fresh, wmap, cell, sx, sy)
+                self._record_region_purity(rows, rinfo)
+
+            for i, r in enumerate(rows):
+                ci = crank[i]
                 out.append((
-                    self._rank_key(
+                    self._ckey(ci, self._rank_key(
                         r["score_r"] + self.cand_local_lambda * r["u_eff"],
-                        r["d0"], r["ax"], r["ay"], r["px"], r["py"], r["cd"]),
+                        r["d0"], r["ax"], r["ay"], r["px"], r["py"], r["cd"])),
                     r["d0"], r["px"], r["py"], r["ncell"], r["L"],
-                    self._rank_key(r["base"], r["d0"], r["ax"], r["ay"],
-                                   r["px"], r["py"], r["cd"]),
+                    self._ckey(ci, self._rank_key(
+                        r["base"], r["d0"], r["ax"], r["ay"],
+                        r["px"], r["py"], r["cd"])),
                     r["bonus"], r["idle_s"], r["w"], r["base"],
                     r["lu"],
                     # `u_term` is **the term as it entered the score**, i.e. after
@@ -2476,17 +2756,18 @@ class FrontierExplorer:
                     # between the mechanism running and the mechanism mattering.
                     # It carries the region term, exactly as it carries the debt
                     # -- the term under test is the local one here.
-                    self._rank_key(r["score_r"], r["d0"], r["ax"], r["ay"],
-                                   r["px"], r["py"], r["cd"]),
+                    self._ckey(ci, self._rank_key(
+                        r["score_r"], r["d0"], r["ax"], r["ay"],
+                        r["px"], r["py"], r["cd"])),
                     # --- c[14]: the comparator for the *region* term ----------
                     # The key this place would have had with `region_lambda = 0`,
                     # every other term (debt, local) left exactly as it is.  That
                     # is the only way "the mechanism ran" and "the mechanism
                     # mattered" can be told apart for a term that only ever adds
                     # one number to each candidate.
-                    self._rank_key(
+                    self._ckey(ci, self._rank_key(
                         r["score"] + self.cand_local_lambda * r["u_eff"],
-                        r["d0"], r["ax"], r["ay"], r["px"], r["py"], r["cd"]),
+                        r["d0"], r["ax"], r["ay"], r["px"], r["py"], r["cd"])),
                     # --- c[15..21]: the region instrument ---------------------
                     # What Gate A reads (does the time dimension vary across the
                     # candidates, and across how many distinct tiles) and what
@@ -2499,10 +2780,21 @@ class FrontierExplorer:
                     r["r_stage"],     # 18  never / brief / starved / done
                     r["rid"],         # 19  the tile's identity
                     r["r_t"],         # 20  d(score)/d(lambda): the slope
-                    r["score"]))      # 21  the score with no region term
-            # Biggest-and-nearest first, quantised so that two patches a few
-            # percent apart do not change places on a floating-point hiccup.
-            out.sort(key=lambda c: c[0])
+                    r["score"],       # 21  the score with no region term
+                    # --- c[22]: which region this place belongs to -----------
+                    # The rank of its cluster, 0 = the region the region layer
+                    # chose.  This is the only field the two levels add, and it
+                    # is what lets every cross-region move be attributed: a
+                    # point-level swap that changes `c[22]` is impossible by
+                    # construction (`_ckey`), so any move between regions in the
+                    # record is the region layer's doing and nothing else.
+                    ci))              # 22  the region's rank
+            # Region first, then the old key.  With `rfirst` off every `c[22]`
+            # is 0, so this is the same total order the policy had before --
+            # and with it on, the point key is only ever reached inside one
+            # region.  Both are quantised, so two patches a few percent apart
+            # still cannot change places on a floating-point hiccup.
+            out.sort(key=lambda c: (c[22], c[0]))
             self.last_sweep_cands = out
             return out
 
@@ -2607,7 +2899,12 @@ class FrontierExplorer:
             best_local = min(cands, key=lambda c: c[13])
             self._record_local_margin(cands, best_local)
             if self.cand_local_lambda > 0.0:
-                top_used = min(cands, key=lambda c: c[0])
+                # "The term's own first choice" is the head of the **actual**
+                # order, which under `rfirst` already has the region rank in
+                # front (`_ckey`).  Reading it off `c[0]` alone would call the
+                # best place of a lower-ranked region the term's first choice --
+                # and the whole point of the two levels is that it is not.
+                top_used = cands[0]
         # The region term's own comparator and margin.  Unlike the local pair
         # this is skipped at `region_lambda = 0`, because the region table is
         # only maintained while the term is switched on (same rule as the patch
@@ -2620,7 +2917,7 @@ class FrontierExplorer:
         if len(cands) >= 2 and self.region_lambda > 0.0:
             best_region = min(cands, key=lambda c: c[14])
             self._record_region_margin(cands, best_region)
-            top_used_r = min(cands, key=lambda c: c[0])
+            top_used_r = cands[0]
         for c in cands[:self.max_plans_per_pick]:
             tx, ty, ncell, L = float(c[2]), float(c[3]), int(c[4]), c[5]
             path = self.planner.plan(wmap, (x0, y0), (tx, ty))
@@ -2760,6 +3057,24 @@ class FrontierExplorer:
                                                / max(dist, 1e-6), 3)))
                     elif self.region_lambda > 0.0:
                         self.n_region_fallthrough += 1
+                if self.rfirst:
+                    # Gate 4's third leg: which region was taken.  `reg_rank > 0`
+                    # means the top-ranked region had nothing this map could
+                    # route to, so the fall-through crossed a region **for a
+                    # routing reason** -- which is a legitimate move and is
+                    # counted separately, exactly as the local term's
+                    # fall-through is (an unplannable head is not a decision the
+                    # term made).
+                    cr = int(c[-1])
+                    self.n_rfirst_picks += 1
+                    if cr == 0:
+                        self.n_rfirst_top_used += 1
+                    if len(self.rfirst_picks) < 60:
+                        self.rfirst_picks.append(dict(
+                            t=round(float(self._last_stamp or 0.0), 1),
+                            reg_rank=cr, n_reg=self._last_n_regions,
+                            n_cand=len(cands),
+                            to=[round(tx, 2), round(ty, 2)]))
                 return tx, ty, path, ncell, L
             self.n_plan_failures += 1
         return None

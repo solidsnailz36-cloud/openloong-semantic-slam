@@ -84,18 +84,8 @@ def _explore_overrides(items):
     than at the command line, and "the flag silently did nothing" is the failure
     mode this whole flag exists to avoid.
     """
-    import ast
-    out = {}
-    for it in items or ():
-        if "=" not in it:
-            raise SystemExit("--explore-set wants key=value, got %r" % it)
-        k, v = it.split("=", 1)
-        k, v = k.strip(), v.strip()
-        try:
-            out[k] = ast.literal_eval(v)
-        except (ValueError, SyntaxError):
-            out[k] = v
-    return out
+    from r2slam.overrides import parse_kv_overrides
+    return parse_kv_overrides(items)
 
 
 def _resolve_vendor(explicit: str, filename: str) -> str:

@@ -28,11 +28,19 @@ DRY=0
 
 # Everything the container actually executes.  `config/` is included because a
 # config edit (voxel size, a topic name) is just as invisible as a code edit.
+#
+# ⚠️ THIS IS A WHITELIST, SO A **NEW MODULE** HAS TO BE ADDED HERE.
+# A missing entry used to mean the container silently ran the previous build;
+# now that `explore.py` imports `r2slam.overrides`, a missing entry means the
+# container cannot start at all (`ImportError` inside `from .overrides import`).
+# Either way it is invisible from the sim's own output, so add the file in the
+# same commit that creates it.
 PKG_PATHS=(
   "r2slam/detect.py"
   "r2slam/fusion.py"
   "r2slam/labels.py"
   "r2slam/explore.py"
+  "r2slam/overrides.py"
   "r2slam/nav.py"
   "r2slam/worldmap.py"
   "r2slam/traversable.py"
