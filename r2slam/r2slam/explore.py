@@ -111,7 +111,8 @@ class FrontierExplorer:
                  region_period_s: float = 1.0,
                  rfirst: bool = False, rfirst_link_m: float = 3.00,
                  rfirst_radius_m: float = 1.50,
-                 rfirst_score_mode: str = "area"):
+                 rfirst_score_mode: str = "area",
+                 rfirst_gate: bool = False):
         self.v_max = float(v_max)
         self.w_max = float(w_max)
         self.max_target_range = float(max_target_range)
@@ -795,12 +796,52 @@ class FrontierExplorer:
         # two-level order collapse onto the standing global order; it exists as
         # the control that tests the clustering layer itself (case 30).
         self.rfirst_score_mode = str(rfirst_score_mode)
+        # --- the region-level reachability gate ------------------------------
+        #
+        # Boss, 2026-10-06, closing section 28: "the next cut is not another
+        # region score -- it is that **the region score only says which region is
+        # worth going to; reachability says whether it can be gone to right now**.
+        # Only routable regions enter the final competition."  The measurement
+        # that forced it: `fallthrough` = 0.25-0.50, i.e. the region layer's
+        # top-ranked cluster had nothing this map could route to in one decision
+        # out of four to one out of two.  So what section 28 actually tested was
+        # "does an **unroutable** region ranker work", and the answer to that is
+        # not informative about region-first as an idea.
+        #
+        # The gate is not a penalty on unreachable regions.  It **removes them
+        # from the competition**: every region's representative place (its own
+        # best-ranked candidate) is planned once, the ones that cannot be routed
+        # are ranked **after** all the routable ones however good their score is,
+        # and the region order among the survivors is unchanged.  With the gate on,
+        # the head of the region order is routable **by construction** -- which is
+        # what makes `fallthrough -> 0` a checkable property of the code and not a
+        # statistic (Gate 5).
+        #
+        # If nothing is routable the gate is a no-op for that decision and says so
+        # (`n_gate_all_bad`), because "the map has nothing to offer" is not the
+        # gate's decision to make.
+        self.rfirst_gate = as_bool(rfirst_gate)
         self.rfirst_hist: List[dict] = []    # per pick: clusters, spans, scores
         self.rfirst_picks: List[dict] = []   # per pick: which cluster was taken
         self.n_rfirst_picks = 0              # picks where a cluster was chosen
         self.n_rfirst_top_used = 0           # ... and it was the top-ranked one
         self.rfirst_max_span = 0.0           # worst within-cluster span seen
         self._last_n_regions = 0
+        self._last_pick_path = ""            # survey / locked / global / fallback
+        # --- Gate 5: the region layer's authority over the final choice ------
+        self.n_gate_seen = 0            # decisions the gate looked at
+        self.n_gate_all = 0             # region candidates, summed
+        self.n_gate_ok = 0              # ... of which routable
+        self.n_gate_bad = 0             # ... of which not
+        self.n_gate_all_bad = 0         # decisions where nothing was routable
+        self.n_gate_top_rejected = 0    # decisions where the ungated head was unroutable
+        self.gate_hist: List[dict] = []  # per decision, for the report
+        # One decision's plan results, keyed by target.  The gate plans each
+        # region's representative and `_plan_first` then tries the same places
+        # again, so without this the same A* search would run twice for every
+        # accept.  Cleared at the start of every `_pick_sweep_target`, because a
+        # route is only meaningful for one (map, start) pair.
+        self._plan_cache: dict = {}
 
         self.n_sweep_abandoned = 0
         self._sw_best = float("inf")
@@ -1527,7 +1568,12 @@ class FrontierExplorer:
         the robot goes.
         """
         n = len(cands)
-        rec = dict(t=round(self._debt_t, 1), where=where, n=n,
+        # The frame's own stamp, not `_debt_t`: that clock only advances while the
+        # debt is switched on, so with `debt_lambda = 0` every entry here would
+        # read t = 0 and "which rule produced the candidates at time X" would be
+        # unanswerable from the record.  Same mistake the local term's record had
+        # (see `_record_local_margin`).
+        rec = dict(t=round(float(self._last_stamp or 0.0), 1), where=where, n=n,
                    sep_min=float("nan") if n < 2 else 0.0,
                    az_span=float("nan") if n < 2 else 0.0)
         if n >= 2:
@@ -1543,6 +1589,11 @@ class FrontierExplorer:
         self.pick_sizes.append(rec)
         if len(self.pick_sizes) > 600:
             del self.pick_sizes[:300]
+        # Which rule produced the list `_plan_first` is about to walk.  Kept so a
+        # pick can be attributed to the rule that built its candidate set, which
+        # is the difference between "the region layer chose this" and "the survey
+        # filter deleted the region the layer chose".
+        self._last_pick_path = where
 
     def pick_stats(self) -> dict:
         """What every pick had to choose between, and whether it was a real choice.
@@ -1741,6 +1792,27 @@ class FrontierExplorer:
             out.update(n_rfirst_picks=self.n_rfirst_picks,
                        n_rfirst_top=self.n_rfirst_top_used,
                        rfirst_score_mode=self.rfirst_score_mode)
+        # --- Gate 5: does the region layer actually decide? ------------------
+        #
+        # Boss, 2026-10-06: "acceptance is hard -- `fallthrough -> 0`, and the
+        # region finally chosen must come from the routable set.  If the top
+        # region is still routinely unroutable and the pick falls through to the
+        # second, then the gate's definition is still not on the real decision
+        # path, and it does not go to the simulator."
+        #
+        # `fallthrough` is `rf_rank_gt0_frac` (the share of picks whose chosen
+        # region was not the region layer's first).  With the gate on it has to be
+        # 0: the region ranked first is routable by construction, and it is the
+        # very place `_plan_first` tries first.
+        if self.rfirst_gate:
+            seen = max(self.n_gate_seen, 1)
+            out.update(gate_seen=self.n_gate_seen,
+                       gate_reg_med=round(self.n_gate_all / seen, 2),
+                       gate_ok_med=round(self.n_gate_ok / seen, 2),
+                       gate_bad_med=round(self.n_gate_bad / seen, 2),
+                       gate_all_bad_frac=round(self.n_gate_all_bad / seen, 3),
+                       # the rejection rate of the score's own winner
+                       gate_top_rej_frac=round(self.n_gate_top_rejected / seen, 3))
         if self.rfirst_picks:
             rr = np.array([p["reg_rank"] for p in self.rfirst_picks], float)
             out.update(rf_rank_med=float(np.median(rr)),
@@ -2115,7 +2187,8 @@ class FrontierExplorer:
                 clusters.append([i])
         return clusters
 
-    def _region_first_crank(self, rows, clusters, fresh, wmap, cell, sx, sy):
+    def _region_first_crank(self, rows, clusters, fresh, wmap, cell, sx, sy,
+                            x0, y0):
         """Rank the regions, and hand every candidate its region's rank.
 
         The score is **geometric only**: the never-visited floor the region holds
@@ -2167,7 +2240,53 @@ class FrontierExplorer:
                              cx=float(np.mean([p[0] for p in pts])),
                              cy=float(np.mean([p[1] for p in pts]))))
 
-        keyed = [((-int(round(it["score"] / q)), int(round(it["d"] / qm)),
+        # --- Gate 5: only routable regions compete for the top --------------
+        #
+        # Each region is represented by its own best place (the head of its own
+        # point order) and that place is planned exactly once.  A region that
+        # cannot be routed is ranked **after every region that can**, whatever
+        # its score -- boss's "remove the unreachable region from the
+        # competition", not "subtract a little from it".  They are ranked after
+        # rather than dropped, because the standing fallback still has to exist:
+        # if the routable regions turn out to be unusable further down the list,
+        # `_plan_first` needs places to try, and it walks the list in order either
+        # way.
+        #
+        # With the gate on, the head of the region order is routable **by
+        # construction** -- the same place `_plan_first` will try first.  That is
+        # what turns Gate 5's `fallthrough -> 0` into a checkable property of the
+        # code instead of a statistic.
+        if self.rfirst_gate:
+            for it in info:
+                head = min(it["idx"], key=lambda i: self._rank_key(
+                    rows[i]["score_r"], rows[i]["d0"], rows[i]["ax"],
+                    rows[i]["ay"], rows[i]["px"], rows[i]["py"], rows[i]["cd"]))
+                rep = (float(rows[head]["px"]), float(rows[head]["py"]))
+                path = self._plan_cache.get(rep)
+                if path is None:
+                    path = self.planner.plan(wmap, (x0, y0), rep)
+                    self._plan_cache[rep] = path
+                it["routable"] = bool(path)
+                it["rep"] = [round(rep[0], 2), round(rep[1], 2)]
+            # What the gate bought: was the region the *ungated* score would have
+            # put first actually routable?  Same quantity as the previous round's
+            # `fallthrough`, read on the arm that still has the defect.
+            first_ungated = min(info, key=lambda it: (
+                -int(round(it["score"] / q)), int(round(it["d"] / qm)),
+                int(round(it["cx"] / qm)), int(round(it["cy"] / qm))))
+            first_ungated["ungated_head"] = True
+            first_ungated["ungated_head_bad"] = (not first_ungated["routable"])
+        for it in info:
+            it.setdefault("routable", True)
+            it.setdefault("rep", None)
+            it.setdefault("ungated_head", False)
+            it.setdefault("ungated_head_bad", False)
+
+        # Routable first, then by score, then by the same quantised tiebreaks the
+        # point key uses.  With the gate off the leading field is constant, so
+        # this is exactly the order section 28 measured.
+        keyed = [((0 if it["routable"] else 1,
+                   -int(round(it["score"] / q)), int(round(it["d"] / qm)),
                    int(round(it["cx"] / qm)), int(round(it["cy"] / qm))), k)
                  for k, it in enumerate(info)]
         keyed.sort()
@@ -2212,6 +2331,41 @@ class FrontierExplorer:
             d_start=[round(float(it["d"]), 2) for it in info]))
         if len(self.rfirst_hist) > 400:
             del self.rfirst_hist[:200]
+
+        # --- Gate 5: the region layer's authority over the final choice ------
+        #
+        # Boss, 2026-10-06: "this round the important thing is not coverage, it is
+        # verifying that the region layer finally has the authority.  Report
+        # `region_candidates` / `region_reachable` / `region_unreachable` /
+        # `fallthrough` / the rejection rate of the top-ranked region / whether
+        # the region finally chosen is the region-score winner.  Acceptance is
+        # hard: `fallthrough -> 0`, and the chosen region must come from the
+        # routable set."
+        #
+        # `ungated_head_bad` is the one that prices the gate: it is the region the
+        # *score alone* would have put first, and it is `True` exactly when that
+        # region could not be routed -- i.e. the decision section 28's arm would
+        # have handed to the fallback.  Same quantity as that round's
+        # `fallthrough`, read on an arm that still has the defect.
+        if self.rfirst_gate and info:
+            ok = sum(1 for it in info if it["routable"])
+            self.n_gate_seen += 1
+            self.n_gate_all += len(info)
+            self.n_gate_ok += ok
+            self.n_gate_bad += len(info) - ok
+            if ok == 0:
+                # Nothing routable: the gate stands aside for this decision,
+                # because "this map has nothing to offer" is not the gate's call.
+                self.n_gate_all_bad += 1
+            bad_head = any(it.get("ungated_head_bad") for it in info)
+            if bad_head:
+                self.n_gate_top_rejected += 1
+            self.gate_hist.append(dict(
+                t=round(float(self._last_stamp or 0.0), 1), n_reg=len(info),
+                n_ok=ok, n_bad=len(info) - ok,
+                ungated_head_bad=bool(bad_head)))
+            if len(self.gate_hist) > 400:
+                del self.gate_hist[:200]
 
     def _fresh_area(self, wmap, reach, x0, y0) -> float:
         """Walkable floor the robot has never been near, in m2.
@@ -2728,7 +2882,7 @@ class FrontierExplorer:
             if self.rfirst and len(rows) >= 2:
                 rclusters = self._cluster_rows(rows, self.rfirst_link_m)
                 crank, rinfo = self._region_first_crank(
-                    rows, rclusters, fresh, wmap, cell, sx, sy)
+                    rows, rclusters, fresh, wmap, cell, sx, sy, x0, y0)
                 self._record_region_purity(rows, rinfo)
 
             for i, r in enumerate(rows):
@@ -2920,7 +3074,14 @@ class FrontierExplorer:
             top_used_r = cands[0]
         for c in cands[:self.max_plans_per_pick]:
             tx, ty, ncell, L = float(c[2]), float(c[3]), int(c[4]), c[5]
-            path = self.planner.plan(wmap, (x0, y0), (tx, ty))
+            # The region gate has usually planned this exact place already (it is
+            # the head of its region, and the head of the top region is the first
+            # thing tried here), so this is a cache read rather than a second A*.
+            tkey = (tx, ty)
+            path = self._plan_cache.get(tkey)
+            if path is None:
+                path = self.planner.plan(wmap, (x0, y0), tkey)
+                self._plan_cache[tkey] = path
             if path:
                 self.n_plans += 1
                 if best_plain is not None:
@@ -3072,8 +3233,16 @@ class FrontierExplorer:
                     if len(self.rfirst_picks) < 60:
                         self.rfirst_picks.append(dict(
                             t=round(float(self._last_stamp or 0.0), 1),
-                            reg_rank=cr, n_reg=self._last_n_regions,
+                            reg_rank=cr,
+                            # Counted **on this list**, not read off the last
+                            # `gather`.  `_plan_first` runs again after a fallback
+                            # gather with a different candidate set, so a stored
+                            # count can belong to a different decision -- section
+                            # 29 lists a pick with more regions than candidates,
+                            # which is how exactly that was noticed.
+                            n_reg=len({int(c[-1]) for c in cands}),
                             n_cand=len(cands),
+                            path=getattr(self, "_last_pick_path", "?"),
                             to=[round(tx, 2), round(ty, 2)]))
                 return tx, ty, path, ncell, L
             self.n_plan_failures += 1
@@ -3608,6 +3777,13 @@ class FrontierExplorer:
         two real callers pass it, because the debt field measures neglect in
         seconds and cannot guess the frame rate of the dataset it is running on.
         """
+        # A route is only meaningful for one (map, start) pair, so the plan
+        # results of one decision do not outlive the frame.  See `_plan_cache` in
+        # `__init__`: the region reachability gate plans each region's
+        # representative and `_plan_first` then tries the same places again, so
+        # without this cache the same A* search would run twice for every accept.
+        self._plan_cache = {}
+
         # ---- stagnation guard, before anything else --------------------------
         # `ground` is the traversable grid, so its sum is the map's own answer to
         # "how much do I know".  If it has not grown in `stagnate_frames`, there

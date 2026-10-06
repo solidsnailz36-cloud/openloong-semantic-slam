@@ -1982,13 +1982,104 @@ def main():
         fails.append("rfirst written as the text \"False\" still built region "
                      "state: the two spellings do not agree")
 
+    print("32) the region reachability gate: unroutable regions leave the race")
+    # Boss, 2026-10-06: "the next cut is not another region score.  The region
+    # score only says which region is worth going to; reachability says whether
+    # it can be gone to right now.  Only routable regions enter the final
+    # competition."  Measured before this: `fallthrough` = 0.25-0.50, so what was
+    # actually being tested was "does an **unroutable** region ranker work".
+    #
+    # A stub planner that refuses exactly one place is the only way to test the
+    # gate on a fixture where everything really is connected: it lets the case say
+    # "the score's own winner is unroutable" without inventing a world.
+    class _StubPlanner:
+        """Routes everywhere except the places in `bad`."""
+
+        def __init__(self, bad):
+            self.bad = set(bad)
+            self.calls = 0
+
+        def plan(self, wmap, start, goal):
+            self.calls += 1
+            if (float(goal[0]), float(goal[1])) in self.bad:
+                return []
+            return [tuple(start), (float(goal[0]), float(goal[1]))]
+
+    w32 = two_rooms()
+
+    def explore32(gate, bad=None):
+        e = FrontierExplorer(sweep=True, stagnate_frames=10 ** 9,
+                             sweep_cands_per_patch=4,
+                             rfirst=True, rfirst_gate=gate)
+        e._survey_stops = []
+        e._sweep_patch_mask = None
+        e._sweep_patch_stops = 0
+        # The stub is swapped in *after* `_masks`: that call needs the real
+        # planner's `free_space` to build the reachable component, and only the
+        # routing step is being faked here.
+        r, _x = e._masks(w32, (0.0, 0.0))
+        if bad is not None:
+            e.planner = _StubPlanner(bad)
+        p = e._pick_sweep_target(w32, r, 0.0, 0.0)
+        return e, (None if p is None else (round(p[0], 2), round(p[1], 2)))
+
+    # (a) with the gate off the instrument must be silent -- the same rule every
+    # other switch in this file follows.
+    e32off, _p32off = explore32(False)
+    if e32off.pick_stats().get("gate_seen") is not None:
+        fails.append("the Gate 5 instrument reported on an arm with the gate off")
+    # (b) where does the score alone send the robot, and which region is that?
+    cands = list(e32off.last_sweep_cands)
+    tops = [c for c in cands if int(c[-1]) == 0]
+    rest = [c for c in cands if int(c[-1]) > 0]
+    if not tops or not rest:
+        fails.append("the fixture produced %d candidates but not two competing "
+                     "regions: the gate cannot be tested here"
+                     % len(cands))
+    else:
+        head = tops[0]                       # the region winner's own best place
+        bad = {(float(head[2]), float(head[3]))}
+        e32g, p32g = explore32(True, bad)
+        st32 = e32g.pick_stats()
+        print("    score's winner %s is made unroutable -> pick %s | "
+              "regions ok/bad %.2f/%.2f, top rejected %.3f"
+              % ((round(float(head[2]), 2), round(float(head[3]), 2)), p32g,
+                 st32.get("gate_ok_med", 0.0), st32.get("gate_bad_med", 0.0),
+                 st32.get("gate_top_rej_frac", 0.0)))
+        if not st32.get("gate_seen"):
+            fails.append("the gate never ran on an arm that asked for it")
+        if not st32.get("gate_top_rej_frac"):
+            fails.append("the gate did not notice that the score's own winner "
+                         "was unroutable: `top rejected` is 0 while the winner "
+                         "was made unreachable")
+        # the decision moved to a different region
+        if p32g is not None:
+            d_head = float(np.hypot(p32g[0] - float(head[2]),
+                                    p32g[1] - float(head[3])))
+            if d_head <= 3.0:
+                fails.append("the pick stayed %.2f m from the unroutable "
+                             "region's head: the gate did not remove it from the "
+                             "competition" % d_head)
+        # and the region that was taken must be the region layer's first, i.e.
+        # the unroutable one did not merely get a worse score, it lost the race.
+        if e32g.n_rfirst_picks and e32g.n_rfirst_top_used != e32g.n_rfirst_picks:
+            fails.append("the pick fell through to a non-first region even with "
+                         "the gate on (%d of %d took the first)"
+                         % (e32g.n_rfirst_top_used, e32g.n_rfirst_picks))
+        # (c) an arm with nothing routable at all must stand aside rather than
+        # invent a choice: every candidate made unroutable means no pick at all.
+        allpts = {(float(c[2]), float(c[3])) for c in cands}
+        e32n, p32n = explore32(True, allpts)
+        if e32n.n_gate_all_bad == 0:
+            fails.append("an arm where nothing was routable did not report it")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (31 checks)")
+    print("verdict: PASS (32 checks)")
     return 0
 
 

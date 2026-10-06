@@ -253,6 +253,43 @@ def main():
           "不是区域层的决定）")
     print()
 
+    # ---- E. Gate 5: does the region layer have authority? -------------------
+    #
+    # Boss, 2026-10-06: "acceptance is hard -- fallthrough -> 0, and the region
+    # finally chosen must come from the routable set.  If the top region is still
+    # routinely unroutable and the pick falls through to the second, then the
+    # gate's definition is still not on the real decision path, and it does not go
+    # to the simulator."
+    #
+    # `top rejected` is the price of the gate: the share of decisions where the
+    # region the *score alone* would have put first was unroutable.  On an arm
+    # without the gate that share is exactly its `fallthrough`; with the gate on
+    # it should still be non-zero (the map does not change) while `fallthrough`
+    # goes to zero -- that gap is the gate working.
+    print("===== E. Gate 5: region-level reachability =====")
+    print("  %-10s %8s %9s %9s %9s %12s %11s"
+          % ("arm", "decisions", "reg med", "ok med", "bad med", "top rejected",
+             "all-bad"))
+    for name in a.arms:
+        d = stats.get(name) or {}
+        rf = d.get("rfirst", {})
+        if not rf.get("gate"):
+            print("  %-10s %8s %9s %9s %9s %12s %11s"
+                  % (name, "-", "-", "-", "-", "-", "-"))
+            continue
+        seen = max(int(rf.get("gate_seen", 0)), 1)
+        print("  %-10s %8s %9s %9s %9s %12s %11s"
+              % (name, rf.get("gate_seen"), "%.2f" % (rf.get("gate_all", 0) / seen),
+                 "%.2f" % (rf.get("gate_ok", 0) / seen),
+                 "%.2f" % (rf.get("gate_bad", 0) / seen),
+                 "%.3f" % (rf.get("gate_top_rejected", 0) / seen),
+                 "%.3f" % (rf.get("gate_all_bad", 0) / seen)))
+    print("  （`top rejected` = 「只按分数排出来的第一名**不可达**」的比例 —— "
+          "它就是上一轮 `fallthrough` 的同名量，只是读在仍然有这个缺陷的臂上。"
+          "戴上 gate 之后：`top rejected` 应该仍然非零（地图没变），"
+          "而 `fallthrough` 必须变 0 —— 这个差就是 gate 起了作用）")
+    print()
+
     # ---- the segments themselves, so a long move cannot hide in a median ---
     for name in a.arms:
         if name not in rows or name == base_name:

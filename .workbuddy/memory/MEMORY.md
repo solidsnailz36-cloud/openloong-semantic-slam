@@ -3,8 +3,8 @@
 > 只放**跨会话必须记住的决策与坑**。数字与推导在文档里。
 
 ## 索引
-- **★★ `docs/交接_20261004_复赛感知精修.md` ＝当前进度交接，新会话第一份读它**（§18 是本轮）。
-- **★ `docs/探索算法_v2_设计与参考.md` ＝探索/规划的全部现状与判据**（§17 起逐轮；**§28 是本轮**；
+- **★★ `docs/交接_20261004_复赛感知精修.md` ＝当前进度交接，新会话第一份读它**（§19 是本轮）。
+- **★ `docs/探索算法_v2_设计与参考.md` ＝探索/规划的全部现状与判据**（§17 起逐轮；**§29 是本轮**；
   §24 开头有一条**撤回指针**）。
 - 技能：`robot-policy-replay-ab`（**新会话先看它**）、`camera-lidar-person-fusion`、
   `gazebo-classic-headless-container`、`remote-job-and-snapshot`、`lidar-map-forensics`（85 KB 待整理）、
@@ -131,6 +131,25 @@
      本该当对照的臂**开着新功能跑完整场**，无报错无警告。根因是**三个参数入口类型推断不一致**；
      已统一到 **`r2slam/overrides.py`** + 5 个布尔构造参数走 `as_bool`（case 31 钉住）。
      **硬规则：任何 A/B 先看对照臂与基准的产物 md5 是否一致**（`out/_region_gate.py` 第 0 段）。
+12. **★★ 第二十三轮（§29）：region 可达性门 —— 假设被自己的实验证伪，真凶是 `survey` 过滤器。**
+   * 做的：区域层用**簇内头名**作代表先规划，**不可达的 region 排到所有可达 region 之后**
+     （剔除出竞争，不是扣分）；全不可达时退让。加**每帧清空的 `_plan_cache`**。
+     `rfirst_gate` 默认 False，关闭时与 §28 bit-for-bit 相同。
+   * **Gate 5 三采集一致**：`region_candidates` 5.88–7.35、**`region_unreachable = 0.00`**、
+     **`top rejected = 0.000`**、`gate_hist` 的 `n_bad` 取值集合 = **`{0}`** ⇒
+     **簇代表点在这套地图上永远可达**。**R0 与 R1 的逐帧产物 md5 三采集全相同** ⇒ gate 是 no-op。
+     **判死**：不再以"区域不可达"为理由重开（将来换成有真死区的地图可再挂上试，case 32 在）。
+   * **★★ 真凶（本轮真正的产出）**：`rfirst_picks` 加 `path` 后查到 —— 成功 pick **17/17 全在
+     `survey` 路径**，`fallthrough` **6/6 也在 survey**。机制是**控制流顺序**：
+     `gather(全候选)` 算 rank 并排序 → **`new_c` 按候选点过滤（离 survey_stop ≤2 m 删掉）**
+     → `_plan_first` 走 `new_c`，**rank 没重算** ⇒ 头名已被改写。
+     极端形态：一次 `n_cand=5` 而**头名 rank=4**。
+     ⇒ §28 的结论修正为：**不是"排第一的区域不可达"，而是"区域排序的输入被下游过滤改写了"**。
+   * **下一步（待 boss 拍）**：**把 `survey` 过滤挪到区域排序之前**（在最终候选集上算 rank）。
+     不改候选生成规则（`fresh`/`patch_points`/`sweep_cands_per_patch`/`sweep_stop_spread_m` 全不动），
+     只改"先过滤还是先排序"。备选：在 `new_c` 上重算一次 rank。
+   * 仪器：`_note_pick_size` 的时间戳从 `_debt_t`（只在 debt 开启时走 ⇒ 关掉时恒 0）改成
+     **本帧 stamp** —— **同一类坑第三次出现**，代码里已写明原因。
 
 ## ★★ 指标：比率型必须先查分母
 - **`out/_room_cover.py` / `_local_ab.py` 的逐房间覆盖率分母用的是「末帧地图里可达的格子」**，

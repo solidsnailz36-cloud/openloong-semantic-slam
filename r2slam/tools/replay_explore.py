@@ -597,7 +597,22 @@ def main():
                                                         "rfirst_max_span", 0.0),
                                        picks=getattr(exr, "n_rfirst_picks", 0),
                                        top_used=getattr(exr,
-                                                        "n_rfirst_top_used", 0)),
+                                                        "n_rfirst_top_used", 0),
+                                       # Gate 5: the region reachability gate's
+                                       # own counts -- how many regions were on
+                                       # the table, how many of them routable,
+                                       # and how often the score's own winner had
+                                       # to be rejected for being unroutable.
+                                       gate=getattr(exr, "rfirst_gate", False),
+                                       gate_seen=getattr(exr, "n_gate_seen", 0),
+                                       gate_all=getattr(exr, "n_gate_all", 0),
+                                       gate_ok=getattr(exr, "n_gate_ok", 0),
+                                       gate_bad=getattr(exr, "n_gate_bad", 0),
+                                       gate_all_bad=getattr(exr,
+                                                            "n_gate_all_bad", 0),
+                                       gate_top_rejected=getattr(
+                                           exr, "n_gate_top_rejected", 0)),
+                                   gate_hist=getattr(exr, "gate_hist", []),
                                    region_margin=getattr(exr, "region_hist", []),
                                    region_switches=getattr(exr,
                                                            "region_switches", []),
