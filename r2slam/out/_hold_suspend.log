@@ -1,0 +1,83 @@
+thread caps : cv2=1  kiss_icp=1  onnxruntime=2
+map hold    : suspend (0 cells differ from default? verify with md5)
+detector    : v8 (yolo26n.onnx)
+explorer    : sweep+shadow
+  debt      : lambda=0.00  grace=20 s  cap=120 s
+  map 58s    : out/_hold_suspend_058.npz  (front 1464, inside 891, facing_out 317)
+  map 62s    : out/_hold_suspend_062.npz  (front 1323, inside 748, facing_out 320)
+  map 66s    : out/_hold_suspend_066.npz  (front 1232, inside 667, facing_out 310)
+  map 69s    : out/_hold_suspend_069.npz  (front 1226, inside 51, facing_out 0)
+frames       : 498
+  n_picks                63
+  n_reused               435
+  n_arrivals             5
+  n_backoffs             10
+  n_sweep_abandoned      5
+  n_first_pass_stops     3
+  n_deep_stops           4
+  n_shadow_probes        3
+  n_shadow_far           128
+  n_shadow_skipped       0
+  n_viewpoint_stops      0
+  n_second_approach      0
+  n_straight             161
+  n_routed               303
+  n_arc_frames           128
+  n_patch_locks          3
+  n_patch_releases       1
+  n_los_shortened        34
+  n_frozen_frames        0
+  n_wedge_frames         0
+  n_goal_blocked_frames  242
+  n_goal_abandons        5
+  goal_blocked_frames    30
+  n_debt_updates         0
+  n_debt_blocks          0
+  max_debt_idle_s        0.0
+  n_debt_picks           0
+  n_debt_swaps           0
+  last_debt_idle_s       0.0
+  last_debt_f            0.0
+  n_local_picks          0
+  n_local_swaps          0
+  n_local_swaps_bad      0
+  last_local_u_pick      0.0
+  last_local_term_pick   0.0
+  n_region_picks         0
+  n_region_swaps         0
+  n_region_swaps_bad     0
+  n_region_fallthrough   0
+  n_region_live          0
+  n_region_starved       0
+  max_region_idle_s      0.0
+  n_plans                68
+  n_plan_failures        0
+  n_blacklisted          716
+  n_empty_pick           43
+  n_relax_seen           0
+  n_relax_saved          0
+  n_relax_failed         0
+  n_frontier_relaxed     0
+  pick_empty             43（前 8 条）:
+     t= 129.3  frontier=   49 in_range=   49 big=  49 far=   5 after_fu=   5 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+     t= 129.5  frontier=   50 in_range=   50 big=  49 far=   6 after_fu=   6 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+     t= 129.7  frontier=   50 in_range=   50 big=  49 far=   6 after_fu=   6 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+     t= 129.9  frontier=   50 in_range=   50 big=  49 far=   7 after_fu=   7 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+     t= 130.1  frontier=   50 in_range=   50 big=  49 far=   7 after_fu=   7 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+     t= 130.3  frontier=   49 in_range=   49 big=  49 far=   7 after_fu=   7 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+     t= 130.5  frontier=   49 in_range=   49 big=  49 far=   9 after_fu=   9 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+     t= 130.7  frontier=   49 in_range=   49 big=  49 far=  12 after_fu=  12 after_bl=   0 after_den=   0 (bl_places=3 denied=5)
+  n_picks_seen           61
+  cand_med               0.0
+  cand_max               1
+  cand_1                 61
+  cand_2_3               0
+  cand_4p                0
+  p_ge2                  0.0
+  p_ge3                  0.0
+  by_path                {'global': '52 picks, 0 with >=2, 0 with >=4', 'lock-failed': '1 picks, 0 with >=2, 0 with >=4', 'locked': '5 picks, 0 with >=2, 0 with >=4', 'survey': '3 picks, 0 with >=2, 0 with >=4'}
+  frames with v==0         0 (0.0%)
+  frames with v==0 and w==0 0 (0.0%)
+  poses written: out/_poses_suspend.csv
+  probe series : out/_holdprobe.csv  (19920 rows = 498 frames x 40 cells)
+  written      : out/_hold_suspend.csv

@@ -1,0 +1,74 @@
+thread caps : cv2=1  kiss_icp=1  onnxruntime=2
+map min pts : 2 (1 = today; only the map memory changes, obstacle_now is set earlier)
+detector    : v8 (yolo26n.onnx)
+explorer    : sweep+shadow
+  debt      : lambda=0.00  grace=20 s  cap=120 s
+  map 58s    : out/_hold_k2_058.npz  (front 1493, inside 924, facing_out 316)
+  map 62s    : out/_hold_k2_062.npz  (front 1348, inside 779, facing_out 321)
+  map 66s    : out/_hold_k2_066.npz  (front 1263, inside 702, facing_out 314)
+  map 69s    : out/_hold_k2_069.npz  (front 1258, inside 697, facing_out 314)
+frames       : 498
+  n_picks                20
+  n_reused               478
+  n_arrivals             6
+  n_backoffs             4
+  n_sweep_abandoned      2
+  n_first_pass_stops     2
+  n_deep_stops           1
+  n_shadow_probes        3
+  n_shadow_far           44
+  n_shadow_skipped       0
+  n_viewpoint_stops      1
+  n_second_approach      1
+  n_straight             201
+  n_routed               297
+  n_arc_frames           165
+  n_patch_locks          2
+  n_patch_releases       0
+  n_los_shortened        69
+  n_frozen_frames        0
+  n_wedge_frames         0
+  n_goal_blocked_frames  163
+  n_goal_abandons        2
+  goal_blocked_frames    30
+  n_debt_updates         0
+  n_debt_blocks          0
+  max_debt_idle_s        0.0
+  n_debt_picks           0
+  n_debt_swaps           0
+  last_debt_idle_s       0.0
+  last_debt_f            0.0
+  n_local_picks          0
+  n_local_swaps          0
+  n_local_swaps_bad      0
+  last_local_u_pick      0.0
+  last_local_term_pick   0.0
+  n_region_picks         0
+  n_region_swaps         0
+  n_region_swaps_bad     0
+  n_region_fallthrough   0
+  n_region_live          0
+  n_region_starved       0
+  max_region_idle_s      0.0
+  n_plans                43
+  n_plan_failures        0
+  n_blacklisted          17
+  n_empty_pick           0
+  n_relax_seen           0
+  n_relax_saved          0
+  n_relax_failed         0
+  n_frontier_relaxed     0
+  n_picks_seen           19
+  cand_med               0.0
+  cand_max               1
+  cand_1                 19
+  cand_2_3               0
+  cand_4p                0
+  p_ge2                  0.0
+  p_ge3                  0.0
+  by_path                {'global': '12 picks, 0 with >=2, 0 with >=4', 'lock-failed': '2 picks, 0 with >=2, 0 with >=4', 'locked': '3 picks, 0 with >=2, 0 with >=4', 'survey': '2 picks, 0 with >=2, 0 with >=4'}
+  frames with v==0         0 (0.0%)
+  frames with v==0 and w==0 0 (0.0%)
+  poses written: out/_poses_k2.csv
+  probe series : out/_holdprobe_k2.csv  (19920 rows = 498 frames x 40 cells)
+  written      : out/_hold_k2.csv

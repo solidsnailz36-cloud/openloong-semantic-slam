@@ -4,10 +4,10 @@
 > 这份文件要保持**短**：写不进来的细节属于 `docs/`。
 
 ## 索引
-- **★★ `docs/交接_20261004_复赛感知精修.md` ＝当前进度交接，新会话第一份读它**（§32 是本轮）。
+- **★★ `docs/交接_20261004_复赛感知精修.md` ＝当前进度交接，新会话第一份读它**（§33 是本轮）。
 - **★ `docs/探索算法_成熟方案对标.md` ＝与 FUEL/NBV/ASE/ROS2 的**源码级**对照（设计文档 §37；
   **新会话若在讨论架构，先读它**）。
-- **★ `docs/探索算法_v2_设计与参考.md` ＝探索/规划的全部现状与判据**（**§42 是本轮**；§24 有撤回指针）。
+- **★ `docs/探索算法_v2_设计与参考.md` ＝探索/规划的全部现状与判据**（**§43 是本轮**；§24 有撤回指针）。
 - 技能：`robot-policy-replay-ab`（**新会话先看它**）、`camera-lidar-person-fusion`、
   `gazebo-classic-headless-container`、`remote-job-and-snapshot`、`lidar-map-forensics`（待整理）、
   `competition-submission-final-audit`。
@@ -123,6 +123,25 @@
     （§42）：格心是 `ix*res-ext+res/2`，**落在半整数上**，用 `round` 的 banker's rounding
     会把一半的格送偏一格。第一次消融 `obstacle` 差异 **0 格**、`inside` 一分没动，
     **没有任何报错** —— 是靠"消融必须改变点什么"这个守恒式发现的。
+25. **★★ boss 的字面修法「障碍证据不清零 `_ground_after`」判死**（§43，五臂 A/B，同采集同轨迹）：
+    - **`total`（永不清零）**：门开了（`inside` 51→656），但**释放 16.56 m² 障碍，其中 90%
+      属 ≥50 格大结构、452 格带 100+ 票（最高 291）** ⇒ **把真墙一起放掉**。
+    - **`suspend` / `suspend_vote`（同帧 both 才不清零/不计票）完全无效**，因为
+      **判据方向反了**：**门内格的同帧 both = 0，真墙格反而 228–258** ⇒
+      "同帧 both"识别的是**墙根泄漏**，不是悬空结构。
+    - 全部默认关闭；`reset` 与 `--map-min-points 1` 的逐帧 CSV 与基线 **md5 逐位相同**。
+26. **★★★ 换个"量"常常就是分离器：真结构是点云簇，擦边是单点**（§43）：
+    ```
+    门内 194 次回波   p25 1  中位 1  p75 1   单点占 91.8%   h 中位 1.95–1.99（贴 OBSTACLE_HI=2.00）
+    真墙 1842 次回波  p25 6  中位 12 p75 26  单点占  5.2%   h 0.43→1.55 的立面
+    ```
+    **根因改写**：不是"0.35 m 的门楣"，是**紧贴 `OBSTACLE_HI` 下沿的稀疏单点回波**；
+    而 **`OBSTACLE_MIN_VOTES=2` 数的是「帧数」** ⇒ **两个"每帧一个点"的帧 = 两帧真墙的证据**。
+    **`--map-min-points 2` 分离度：滤掉门内 91.8%、保留真墙 94.8%**（K=3 是 100%/91.9%）。
+    **通关**：门保持通行（`inside` 697）｜**24/24 真墙格仍被阻断**｜`votes≥100` 只释放 9 格
+    （0.09 m²）｜**新增障碍 0 格**｜`reach` 外接框与基线**完全相同**｜`exterior` 不变（无穿墙）
+    ｜**`obstacle_now`（安全层）不受影响**（在过滤之前就设好）。
+    ⚠️ **是候选不是批准**（仅 1 采集 1 跑次，且释放了 24% 的障碍层）。
 
 **已判死（附重开条件）**
 - **候选级局部效用 `local_u` 整族**（§23–25）：默认 λ=0。它要买的"门前还剩多少"是 0.5–2 m²，
@@ -171,7 +190,7 @@
 `out/_vantage_ab.py`（`V` 的两种折算形式 A/B，**只读**，需先有 `--dump-cells` 的 `cells_*.npz`）；
 `out/_fallback_probe.py`（**只读量 Gate 的触发率与触发时状态**，`frames.csv` + `summary.json`）；
 `out/_rf1r3_fork.py`（**跑次间时间对齐 + 到达事件提取**，判"候选层 vs 规划/感知"）。
-**本轮新增**：`out/_door_series.py`（门格逐帧时序）、`out/_door_width.py`（腐蚀后真实门宽）、`out/_door_ablate.py`（逐格消融）；replay 新增 `--probe-cells` / `--probe-points` / `--ablate-cells`。
+**本轮新增**：`out/_door_series.py`（门格逐帧时序）、`out/_door_width.py`（腐蚀后真实门宽）、`out/_door_ablate.py`（逐格消融）；replay 新增 `--probe-cells` / `--probe-points` / `--ablate-cells` / `--map-hold` / `--map-min-points`；`out/_hold_ab.py`（五臂对比）。
 
 ## 硬规则（工程）
 - **会话开头先补 PATH**：`export PATH="/c/Users/ZhuanZ/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:$PATH"`。

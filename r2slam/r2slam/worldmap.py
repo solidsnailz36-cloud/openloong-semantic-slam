@@ -277,6 +277,83 @@ OBSTACLE_OPEN_PX = 3
 # isolated 13.5 m2.  A guard that undoes an earlier fix is not a guard.
 OBSTACLE_STRONG_VOTES = 20
 
+# ... and what an obstacle return does to the *floor* counter for that same cell.
+#
+# `_ground_after` counts "frames that showed floor since the last obstacle
+# evidence" -- `add()` resets it to zero whenever an obstacle return lands in the
+# cell.  That is right when the obstacle is a *thing standing on the floor*: the
+# floor evidence is older news than the thing.  It is wrong when the return comes
+# from something *hanging above* floor that the same frame can also see -- a door
+# lintel, a table top, a shelf.  Both project onto one 2D cell, and the reset
+# then throws away the floor evidence that this very frame produced, so the cell
+# can never accumulate enough `_ground_after` to satisfy the release rule while
+# `_obs_votes` keeps climbing.  That is a ratchet.
+#
+# Measured on `cap_rf1r3` (2026-10-07): the doorway at y = +1.35 carries 10 cells
+# whose obstacle returns are 61% in the [0.35, 0.50) band -- i.e. sitting right
+# on `OBSTACLE_LO` -- and whose `votes` climb monotonically from 0 to 105 over
+# the run; at t = 67 s five of them flip to obstacle together and those 5 cells
+# (0.05 m2) cut the robot's reachable set from 143.3 to 12.9 m2.
+#
+# Modes (`--map-hold` in the replay, `map_hold` in the pipeline):
+#   "reset"    what shipped: an obstacle return zeroes the floor counter.
+#   "total"    an obstacle return leaves it alone, so the release test
+#              (`_ground_after >= ratio * _obs_votes`) compares *total* floor
+#              frames against total obstacle votes.
+#   "suspend"  leave it alone only when the same frame also put floor returns in
+#              that same cell -- the return cannot be a thing standing on the
+#              floor, because the floor underneath it is visible.  Narrowest
+#              reading of "hanging structure".
+#   "suspend_vote"
+#              same test, but applied to the **vote** instead: a frame that saw
+#              floor *and* something above it in one cell does not count as
+#              obstacle evidence for that cell at all.
+#
+# Measured on `cap_rf1r3` (498 frames, 2026-10-07) -- the A/B that made this a
+# switch rather than a fix:
+#
+#   mode           reach末   blocked末   obstacle释放   释放格中 votes>=100 的
+#   reset(现状)     12.81     26.05         --                 --
+#   total          166.72     10.59      16.56 m2       452 格 (4.52 m2)
+#   suspend         12.83     23.25        ~0            0
+#
+# `total` opens the door **and releases 90% of the cells it frees from
+# structures of 50+ cells** -- i.e. it takes real walls with it.  `suspend` does
+# nothing at all: the doorway's returns are *alternating* (a frame with an
+# obstacle return, then a frame with floor), so "both in the same frame" almost
+# never holds.  Both are quoted here so the next person does not re-run them.
+#
+# **The default is "reset"**: this is a hypothesis under test, not a fix.  The
+# A/B has to show it opens the doorway *and* leaves real walls blocking before it
+# can ship -- a wall leaks a few floor returns at its base (see the ratio note
+# above), so "total" in particular could release real structure.
+OBSTACLE_HOLD = "reset"
+OBSTACLE_MIN_POINTS = 1
+
+# ... and how many returns in one cell in one frame are needed for that frame to
+# count as obstacle evidence at all.
+#
+# `OBSTACLE_MIN_VOTES` counts **frames**, and that is the gap the rf1r3 doorway
+# fell through: a structure puts a *cloud* in a cell (measured on the doorway's
+# jamb walls: median 12 returns per frame, p25 6, p75 26), while a grazing or
+# edge-on return puts **one point** there (measured on the same run's in-door
+# cells: 194 returns over 498 frames, **91.8% of them a single point**, median 1).
+# Two single-point frames therefore read as "two frames saw something here" --
+# the same evidence as two frames of a wall.
+#
+# Measured separation on `cap_rf1r3` (`out/_doorprobe.pts.csv`, the 16 doorway
+# cells vs the 6 jamb-wall cells, 2036 obstacle returns):
+#
+#     K    in-door returns kept   jamb-wall returns kept
+#     1          100.0%                 100.0%          <- today
+#     2            8.2%                  94.8%
+#     3            0.0%                  91.9%
+#
+# **The safety layer does not depend on this**: `obstacle_now` -- this frame's
+# raw returns, which `_ahead_clear` reads -- is set before this filter, so the
+# robot still stops for a wall it is looking at right now.  Only the *memory*
+# changes.  Default 1 = today's behaviour.
+
 
 
 def trajectory_runs(inside: np.ndarray) -> List[np.ndarray]:
@@ -519,21 +596,53 @@ class WorldMap:
                 self.seen[cyo[sm], cxo[sm]] = True
             self.ground_ever[cyo, cxo] |= g[ok]
             self.obstacle_now[cyo, cxo] |= o[ok]
-            # One count per cell per frame for the release counter too.  Order
-            # matters: floor first, then obstacle resets it, so a frame that
-            # shows both in the same cell (a person standing *on* the floor)
-            # counts as obstacle and does not creep towards release.
+            # One count per cell per frame for the release counter too.  Floor
+            # counts first and obstacle evidence comes second, so a cell that
+            # shows both in one frame (a person standing *on* the floor) is
+            # decided by `OBSTACLE_HOLD` -- see its note: "reset" counts it as
+            # obstacle and the cell does not creep towards release, while
+            # "suspend" keeps the floor evidence because the floor under the
+            # return is visible in that very frame.
             if g[ok].any():
                 kg = cyo[g[ok]].astype(np.int64) * self.n + cxo[g[ok]]
-                for u in np.unique(kg):
+                g_keys = np.unique(kg)
+                for u in g_keys:
                     self._ground_after[int(u) // self.n, int(u) % self.n] += 1
+            else:
+                g_keys = None
             if o[ok].any():
                 # one vote per cell per frame: a single scan puts many returns in
                 # one 0.1 m cell and they are one observation, not many
                 key = cyo[o[ok]].astype(np.int64) * self.n + cxo[o[ok]]
-                for u in np.unique(key):
-                    self._obs_votes[int(u) // self.n, int(u) % self.n] += 1
-                    self._ground_after[int(u) // self.n, int(u) % self.n] = 0
+                o_keys, o_cnt = np.unique(key, return_counts=True)
+                if OBSTACLE_MIN_POINTS > 1:
+                    # A structure puts a cloud in the cell; a grazing return puts
+                    # one point.  See `OBSTACLE_MIN_POINTS`.
+                    keep = o_cnt >= OBSTACLE_MIN_POINTS
+                    o_keys = o_keys[keep]
+                # Cells where **this frame** put both floor and obstacle returns.
+                # Those cannot be "a thing standing on the floor" -- the floor
+                # under the thing is visible -- so `"suspend"` keeps their floor
+                # counter.  See `OBSTACLE_HOLD`.
+                both = set()
+                if (OBSTACLE_HOLD in ("suspend", "suspend_vote")
+                        and g_keys is not None):
+                    both = set(np.intersect1d(o_keys, g_keys,
+                                              assume_unique=True).tolist())
+                for u in o_keys:
+                    uu = int(u)
+                    if OBSTACLE_HOLD == "suspend_vote" and uu in both:
+                        # The frame saw floor *and* something above it in this
+                        # cell.  Whatever that something is, it is not standing
+                        # on the cell's floor -- so this frame is not evidence
+                        # that the cell is blocked.  Unlike "suspend" this
+                        # attacks the *vote*, not the floor counter, and it is
+                        # the vote that the ratchet feeds on.
+                        continue
+                    self._obs_votes[uu // self.n, uu % self.n] += 1
+                    if OBSTACLE_HOLD == "total" or uu in both:
+                        continue
+                    self._ground_after[uu // self.n, uu % self.n] = 0
         # `votes` is monotone, so promoting it to the map layer every frame
         # converges to the same place as deciding it once at the end.
         np.greater_equal(self._obs_votes, OBSTACLE_MIN_VOTES, out=self.obstacle)

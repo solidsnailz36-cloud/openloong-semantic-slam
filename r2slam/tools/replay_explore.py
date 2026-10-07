@@ -57,6 +57,7 @@ from r2slam.odometry import apply_thread_limits, make_odometry, register  # noqa
 from r2slam.traversable import (fit_ground, ground_tolerance,      # noqa: E402
                                 OBSTACLE_LO, OBSTACLE_HI)          # noqa: E402
 from r2slam.worldmap import WorldMap                               # noqa: E402
+from r2slam import worldmap as _wm_mod                             # noqa: E402
 
 from online_pipeline import _resolve_vendor, frames_from_npz       # noqa: E402
 
@@ -201,6 +202,27 @@ def main():
                          "so the run itself is unchanged; only the dumped "
                          "classification differs.  Sanity check: without this "
                          "flag the same dump reproduces exactly.")
+    ap.add_argument("--map-hold", default=None,
+                    choices=["reset", "total", "suspend", "suspend_vote"],
+                    help="what an obstacle return does to the floor counter of "
+                         "the same cell (`worldmap.OBSTACLE_HOLD`).  `reset` is "
+                         "what ships; `total` never zeroes it; `suspend` zeroes "
+                         "it only when the same frame did NOT also put floor "
+                         "returns in that cell.  Exists because a return from "
+                         "something hanging above floor projects onto the same "
+                         "2D cell as the floor underneath it, and the reset then "
+                         "discards floor evidence the frame just produced -- a "
+                         "ratchet that sealed the rf1r3 doorway (section 42).")
+    ap.add_argument("--map-min-points", type=int, default=None,
+                    help="minimum returns in one cell in one frame for that "
+                         "frame to count as obstacle evidence "
+                         "(`worldmap.OBSTACLE_MIN_POINTS`).  1 is today: it "
+                         "counts frames, so two single-point frames equal two "
+                         "frames of a wall -- which is how the rf1r3 doorway got "
+                         "sealed.  The jamb walls put a median of 12 returns per "
+                         "frame in a cell and the in-door cells 1, so K=2 drops "
+                         "91.8%% of the false evidence and keeps 94.8%% of the "
+                         "real.  `obstacle_now` (the safety layer) is unaffected.")
     ap.add_argument("--dump-cands", default=None,
                     help="also write the ranked sweep candidate table per frame "
                          "(one row per candidate).  Read it from an arm whose "
@@ -250,6 +272,19 @@ def main():
                                 if cfg.lidar.nominal_hz else None))
     wmap = WorldMap(resolution=rt.map_resolution, extent=rt.map_extent,
                     voxel=rt.pcd_voxel)
+    if a.map_min_points is not None:
+        _wm_mod.OBSTACLE_MIN_POINTS = int(a.map_min_points)
+        print("map min pts : %d (1 = today; only the map memory changes, "
+              "obstacle_now is set earlier)" % int(a.map_min_points))
+    if a.map_hold:
+        # Set the **module** attribute, not an instance one: `WorldMap.add`
+        # reads `OBSTACLE_HOLD` as a module global, so an instance attribute
+        # would be silently ignored -- and "silently ignored" is the failure
+        # this harness exists to catch (`--arms "F0:rfirst=False"` parsed
+        # `"False"` as a truthy string and ran a whole arm with the feature on).
+        _wm_mod.OBSTACLE_HOLD = a.map_hold
+        print("map hold    : %s (0 cells differ from default? verify with md5)"
+              % a.map_hold)
     registry = ObjectRegistry()
 
     det = None
