@@ -1,0 +1,38 @@
+====================================================================================================
+== 真值几何 /root/.gazebo/models/house.world  (38 项)
+====================================================================================================
+   box         19 项   (模型 cardboard_box, house, person_walking)
+   cylinder     2 项   (模型 cocacola, saucepan)
+   mesh        17 项   (模型 arm_chair, aws_robomaker_residential_ShoeRack_01_0, aws_robomaker_residential_TVCabinet_01, aws_robomaker_residential_Trash_01, aws_robomaker_residential_Trash_01_0, aws_robomaker_residential_Trash_01_1)
+   排除: ['youbot']
+   origin(world->map): x=0.000 y=0.000
+
+====================================================================================================
+== 对齐自检（600x600, res 0.10, extent 30.0）
+====================================================================================================
+   真值 z∈[0.35,2.00) 占用   2161 格 (21.6 m²) | 地图 obstacle   3320 (33.2 m²)
+   真值格 -> 最近地图 obstacle：p50 0.10  p90 0.74  p99 1.62  (<=0.20 m 70.8%)
+   精细拟合: (-1, -2) 格 = (-0.10, -0.20) m   -> 距离中位 0.000 m  p90 0.72 m  (<=0.20 m 77.2%)
+      arm_chair                                          80 格 (0.80 m²)
+      aws_robomaker_residential_ShoeRack_01_0             0 格 (0.00 m²)
+      aws_robomaker_residential_TVCabinet_01            182 格 (1.82 m²)
+      aws_robomaker_residential_Trash_01                  0 格 (0.00 m²)
+      aws_robomaker_residential_Trash_01_0                0 格 (0.00 m²)
+      aws_robomaker_residential_Trash_01_1                0 格 (0.00 m²)
+      cardboard_box                                       0 格 (0.00 m²)
+      citizen_extras_female_02                           22 格 (0.22 m²)
+      citizen_extras_male_03                             23 格 (0.23 m²)
+      cocacola                                            0 格 (0.00 m²)
+      house                                            1364 格 (13.64 m²)
+      ikea_folke_chair                                   30 格 (0.30 m²)
+      ikea_folke_chair_0                                 30 格 (0.30 m²)
+      ikea_stefan_chair                                  30 格 (0.30 m²)
+      ikea_stefan_chair_clone                            30 格 (0.30 m²)
+      ikea_stefan_chair_clone_0                          27 格 (0.27 m²)
+      ikea_stefan_chair_clone_1                          28 格 (0.28 m²)
+      ikea_stefan_chair_clone_2                          27 格 (0.27 m²)
+      kitchen_table                                     144 格 (1.44 m²)
+      person_walking                                      0 格 (0.00 m²)
+      saucepan                                            0 格 (0.00 m²)
+      sofa                                              144 格 (1.44 m²)
+   -> /work/k2/truth_rf0r2.npz

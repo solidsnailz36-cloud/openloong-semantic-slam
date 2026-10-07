@@ -1,0 +1,18 @@
+[B_rf0r3] exit=0 rows=1087
+[A_rf0r3] exit=0 rows=1087
+[A_rf0r2] exit=0 rows=1344
+[B_rf0r2] exit=0 rows=1344
+[A_rf0r1] exit=0 rows=1390
+[B_rf0r1] exit=0 rows=1390
+[A_rf0r4] exit=0 rows=1342
+[B_rf0r4] exit=0 rows=1342
+[A_rf1r2] exit=0 rows=1234
+[B_rf1r2] exit=0 rows=1234
+[B_rf1r1] exit=0 rows=1305
+[A_rf1r1] exit=0 rows=1305
+[B_rf1r3] exit=0 rows=499
+[A_rf1r3] exit=0 rows=499
+[B_rf1r4] exit=0 rows=997
+[A_rf1r4] exit=0 rows=997
+=== done ===
+maps: 16 / 16
