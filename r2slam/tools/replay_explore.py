@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 
@@ -167,6 +168,39 @@ def main():
                          "t=58.8 and t=67.2 while `blocked` grew by only "
                          "0.8 m2, so the end-frame map alone cannot show what "
                          "closed the door.")
+    ap.add_argument("--probe-cells", default=None, metavar="FILE",
+                    help="a JSON list of `[x, y]` world coordinates: record the "
+                         "layer state of exactly those cells on **every frame** "
+                         "into a long-form CSV.  A snapshot pair can prove *that* "
+                         "a door shut; only a per-frame series can say whether "
+                         "those cells were flip-flopping (a temporal-stability "
+                         "problem) or latched on once and never came back (a "
+                         "persistence problem) -- and those two have opposite "
+                         "fixes.  Columns: ground, obstacle, obstacle_now "
+                         "(this frame's raw returns), obs_votes (monotone), "
+                         "ground_after (reset by any obstacle return), on_path.")
+    ap.add_argument("--probe-points", default=None, metavar="FILE",
+                    help="the same JSON cell list as --probe-cells, but record "
+                         "**the returns themselves**: per frame, per cell, how "
+                         "many points landed in it and, of those, how many the "
+                         "frame classified as obstacle along with their height "
+                         "band `h` (metres above the fitted ground) and their "
+                         "range from the sensor.  This is the last link of the "
+                         "chain the door investigation needs: `votes` grow only "
+                         "from obstacle returns, so the question \"why did this "
+                         "cell flip\" ends at \"what did the sensor actually "
+                         "report here, from how far away\".  Columns: n, n_obs, "
+                         "n_ground, h_obs_lo, h_obs_hi, h_obs_med, rng_med.")
+    ap.add_argument("--ablate-cells", default=None, metavar="FILE",
+                    help="a JSON list of `[x, y]`: before every saved map, drop "
+                         "exactly those cells from the `obstacle` layer (and "
+                         "re-derive `ground` from `ground_ever`) so the dumped "
+                         "`reach` answers \"would the door have stayed open if "
+                         "these cells were not obstacles?\".  The ablation is "
+                         "**temporary** -- it is undone before the next frame, "
+                         "so the run itself is unchanged; only the dumped "
+                         "classification differs.  Sanity check: without this "
+                         "flag the same dump reproduces exactly.")
     ap.add_argument("--dump-cands", default=None,
                     help="also write the ranked sweep candidate table per frame "
                          "(one row per candidate).  Read it from an arm whose "
@@ -276,28 +310,69 @@ def main():
         map_at = sorted(float(v) for v in secs.split(",") if v.strip())
     t_first = [None]
 
-    def save_map(path, explorer, wmap, t, tag=""):
+    ablate = None
+    if a.ablate_cells:
+        with open(a.ablate_cells, encoding="utf-8") as fh:
+            _cl = [(float(x), float(y)) for x, y in json.load(fh)]
+        _ai = np.floor((np.array([c[0] for c in _cl]) + wmap.extent)
+                       / wmap.resolution).astype(int)
+        _aj = np.floor((np.array([c[1] for c in _cl]) + wmap.extent)
+                       / wmap.resolution).astype(int)
+        ablate = (_ai, _aj)
+
+    probe_ix = probe_iy = None
+    probe_rows = []
+    pt_rows = []
+    pt_cells = None
+    if a.probe_cells or a.probe_points:
+        src = a.probe_cells or a.probe_points
+        with open(src, encoding="utf-8") as fh:
+            _pl = [(float(x), float(y)) for x, y in json.load(fh)]
+        probe_ix = np.floor((np.array([c[0] for c in _pl]) + wmap.extent)
+                            / wmap.resolution).astype(int)
+        probe_iy = np.floor((np.array([c[1] for c in _pl]) + wmap.extent)
+                            / wmap.resolution).astype(int)
+        if a.probe_points:
+            pt_cells = np.stack([probe_iy, probe_ix], axis=1)
+
+    def save_map(path, explorer, wmap, t, tag="", ablate=None):
         # Ask the **explorer's own** functions, not a reimplementation: the
         # question is about the policy's classification, so a second
         # implementation would answer for a different classifier.
         # `_obs_votes` comes along because the interesting failure is a door
         # closing on a handful of obstacle votes -- `obstacle` alone is boolean
         # and cannot say how close to the threshold the threshold was.
-        free, unknown = explorer._free_unknown(wmap)
-        reach, exterior = explorer._masks(wmap, (float(t[0]), float(t[1])))
-        inside, facing_out, front = explorer._usable_frontier(
-            wmap, free, unknown, reach, exterior)
-        z = np.zeros_like(front)
-        np.savez(path, ground=wmap.ground, obstacle=wmap.obstacle,
-                 obstacle_votes=getattr(wmap, "_obs_votes", z),
-                 seen=wmap.seen, ground_ever=wmap.ground_ever,
-                 free=free, unknown=unknown, reach=reach, exterior=exterior,
-                 front=front,
-                 inside=(z if inside is None else inside),
-                 facing_out=(z if facing_out is None else facing_out),
-                 pose=np.array([float(t[0]), float(t[1])]),
-                 resolution=np.float64(wmap.resolution),
-                 extent=np.float64(wmap.extent))
+        #
+        # `ablate` (see `--ablate-cells`) drops the listed cells from `obstacle`
+        # for **this classification only**, then puts them back.  It exists
+        # because "61 cells appeared between t=66 and t=69" and "those 61 cells
+        # are what shut the door" are two different claims, and only the second
+        # one justifies touching the map layer; the counterfactual is the test.
+        undo = None
+        if ablate is not None and len(ablate[0]):
+            undo = (wmap.obstacle.copy(), wmap.ground.copy())
+            wmap.obstacle[ablate[1], ablate[0]] = False
+            np.logical_and(wmap.ground_ever, ~wmap.obstacle, out=wmap.ground)
+        try:
+            free, unknown = explorer._free_unknown(wmap)
+            reach, exterior = explorer._masks(wmap, (float(t[0]), float(t[1])))
+            inside, facing_out, front = explorer._usable_frontier(
+                wmap, free, unknown, reach, exterior)
+            z = np.zeros_like(front)
+            np.savez(path, ground=wmap.ground, obstacle=wmap.obstacle,
+                     obstacle_votes=getattr(wmap, "_obs_votes", z),
+                     seen=wmap.seen, ground_ever=wmap.ground_ever,
+                     free=free, unknown=unknown, reach=reach,
+                     exterior=exterior, front=front,
+                     inside=(z if inside is None else inside),
+                     facing_out=(z if facing_out is None else facing_out),
+                     pose=np.array([float(t[0]), float(t[1])]),
+                     resolution=np.float64(wmap.resolution),
+                     extent=np.float64(wmap.extent))
+        finally:
+            if undo is not None:
+                np.copyto(wmap.obstacle, undo[0])
+                np.copyto(wmap.ground, undo[1])
         print("  map %-6s : %s  (front %d, inside %d, facing_out %d)"
               % (tag, path, int(front.sum()),
                  int(z.sum() if inside is None else inside.sum()),
@@ -355,6 +430,35 @@ def main():
             if p["label"] == L.PERSON:
                 persons_world.append((pw[0], pw[1]))
         informative = (h <= OBSTACLE_HI) & (h >= -0.60)
+
+        if pt_cells is not None:
+            # The last link of the chain: `votes` grow only from obstacle
+            # returns, so "why did this cell flip" ends at "what did the sensor
+            # report here, and from how far".  Cell indices use the same
+            # convention as `WorldMap.cell_of` -- `floor`, never a truncating
+            # cast, or a coordinate just outside the map on the negative side
+            # snaps onto cell 0.
+            _fin = (np.isfinite(world_pts[:, 0]) & np.isfinite(world_pts[:, 1])
+                    & np.isfinite(h))
+            _px = np.floor((world_pts[:, 0] + wmap.extent)
+                           / wmap.resolution).astype(np.int64)
+            _py = np.floor((world_pts[:, 1] + wmap.extent)
+                           / wmap.resolution).astype(np.int64)
+            for _ci in range(len(pt_cells)):
+                _cy, _cx = int(pt_cells[_ci, 0]), int(pt_cells[_ci, 1])
+                m = _fin & (_px == _cx) & (_py == _cy)
+                if not m.any():
+                    continue
+                mo = m & obstacle_mask
+                mg = m & ground_mask
+                pt_rows.append((
+                    n, repr(float(fr.stamp)), _ci, int(m.sum()),
+                    int(mo.sum()), int(mg.sum()),
+                    repr(round(float(h[mo].min()), 3)) if mo.any() else "",
+                    repr(round(float(h[mo].max()), 3)) if mo.any() else "",
+                    repr(round(float(np.median(h[mo])), 3)) if mo.any() else "",
+                    repr(round(float(np.median(rng_xy[m])), 2))))
+
         wmap.add(world_pts, ground_mask, obstacle_mask, obj_mask,
                  pose_xy=(t[0], t[1]), stamp=float(fr.stamp),
                  persons_xy=persons_world, obj_labels=obj_label,
@@ -376,13 +480,25 @@ def main():
                                          stamp=float(fr.stamp))
             results.append((name, exr, _v, _w, _e))
 
+        if probe_ix is not None:
+            for _k in range(len(probe_ix)):
+                _i, _j = int(probe_ix[_k]), int(probe_iy[_k])
+                probe_rows.append((
+                    n, repr(float(fr.stamp)), _k,
+                    repr(float(t[0])), repr(float(t[1])),
+                    int(wmap.ground[_j, _i]), int(wmap.obstacle[_j, _i]),
+                    int(wmap.obstacle_now[_j, _i]),
+                    int(wmap._obs_votes[_j, _i]),
+                    int(wmap._ground_after[_j, _i]),
+                    int(wmap._on_path[_j, _i]), int(wmap.seen[_j, _i])))
+
         if t_first[0] is None:
             t_first[0] = float(fr.stamp)
         if map_at:
             while map_at and (float(fr.stamp) - t_first[0]) >= map_at[0]:
                 Tt = map_at.pop(0)
                 save_map("%s_%03d.npz" % (map_at_prefix, int(round(Tt))),
-                         explorer, wmap, t, "%gs" % Tt)
+                         explorer, wmap, t, "%gs" % Tt, ablate=ablate)
 
         if a.poses:
             # `reach` is the size of the component the planner can actually
@@ -725,8 +841,33 @@ def main():
                 wr.writerow([repr(v) for v in row])
         print("  poses written: %s" % a.poses)
 
+    if a.probe_cells:
+        # Long form: one row per (frame, cell).  The question is about a *time
+        # series per cell*, so a wide table would be 61 columns of mostly
+        # repeated values, and the analysis wants to group by cell anyway.
+        probe_csv = os.path.splitext(a.probe_cells)[0] + ".csv"
+        with open(probe_csv, "w", encoding="utf-8", newline="") as fh:
+            wr = csv.writer(fh)
+            wr.writerow(["frame", "stamp", "cell", "rx", "ry", "ground",
+                         "obstacle", "obstacle_now", "obs_votes",
+                         "ground_after", "on_path", "seen"])
+            for row in probe_rows:
+                wr.writerow(row)
+        print("  probe series : %s  (%d rows = %d frames x %d cells)"
+              % (probe_csv, len(probe_rows), n, len(probe_ix)))
+
+    if a.probe_points:
+        pt_csv = os.path.splitext(a.probe_points)[0] + ".pts.csv"
+        with open(pt_csv, "w", encoding="utf-8", newline="") as fh:
+            wr = csv.writer(fh)
+            wr.writerow(["frame", "stamp", "cell", "n", "n_obs", "n_ground",
+                         "h_obs_lo", "h_obs_hi", "h_obs_med", "rng_med"])
+            for row in pt_rows:
+                wr.writerow(row)
+        print("  probe points : %s  (%d rows)" % (pt_csv, len(pt_rows)))
+
     if a.dump_map:
-        save_map(a.dump_map, arms[0][1], wmap, t, "final")
+        save_map(a.dump_map, arms[0][1], wmap, t, "final", ablate=ablate)
 
     if a.dump_patches:
         with open(a.dump_patches, "w", encoding="utf-8", newline="") as fh:
@@ -905,7 +1046,14 @@ def main():
                          float(st.get("region_max_idle_s", 0.0))))
 
         if a.out:
-            import json
+            # `json` is imported at module level.  It used to be imported *here*
+            # as well, which is not a style problem: a function-local `import`
+            # makes the name local **for the whole function**, so the earlier
+            # `json.load` calls for `--ablate-cells` / `--probe-cells` raised
+            # `UnboundLocalError: cannot access local variable 'json' where it
+            # is not associated with a value`.  Same family as the `L` /
+            # `labels as L` collision: in this file a name used at module scope
+            # cannot be re-bound locally, however far apart the two lines are.
             for name, exr in arms:
                 if not hasattr(exr, "pick_stats"):
                     continue
