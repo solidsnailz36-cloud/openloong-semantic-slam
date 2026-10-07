@@ -598,10 +598,42 @@ def main():
               "n_region_picks", "n_region_swaps", "n_region_swaps_bad",
               "n_region_fallthrough", "n_region_live", "n_region_starved",
               "max_region_idle_s",
-              "n_plans", "n_plan_failures", "n_blacklisted"):
+              "n_plans", "n_plan_failures", "n_blacklisted",
+              "n_empty_pick", "n_relax_seen", "n_relax_saved",
+              "n_relax_failed", "n_frontier_relaxed"):
         v = getattr(explorer, k, None)
         if v is not None:
             print("  %-22s %s" % (k, v))
+    # The relax ladder's own log: which rung answered, and what each rung was
+    # offered.  A ladder that "worked" without this cannot be told apart from a
+    # ladder that never ran.
+    _rh = getattr(explorer, "relax_hist", []) or []
+    if _rh:
+        print("  %-22s %d（前 %d 条）:" % ("relax_hist", len(_rh),
+                                          min(6, len(_rh))))
+        for row in _rh[:6]:
+            print("     t=%6.1f  answered_at=%d  rungs=%s  (bl_places=%d "
+                  "denied=%d)"
+                  % (row["t"], row["lvl"],
+                     ", ".join("L%d:%d%s" % (r["level"], r["n_cand"],
+                                             "" if not r["got"] else "*")
+                               for r in row["rungs"]),
+                     row["bl_places"], row["denied"]))
+    # **Which filter emptied the frontier pool.**  Printed separately from the
+    # counters above because it is a list, not a number, and because "the picker
+    # had nothing" is the trigger the fallback design rests on -- cf. the frame
+    # with 1207 frontier cells that still yielded zero candidates.
+    _pe = getattr(explorer, "pick_empty", []) or []
+    if _pe:
+        print("  %-22s %d（前 %d 条）:"
+              % ("pick_empty", len(_pe), min(8, len(_pe))))
+        for row in _pe[:8]:
+            print("     t=%6.1f  frontier=%5d in_range=%5d big=%4d far=%4d "
+                  "after_fu=%4d after_bl=%4d after_den=%4d (bl_places=%d "
+                  "denied=%d)"
+                  % (row["t"], row["n_front"], row["n_in_range"], row["n_big"],
+                     row["n_far"], row["n_fu"], row["n_bl"], row["n_den"],
+                     row["bl_places"], row["denied"]))
     for k, v in (explorer.pick_stats() if hasattr(explorer, "pick_stats")
                  else {}).items():
         print("  %-22s %s" % (k, v))
@@ -811,6 +843,26 @@ def main():
                     json.dump(dict(arm=name,
                                    overrides=a.arms or a.set,
                                    stats=exr.pick_stats(),
+                                   # The fallback's counters and its own
+                                   # ladder log.  `fb_relax = 0` has to leave
+                                   # every one of these at zero -- that is half
+                                   # the no-op check; the md5 of the per-frame
+                                   # record is the other half.
+                                   fallback=dict(
+                                       relax=getattr(exr, "fb_relax", 0),
+                                       seen=getattr(exr, "n_relax_seen", 0),
+                                       saved=getattr(exr, "n_relax_saved", 0),
+                                       failed=getattr(exr, "n_relax_failed", 0),
+                                       frontier_relaxed=getattr(
+                                           exr, "n_frontier_relaxed", 0),
+                                       empty_pick=getattr(exr, "n_empty_pick", 0),
+                                       search_turns=getattr(exr,
+                                                            "n_search_turns", 0),
+                                       search_frames=getattr(exr,
+                                                             "n_search_frames", 0),
+                                       arrivals=getattr(exr, "n_arrivals", 0),
+                                       hist=getattr(exr, "relax_hist", []),
+                                       pick_empty=getattr(exr, "pick_empty", [])),
                                    switches=getattr(exr, "debt_switches", []),
                                    # Gate 1 / Gate 2 for the candidate-level term,
                                    # per pick: the u spread and the lambda each

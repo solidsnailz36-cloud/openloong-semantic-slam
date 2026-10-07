@@ -1,0 +1,204 @@
+{
+ "map_gate": {
+  "20/0.1": {
+   "runs": 7,
+   "frames": 604,
+   "frac_frames": 0.06572361262241568,
+   "frac_secs": 0.06556457781540329,
+   "longest_s": 62.014999999999986,
+   "spans_to_end": 2
+  },
+  "20/0.5": {
+   "runs": 8,
+   "frames": 1003,
+   "frac_frames": 0.10914036996735582,
+   "frac_secs": 0.10879484324768686,
+   "longest_s": 62.014999999999986,
+   "spans_to_end": 5
+  },
+  "30/0.1": {
+   "runs": 3,
+   "frames": 312,
+   "frac_frames": 0.03394994559303591,
+   "frac_secs": 0.03386949692810652,
+   "longest_s": 52.012,
+   "spans_to_end": 1
+  },
+  "30/0.5": {
+   "runs": 6,
+   "frames": 433,
+   "frac_frames": 0.04711643090315561,
+   "frac_secs": 0.04693504789540591,
+   "longest_s": 52.00999999999999,
+   "spans_to_end": 3
+  },
+  "45/0.5": {
+   "runs": 1,
+   "frames": 186,
+   "frac_frames": 0.020239390642002177,
+   "frac_secs": 0.020257347637078302,
+   "longest_s": 37.008999999999986,
+   "spans_to_end": 0
+  },
+  "45/1": {
+   "runs": 3,
+   "frames": 296,
+   "frac_frames": 0.03220892274211099,
+   "frac_secs": 0.0321262620350988,
+   "longest_s": 38.008999999999986,
+   "spans_to_end": 1
+  },
+  "60/1": {
+   "runs": 2,
+   "frames": 128,
+   "frac_frames": 0.013928182807399348,
+   "frac_secs": 0.01393880167572674,
+   "longest_s": 23.00400000000002,
+   "spans_to_end": 0
+  }
+ },
+ "move_gate": {
+  "10/0.25": {
+   "runs": 7,
+   "frames": 306,
+   "frac_frames": 0.03481624758220503,
+   "frac_secs": 0.033322354183736656,
+   "longest_s": 4.000999999999976
+  },
+  "10/0.5": {
+   "runs": 8,
+   "frames": 820,
+   "frac_frames": 0.09329844123335988,
+   "frac_secs": 0.08929968450823847,
+   "longest_s": 49.78299999999996
+  },
+  "20/0.5": {
+   "runs": 7,
+   "frames": 361,
+   "frac_frames": 0.04302741358760429,
+   "frac_secs": 0.0392124411004918,
+   "longest_s": 13.605000000000018
+  },
+  "20/1": {
+   "runs": 8,
+   "frames": 741,
+   "frac_frames": 0.08831942789034565,
+   "frac_secs": 0.08046918170855528,
+   "longest_s": 61.78500000000001
+  },
+  "30/1": {
+   "runs": 6,
+   "frames": 424,
+   "frac_frames": 0.05306633291614518,
+   "frac_secs": 0.04605254203607876,
+   "longest_s": 30.211000000000013
+  },
+  "30/2": {
+   "runs": 8,
+   "frames": 864,
+   "frac_frames": 0.1081351689612015,
+   "frac_secs": 0.09376121166257899,
+   "longest_s": 61.18300000000001
+  }
+ },
+ "inside": {
+  "Gate② W=30 eps=0.5": {
+   "n": 433,
+   "state": {
+    "drive": 312,
+    "turn": 23,
+    "arc": 28,
+    "backoff": 50,
+    "search": 20
+   },
+   "kind": {
+    "sweep": 364,
+    "shadow": 19,
+    "": 50
+   },
+   "cmd_v_med": 0.55,
+   "cmd_w_med": 0.248
+  },
+  "Gate② W=45 eps=0.5": {
+   "n": 186,
+   "state": {
+    "drive": 155,
+    "arc": 17,
+    "turn": 14
+   },
+   "kind": {
+    "sweep": 186
+   },
+   "cmd_v_med": 0.55,
+   "cmd_w_med": 0.238
+  },
+  "Gate③ W=20 X=1.0": {
+   "n": 741,
+   "state": {
+    "drive": 278,
+    "turn": 41,
+    "arc": 81,
+    "backoff": 332,
+    "search": 9
+   },
+   "kind": {
+    "sweep": 651,
+    "shadow": 51,
+    "island": 12,
+    "": 27
+   },
+   "cmd_v_med": 0.0,
+   "cmd_w_med": 0.495
+  },
+  "Gate③ W=30 X=2.0": {
+   "n": 864,
+   "state": {
+    "drive": 395,
+    "backoff": 315,
+    "arc": 89,
+    "turn": 56,
+    "search": 9
+   },
+   "kind": {
+    "sweep": 752,
+    "shadow": 75,
+    "frontier": 15,
+    "": 22
+   },
+   "cmd_v_med": 0.22,
+   "cmd_w_med": 0.495
+  }
+ },
+ "counters": {
+  "search_turns": 67,
+  "search_frames": 67,
+  "sweep_abandoned": 8,
+  "barren_targets": 8,
+  "island_probes": 60,
+  "shadow_probes": 37,
+  "shadow_far": 417,
+  "patch_locks": 89,
+  "patch_releases": 11,
+  "plan_failures": 43,
+  "plans": 1113,
+  "arrivals": 103,
+  "target_switches": 112,
+  "targets_picked": 243,
+  "sweep_targets": 72,
+  "backoffs": 102,
+  "wedge_frames": 384,
+  "blocked_frames": 1151,
+  "goal_abandons": 8,
+  "denied_goals": 8,
+  "frozen_frames": 0,
+  "los_shortened": 999,
+  "viewpoints": 0,
+  "viewpoint_stops": 0,
+  "second_approach": 0,
+  "standoff_rejected": 11
+ },
+ "n_guard_done": [
+  1,
+  8
+ ]
+}

@@ -67,6 +67,7 @@ class FrontierExplorer:
                  target_standoff_m: float = 0.80,
                  stagnate_frames: int = 300, stagnate_eps: float = 0.5,
                  barren_targets: int = 8, barren_blacklist_m: float = 0.60,
+                 fb_relax: int = 0,
                  robot_radius: float = 0.19, replan_every: int = 12,
                  arc_scale: float = 0.40, arc_max_deg: float = 90.0,
                  arc_probe_deg: float = 40.0,
@@ -631,6 +632,13 @@ class FrontierExplorer:
         self.debt_margin: List[dict] = []     # per pick: the lambda it needed
         self.pick_sizes: List[dict] = []      # per pick: how many candidates
         self.last_sweep_cands: list = []      # the ranked list, for probes
+        # Calls to `_pick_target` that returned **zero** candidates, with the
+        # balance of every filter that could have emptied the pool.  Separate
+        # from `n_search_turns` because "the frontier picker had nothing" and
+        # "the whole decision found nothing" are different statements, and the
+        # fallback's trigger is the first one.
+        self.n_empty_pick = 0
+        self.pick_empty: List[dict] = []
 
         # --- region-level starvation: the same idea one layer above ----------
         #
@@ -939,6 +947,25 @@ class FrontierExplorer:
         # corner next frame.
         self.barren_blacklist_m = float(barren_blacklist_m)
         self._barren_spots: List[Tuple[float, float]] = []
+        # ---- fallback: relax the filters instead of giving up --------------
+        #
+        # Measured reason it exists (docs §39): on `rf1r3` the frontier picker
+        # returned **zero** candidates while 49 frontier cells sat on the map --
+        # `after_fu = 4` then `after_bl = 0`, i.e. the last four were all inside
+        # the radius of three `_barren_spots`.  The blacklist only grows and
+        # never expires, so once it happens to cover the last candidate the
+        # decision has nothing left, and the run turns on the spot until
+        # `max_search` and ends at 99 s with 186 m2 of floor mapped.
+        #
+        # `fb_relax = 0` disables it and **zero has to stay a byte-exact
+        # no-op** -- the project's own rule, and §29 is why: a control arm that
+        # silently was not a control cost a whole round.
+        self.fb_relax = int(fb_relax)
+        self.n_relax_seen = 0        # decisions that reached the relax ladder
+        self.n_relax_saved = 0       # ... and got a target back
+        self.n_relax_failed = 0      # ... and did not, at any level
+        self.n_frontier_relaxed = 0  # frontier targets that came from the ladder
+        self.relax_hist: List[dict] = []
         self.n_blacklisted = 0
         self._area_at_target = None
         self._last_area = None
@@ -3628,12 +3655,15 @@ class FrontierExplorer:
                % self.n_sectors)
 
         big = [i for i in in_range if fsize[i] >= self.min_frontier_cells]
+        n_big = len(big)
         pool = big if big else list(in_range)   # map nearly done: take what is left
         far = [i for i in pool if dist[i] >= self.min_target_range]
+        n_far = len(far)
         if far:                                 # a trip shorter than this is not
             pool = far                          # worth the turn it costs
         if frontier_used is not None:
             pool = [i for i in pool if frontier_used[ys[i], xs[i]]]
+        n_fu = len(pool)
         # Drop anything near a place we already went to and learned nothing from
         # (`barren_blacklist_m`).  Done last, so the counters above still say how
         # much was on offer before the blacklist bit.
@@ -3648,12 +3678,30 @@ class FrontierExplorer:
                     continue
                 keep.append(i)
             pool = keep
+        n_bl = len(pool)
         # ... and anything the wedge rule has written off: a frontier the robot
         # physically could not get to is not a frontier, whatever the grid says.
         if self._denied and pool:
             pool = [i for i in pool if not self._is_denied(float(wx[i]),
                                                            float(wy[i]))]
+        n_den = len(pool)
         if not pool:
+            # **Which filter emptied the pool.**  "No candidates" is the trigger
+            # the fallback design (§39) is built on, and "the pool was empty" is
+            # not the same statement as "there was nothing to explore" -- the
+            # frame that motivated this counter had 1207 frontier cells on the
+            # map and still returned zero candidates (rf1r3, t=86.4 s).  Reading
+            # the balances is the difference between adding a fallback and
+            # widening the right filter.
+            self.n_empty_pick += 1
+            if len(self.pick_empty) < 120:
+                self.pick_empty.append(dict(
+                    t=round(float(self._last_stamp or 0.0), 1),
+                    n_front=int(np.size(ys)), n_in_range=int(len(in_range)),
+                    n_big=n_big, n_far=n_far, n_fu=n_fu, n_bl=n_bl,
+                    n_den=n_den, bl_places=len(self._barren_spots),
+                    denied=(len(self._denied) if self._denied else 0),
+                    n_band=int(self.n_blacklisted)))
             return None, None, 0
 
         # No debt bonus here either -- see the note in `_pick_shadow_target`.
@@ -3698,6 +3746,99 @@ class FrontierExplorer:
                 return i, path, len(cand)
         return None, None, len(cand)
 
+    # ---- fallback: a ladder over the filters that can empty the pool --------
+    #
+    # The ladder is ordered by **how strong the filter's claim is**, weakest
+    # first -- not by which one happened to empty the pool in the case that
+    # motivated it.  That first version had it backwards and the measurement
+    # said so: it lifted the blacklist first, the robot was sent back to the
+    # same fruitless cell seven times out of eight, and `bl_places` climbed
+    # 3 -> 11 (docs §39).  Reaching for the weakest claim first is also what the
+    # balances in the motivating frame support:
+    #
+    #   frontier=49  in_range=49  big=49  far=4  after_fu=4  after_bl=0
+    #
+    # i.e. **45 candidates** were being dropped by `min_target_range` and only
+    # 4 by the blacklist.  The vetoes were not what was starving this decision.
+    #
+    #   level 1  `min_target_range`  -- not a veto at all, a preference ("a trip
+    #            shorter than this is not worth the turn").  Dropping it costs
+    #            efficiency and nothing else.
+    #   level 2  `_denied`           -- the wedge rule's write-offs: a heuristic
+    #            about geometry, recorded when a goal could not be reached.
+    #   level 3  `_barren_spots`     -- the strongest claim ("I went there and
+    #            learned nothing"), and the only one with real evidence behind
+    #            it.  Lifted last, and only when everything cheaper has failed.
+    #
+    # The ladder is **per decision and instantly reversible**: nothing is
+    # permanently switched off, no strategy is swapped out, and the normal
+    # filters are back in force on the very next frame.  That is deliberate --
+    # boss's constraint was that a fallback must fire only on evidence of
+    # failure and must not become "the advanced policy is on holiday".
+    def _relax_snapshot(self):
+        return (list(self._barren_spots), self._denied, self.min_target_range)
+
+    def _relax_apply(self, level, snap):
+        """Restore `snap`, then lift the rules up to `level`.  `level = 0` just
+        restores, which is what makes the ladder reversible in one call."""
+        self._barren_spots, self._denied, self.min_target_range = snap
+        self._barren_spots = list(self._barren_spots)
+        if level >= 1:
+            self.min_target_range = 0.0
+        if level >= 2:
+            self._denied = None
+        if level >= 3:
+            self._barren_spots = []
+
+    def _frontier_resolve(self, wmap, x0, y0, pick, wx, wy):
+        """`pick` -> the place to actually drive to, and record why.
+
+        Factored out of `command` so the relax ladder can take the *same* route
+        through the viewpoint rule as the ordinary path -- two copies of this
+        would drift, and the standoff has already bitten once (see the two-stage
+        arrival note in `command`).
+        """
+        i = pick
+        sel = np.hypot(wx - wx[i], wy - wy[i]) <= 1.0
+        anchor = (float(wx[sel].mean()), float(wy[sel].mean()))
+        self._target_anchor = anchor
+        gx, gy, moved = self._viewpoint(wmap, x0, y0, anchor[0], anchor[1])
+        if moved:
+            self.n_viewpoints += 1
+        elif (self.target_standoff_m > 0
+              and float(np.hypot(anchor[0] - x0, anchor[1] - y0))
+              > self.target_standoff_m + wmap.resolution):
+            self.n_standoff_rejected += 1
+        self._target_standoff = bool(moved)
+        return (gx, gy)
+
+    def _relax_retry(self, wmap, x0, y0, yaw, wx, wy, dist, fsize, in_range,
+                     xs, ys, front, frontier_used, sw_none):
+        """One ladder pass.  Returns `(target_res, route, n_cand)` or None.
+
+        Only `_pick_target` is re-asked, and that is not an arbitrary choice:
+        `_pick_sweep_target` **commits to a patch as a side effect** (see the
+        ordering note in `command`), so calling it a second time would advance
+        the patch bookkeeping for a sweep that is then discarded -- the bug that
+        cost two rooms on the v13 A/B.  The frontier picker has no such side
+        effect.
+        """
+        rungs = []
+        snap = self._relax_snapshot()
+        try:
+            for level in range(1, self.fb_relax + 1):
+                self._relax_apply(level, snap)
+                pick, route, n_cand = self._pick_target(
+                    wmap, x0, y0, yaw, (x0, y0), wx, wy, dist, fsize,
+                    in_range, xs, ys, front, frontier_used)
+                rungs.append(dict(level=level, n_cand=int(n_cand),
+                                  got=pick is not None))
+                if pick is not None:
+                    return (self._frontier_resolve(wmap, x0, y0, pick, wx, wy),
+                            route, n_cand, level, rungs)
+        finally:
+            self._relax_apply(0, snap)
+        return None, None, 0, 0, rungs
 
     def _viewpoint(self, wmap, x0, y0, tx, ty):
         """A walkable point `target_standoff_m` short of `(tx, ty)`, or the
@@ -4251,25 +4392,12 @@ class FrontierExplorer:
                     in_range, xs, ys, front, frontier_used)
                 target_res = None
                 if pick is not None:
-                    i = pick
-                    # stabilise on the centroid of the chosen cluster
-                    sel = np.hypot(wx - wx[i], wy - wy[i]) <= 1.0
-                    anchor = (float(wx[sel].mean()), float(wy[sel].mean()))
                     # The frontier is what we mean to *look at*; the viewpoint is
-                    # where we mean to *stand*.  Keep both: the anchor is what
-                    # `_target_still_frontier` is asked about, the viewpoint is
-                    # what the base drives to.  See `target_standoff_m`.
-                    self._target_anchor = anchor
-                    gx, gy, moved = self._viewpoint(wmap, x0, y0,
-                                                    anchor[0], anchor[1])
-                    if moved:
-                        self.n_viewpoints += 1
-                    elif (self.target_standoff_m > 0
-                          and float(np.hypot(anchor[0] - x0, anchor[1] - y0))
-                          > self.target_standoff_m + wmap.resolution):
-                        self.n_standoff_rejected += 1
-                    self._target_standoff = bool(moved)
-                    target_res = (gx, gy)
+                    # where we mean to *stand*.  `_frontier_resolve` keeps both,
+                    # and owns the standoff counters -- factored out so the relax
+                    # ladder below runs the identical route.
+                    target_res = self._frontier_resolve(wmap, x0, y0, pick,
+                                                        wx, wy)
             if target_res is None and self._linked is not None:
                 # Last resort before giving up / searching: go and look at a
                 # doorway we never resolved.
@@ -4290,6 +4418,40 @@ class FrontierExplorer:
                     self._target_kind = "island"
                     self.n_island_probes += 1
                     n_cand = sw[3]
+            if target_res is None and self.fb_relax > 0:
+                # ---- the relax ladder: last question before `search` --------
+                #
+                # Deliberately *after* the island last-resort above and *before*
+                # the turn-on-the-spot branch: it is the cheapest thing left to
+                # try, it adds no new kind of candidate, and it is the only step
+                # here that is fully reversible within the frame.  See
+                # `_relax_retry` for why it re-asks only the frontier picker.
+                self.n_relax_seen += 1
+                t_res, r_route, n_c, lvl, rungs = self._relax_retry(
+                    wmap, x0, y0, yaw, wx, wy, dist, fsize, in_range, xs, ys,
+                    front, frontier_used, sw is None)
+                if t_res is not None:
+                    target_res = t_res
+                    route = r_route
+                    n_cand = n_c
+                    self._target_kind = "frontier"
+                    self.n_relax_saved += 1
+                    self.n_frontier_relaxed += 1
+                else:
+                    self.n_relax_failed += 1
+                if len(self.relax_hist) < 80:
+                    self.relax_hist.append(dict(
+                        t=round(float(self._last_stamp or 0.0), 1),
+                        lvl=int(lvl),
+                        # Where the ladder sent it.  Without this the log cannot
+                        # tell "it recovered and did something new" from "it kept
+                        # being sent back to the same fruitless place", and those
+                        # two want opposite fixes.
+                        to=([round(float(t_res[0]), 2), round(float(t_res[1]), 2)]
+                            if t_res is not None else None),
+                        rungs=rungs,
+                        bl_places=len(self._barren_spots),
+                        denied=(len(self._denied) if self._denied else 0)))
             if target_res is None:
                 self._target = None
                 self._target_anchor = None
