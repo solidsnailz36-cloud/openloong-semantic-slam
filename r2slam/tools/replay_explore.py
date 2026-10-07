@@ -223,6 +223,17 @@ def main():
                          "frame in a cell and the in-door cells 1, so K=2 drops "
                          "91.8%% of the false evidence and keeps 94.8%% of the "
                          "real.  `obstacle_now` (the safety layer) is unaffected.")
+    ap.add_argument("--dump-obs-features", default=None, metavar="FILE",
+                    help="per-cell features of the **obstacle returns themselves**, "
+                         "accumulated over the whole replay: how many returns "
+                         "landed in the cell on each frame it was evidence, their "
+                         "height above the fitted ground, their range, whether the "
+                         "same frame also put floor returns there, and how many of "
+                         "the 8 neighbours held obstacle returns at that moment.  "
+                         "This is the raw material for the question K=2 got wrong: "
+                         "`OBSTACLE_MIN_VOTES` counts frames, so a cell with one "
+                         "return per frame and a cell with twelve per frame cast "
+                         "the same vote.  Read-only -- nothing feeds back.")
     ap.add_argument("--dump-cands", default=None,
                     help="also write the ranked sweep candidate table per frame "
                          "(one row per candidate).  Read it from an arm whose "
@@ -416,6 +427,26 @@ def main():
     cand_rows: list = []        # only filled with --dump-cands
     patch_rows: list = []       # only filled with --dump-patches
     pose_rows = []
+
+    # ---- per-cell features of the obstacle returns themselves -------------
+    # The unit is the cell, and the quantities are the ones that K=2 confused:
+    # `OBSTACLE_MIN_VOTES` counts frames, so a cell that got one return per
+    # frame and a cell that got twelve per frame cast the same vote.  Here the
+    # *returns* are accumulated, not the votes, so the two can be told apart
+    # offline before anybody touches a threshold again.
+    OF_N = wmap.n
+    OF_HB, OF_H0, OF_DH = 34, 0.35, 0.05        # h in [0.35, 2.05), step 0.05
+    of = None
+    if a.dump_obs_features:
+        of = dict(
+            nframes=np.zeros(OF_N * OF_N, np.int32),      # frames with an obstacle return
+            npts=np.zeros(OF_N * OF_N, np.int64),         # returns, total
+            pts=np.zeros((OF_N * OF_N, 9), np.int32),     # per-frame count, bin 8 = ">=8"
+            h=np.zeros((OF_N * OF_N, OF_HB), np.int32),   # h histogram, step 0.05 m
+            rng=np.zeros(OF_N * OF_N, np.float64),        # sum of ranges
+            nb8=np.zeros((OF_N * OF_N, 9), np.int32),     # 8-neighbour obstacle count
+            nground=np.zeros(OF_N * OF_N, np.int32),      # frames that ALSO put floor here
+        )
     prev_stamp = None
     n = 0
     probes = {int(i): [] for i in a.probe}
@@ -498,6 +529,42 @@ def main():
                  pose_xy=(t[0], t[1]), stamp=float(fr.stamp),
                  persons_xy=persons_world, obj_labels=obj_label,
                  objects_xy=objects_world, seen_mask=informative)
+
+        if of is not None:
+            # Accumulate the returns, not the votes.  `obstacle_now` is exactly
+            # "this frame's raw returns" and is set inside `add` before any
+            # threshold, so it is the right thing to read for the neighbourhood.
+            _fin = (np.isfinite(world_pts[:, 0]) & np.isfinite(world_pts[:, 1])
+                    & np.isfinite(h))
+            _m = obstacle_mask & _fin
+            if _m.any():
+                _ci, _cj = wmap.cell_of(world_pts[_m, 0], world_pts[_m, 1])
+                _k = wmap._in(_ci, _cj)
+                _ci, _cj = _ci[_k], _cj[_k]
+                _hh, _rr = h[_m][_k].astype(np.float64), rng_xy[_m][_k].astype(np.float64)
+                if _ci.size:
+                    flat = _cj.astype(np.int64) * OF_N + _ci
+                    key, cnt = np.unique(flat, return_counts=True)
+                    of["nframes"][key] += 1
+                    of["npts"][key] += cnt
+                    np.add.at(of["pts"], (key, np.minimum(cnt, 8)), 1)
+                    hb = np.clip((( _hh - OF_H0) / OF_DH).astype(np.int64),
+                                 0, OF_HB - 1)
+                    np.add.at(of["h"], (flat, hb), 1)
+                    np.add.at(of["rng"], flat, _rr)
+                    _on = wmap.obstacle_now.astype(np.uint8)
+                    nb = (cv2.filter2D(_on, -1, np.ones((3, 3), np.uint8))
+                          - _on)
+                    np.add.at(of["nb8"], (flat,
+                                          np.clip(nb[_cj, _ci], 0, 8)), 1)
+                    _g = ground_mask & _fin
+                    if _g.any():
+                        _gi, _gj = wmap.cell_of(world_pts[_g, 0], world_pts[_g, 1])
+                        _kg = wmap._in(_gi, _gj)
+                        gflat = np.unique(_gj[_kg].astype(np.int64) * OF_N
+                                          + _gi[_kg])
+                        of["nground"][np.intersect1d(key, gflat,
+                                                     assume_unique=True)] += 1
         if objects_world:
             registry.update([(float(p[0]), float(p[1]), 0.0, int(p[2]))
                              for p in objects_world], float(fr.stamp))
@@ -875,6 +942,25 @@ def main():
             for row in pose_rows:
                 wr.writerow([repr(v) for v in row])
         print("  poses written: %s" % a.poses)
+
+    if of is not None:
+        # Sparse storage: the map is 600x600 but only a few thousand cells ever
+        # hold an obstacle return, and the 34-bin height histogram is the bulky
+        # part.  Writing the flat index list instead of the full grids keeps the
+        # artefact small enough to diff and to keep next to the report.
+        idx = np.nonzero(of["nframes"])[0].astype(np.int64)
+        out = dict(cell=idx, nframes=of["nframes"][idx],
+                   npts=of["npts"][idx], pts=of["pts"][idx],
+                   h=of["h"][idx], rng_sum=of["rng"][idx],
+                   nb8=of["nb8"][idx], nground=of["nground"][idx],
+                   n=int(wmap.n), resolution=np.float64(wmap.resolution),
+                   extent=np.float64(wmap.extent),
+                   h_bins=np.int32(OF_HB), h0=np.float64(OF_H0),
+                   h_step=np.float64(OF_DH), frames=np.int64(n),
+                   obstacle_min_points=np.int32(_wm_mod.OBSTACLE_MIN_POINTS))
+        np.savez_compressed(a.dump_obs_features, **out)
+        print("  obs features : %s  (%d cells with obstacle returns)"
+              % (a.dump_obs_features, idx.size))
 
     if a.probe_cells:
         # Long form: one row per (frame, cell).  The question is about a *time
