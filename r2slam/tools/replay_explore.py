@@ -150,6 +150,23 @@ def main():
                          "records how many sub-patches a block would become and "
                          "whether `deepest` and `near_robot` land in the same "
                          "one.  Diagnostic only -- nothing is fed back.")
+    ap.add_argument("--dump-map", default=None,
+                    help="save the final map AND the explorer's own frontier "
+                         "classification (free / unknown / reach / exterior / "
+                         "front / inside / facing_out) as a .npz.  This is what "
+                         "the blame question needs: `facing_out` is defined as "
+                         "'the adjacent unknown component touches the map "
+                         "border', so a census has to ask whether that label "
+                         "really does mean 'the world outside' on this map.")
+    ap.add_argument("--dump-map-at", default=None, metavar="PREFIX:SEC,SEC",
+                    help="`PREFIX:62,68` -- save the same .npz as --dump-map at "
+                         "the first frame at or past each listed time (seconds "
+                         "relative to the first frame), as `PREFIX_062.npz`.  "
+                         "Needed because `reach` can collapse in a single "
+                         "frame: on rf1r3 it went 143.3 -> 13.0 m2 between "
+                         "t=58.8 and t=67.2 while `blocked` grew by only "
+                         "0.8 m2, so the end-frame map alone cannot show what "
+                         "closed the door.")
     ap.add_argument("--dump-cands", default=None,
                     help="also write the ranked sweep candidate table per frame "
                          "(one row per candidate).  Read it from an arm whose "
@@ -251,6 +268,41 @@ def main():
 
     rows_out: dict = {}
     seed_radii = [float(v) for v in str(a.seed_radii).split(",") if v.strip()]
+    map_at = None
+    map_at_prefix = None
+    if a.dump_map_at:
+        pre, _, secs = a.dump_map_at.partition(":")
+        map_at_prefix = pre.strip()
+        map_at = sorted(float(v) for v in secs.split(",") if v.strip())
+    t_first = [None]
+
+    def save_map(path, explorer, wmap, t, tag=""):
+        # Ask the **explorer's own** functions, not a reimplementation: the
+        # question is about the policy's classification, so a second
+        # implementation would answer for a different classifier.
+        # `_obs_votes` comes along because the interesting failure is a door
+        # closing on a handful of obstacle votes -- `obstacle` alone is boolean
+        # and cannot say how close to the threshold the threshold was.
+        free, unknown = explorer._free_unknown(wmap)
+        reach, exterior = explorer._masks(wmap, (float(t[0]), float(t[1])))
+        inside, facing_out, front = explorer._usable_frontier(
+            wmap, free, unknown, reach, exterior)
+        z = np.zeros_like(front)
+        np.savez(path, ground=wmap.ground, obstacle=wmap.obstacle,
+                 obstacle_votes=getattr(wmap, "_obs_votes", z),
+                 seen=wmap.seen, ground_ever=wmap.ground_ever,
+                 free=free, unknown=unknown, reach=reach, exterior=exterior,
+                 front=front,
+                 inside=(z if inside is None else inside),
+                 facing_out=(z if facing_out is None else facing_out),
+                 pose=np.array([float(t[0]), float(t[1])]),
+                 resolution=np.float64(wmap.resolution),
+                 extent=np.float64(wmap.extent))
+        print("  map %-6s : %s  (front %d, inside %d, facing_out %d)"
+              % (tag, path, int(front.sum()),
+                 int(z.sum() if inside is None else inside.sum()),
+                 int(z.sum() if facing_out is None else facing_out.sum())))
+
     cand_rows: list = []        # only filled with --dump-cands
     patch_rows: list = []       # only filled with --dump-patches
     pose_rows = []
@@ -324,11 +376,27 @@ def main():
                                          stamp=float(fr.stamp))
             results.append((name, exr, _v, _w, _e))
 
+        if t_first[0] is None:
+            t_first[0] = float(fr.stamp)
+        if map_at:
+            while map_at and (float(fr.stamp) - t_first[0]) >= map_at[0]:
+                Tt = map_at.pop(0)
+                save_map("%s_%03d.npz" % (map_at_prefix, int(round(Tt))),
+                         explorer, wmap, t, "%gs" % Tt)
+
         if a.poses:
+            # `reach` is the size of the component the planner can actually
+            # drive in -- and on `rf1r3` it collapsed to 12.8 m2 while 186 m2 of
+            # floor had been mapped, which is the whole reason that run ended
+            # early.  It was not recorded anywhere, so the frame it happened on
+            # could not be found; now it is.  `_masks` caches on
+            # (ground.sum, seen.sum, pose), so asking here is cheap.
+            _r, _e = explorer._masks(wmap, (t[0], t[1]))
             pose_rows.append((float(fr.stamp), float(t[0]), float(t[1]),
                               float(yaw), int(wmap.ground.sum()),
                               int(wmap.seen.sum()),
-                              int(wmap.blocked().sum())))
+                              int(wmap.blocked().sum()),
+                              int(_r.sum()), int(_e.sum())))
 
         if idx in probes or (n - 1) in probes:
             probes[idx if idx in probes else n - 1].append(
@@ -652,10 +720,13 @@ def main():
         with open(a.poses, "w", encoding="utf-8", newline="") as fh:
             wr = csv.writer(fh)
             wr.writerow(["stamp", "x", "y", "yaw", "ground_cells", "seen_cells",
-                         "blocked_cells"])
+                         "blocked_cells", "reach_cells", "exterior_cells"])
             for row in pose_rows:
                 wr.writerow([repr(v) for v in row])
         print("  poses written: %s" % a.poses)
+
+    if a.dump_map:
+        save_map(a.dump_map, arms[0][1], wmap, t, "final")
 
     if a.dump_patches:
         with open(a.dump_patches, "w", encoding="utf-8", newline="") as fh:

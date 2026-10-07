@@ -1,0 +1,81 @@
+thread caps : cv2=1  kiss_icp=1  onnxruntime=2
+detector    : v8 (yolo26n.onnx)
+explorer    : sweep+shadow
+  debt      : lambda=0.00  grace=20 s  cap=120 s
+frames       : 1304
+  n_picks                49
+  n_reused               1231
+  n_arrivals             17
+  n_backoffs             22
+  n_sweep_abandoned      8
+  n_first_pass_stops     7
+  n_deep_stops           13
+  n_shadow_probes        5
+  n_shadow_far           13
+  n_shadow_skipped       0
+  n_viewpoint_stops      1
+  n_second_approach      0
+  n_straight             52
+  n_routed               1228
+  n_arc_frames           334
+  n_patch_locks          10
+  n_patch_releases       3
+  n_los_shortened        42
+  n_frozen_frames        0
+  n_wedge_frames         3
+  n_goal_blocked_frames  661
+  n_goal_abandons        8
+  goal_blocked_frames    30
+  n_debt_updates         0
+  n_debt_blocks          0
+  max_debt_idle_s        0.0
+  n_debt_picks           0
+  n_debt_swaps           0
+  last_debt_idle_s       0.0
+  last_debt_f            0.0
+  n_local_picks          0
+  n_local_swaps          0
+  n_local_swaps_bad      0
+  last_local_u_pick      1.4800000000000002
+  last_local_term_pick   0.30982413648958107
+  n_region_picks         0
+  n_region_swaps         0
+  n_region_swaps_bad     0
+  n_region_fallthrough   0
+  n_region_live          0
+  n_region_starved       0
+  max_region_idle_s      0.0
+  n_plans                188
+  n_plan_failures        0
+  n_blacklisted          55
+  n_empty_pick           0
+  n_relax_seen           0
+  n_relax_saved          0
+  n_relax_failed         0
+  n_frontier_relaxed     0
+  n_picks_seen           50
+  cand_med               0.0
+  cand_max               2
+  cand_1                 49
+  cand_2_3               1
+  cand_4p                0
+  p_ge2                  0.02
+  p_ge3                  0.0
+  sep_min_med            5.3
+  sep_min_min            5.3
+  az_span_med            80.7
+  az_span_min            80.7
+  by_path                {'global': '22 picks, 0 with >=2, 0 with >=4', 'lock-failed': '6 picks, 0 with >=2, 0 with >=4', 'locked': '15 picks, 0 with >=2, 0 with >=4', 'survey': '7 picks, 1 with >=2, 0 with >=4'}
+  n_local_seen           1
+  u_med                  1.48
+  u_spread_med           0.56
+  u_spread_p90           0.56
+  u_flat_frac            0.0
+  u_gap_med              0.0
+  u_gap_flat_frac        1.0
+  need_local_inf         True
+  frames with v==0         24 (1.8%)
+  frames with v==0 and w==0 24 (1.8%)
+  poses written: out/_poses_rf1r1.csv
+  map          : out/_map_rf1r1.npz  (front 994, inside 269, facing_out 170)
+  written      : out/_census_rf1r1.csv

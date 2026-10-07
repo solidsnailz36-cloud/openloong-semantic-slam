@@ -1,0 +1,178 @@
+{
+ "rf1r3": {
+  "areas": {
+   "ground": 186.06000000000003,
+   "obstacle": 26.040000000000006,
+   "seen": 213.30000000000004,
+   "ground_ever": 202.77000000000004,
+   "reach": 12.810000000000002,
+   "exterior": 3377.0700000000006,
+   "front": 12.070000000000002,
+   "inside": 0.4900000000000001,
+   "facing_out": 0.0
+  },
+  "free_not_reach": 173.26000000000005,
+  "components": [
+   {
+    "label": 1,
+    "area_m2": 3571.6500000000005,
+    "overlap_reach_m2": 12.810000000000002,
+    "same_component_as_robot": true,
+    "min_dist_m": 0.0,
+    "known_inside_m2": 185.92000000000004,
+    "note": "门槛未解析（island 的对象）"
+   },
+   {
+    "label": 5,
+    "area_m2": 2.0800000000000005,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 46.183222061696824,
+    "known_inside_m2": 0.07,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 4,
+    "area_m2": 0.07,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 41.10109487592758,
+    "known_inside_m2": 0.0,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 2,
+    "area_m2": 0.06000000000000001,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 42.32068052382901,
+    "known_inside_m2": 0.06000000000000001,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 7,
+    "area_m2": 0.04000000000000001,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 41.98154356380909,
+    "known_inside_m2": 0.0,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 6,
+    "area_m2": 0.030000000000000006,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 41.66017282729394,
+    "known_inside_m2": 0.0,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 3,
+    "area_m2": 0.010000000000000002,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 42.9236531530111,
+    "known_inside_m2": 0.010000000000000002,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 8,
+    "area_m2": 0.010000000000000002,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 42.66169241837459,
+    "known_inside_m2": 0.0,
+    "note": "隔着一堵墙（建筑）"
+   }
+  ]
+ },
+ "rf1r1": {
+  "areas": {
+   "ground": 193.94000000000003,
+   "obstacle": 29.300000000000004,
+   "seen": 223.83000000000004,
+   "ground_ever": 215.24000000000004,
+   "reach": 145.38000000000002,
+   "exterior": 3371.9100000000008,
+   "front": 9.940000000000001,
+   "inside": 2.6900000000000004,
+   "facing_out": 1.7000000000000004
+  },
+  "free_not_reach": 49.16000000000001,
+  "components": [
+   {
+    "label": 1,
+    "area_m2": 3568.1800000000007,
+    "overlap_reach_m2": 145.38000000000002,
+    "same_component_as_robot": true,
+    "min_dist_m": 0.0,
+    "known_inside_m2": 193.76000000000005,
+    "note": "门槛未解析（island 的对象）"
+   },
+   {
+    "label": 12,
+    "area_m2": 2.3100000000000005,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 46.4,
+    "known_inside_m2": 0.010000000000000002,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 6,
+    "area_m2": 0.04000000000000001,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 37.26620452903676,
+    "known_inside_m2": 0.04000000000000001,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 11,
+    "area_m2": 0.030000000000000006,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 45.76559843375808,
+    "known_inside_m2": 0.030000000000000006,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 14,
+    "area_m2": 0.020000000000000004,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 42.36319157004109,
+    "known_inside_m2": 0.0,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 9,
+    "area_m2": 0.020000000000000004,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 41.08235631022154,
+    "known_inside_m2": 0.010000000000000002,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 7,
+    "area_m2": 0.020000000000000004,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 40.40222766135551,
+    "known_inside_m2": 0.020000000000000004,
+    "note": "隔着一堵墙（建筑）"
+   },
+   {
+    "label": 8,
+    "area_m2": 0.020000000000000004,
+    "overlap_reach_m2": 0.0,
+    "same_component_as_robot": false,
+    "min_dist_m": 40.60554149374196,
+    "known_inside_m2": 0.020000000000000004,
+    "note": "隔着一堵墙（建筑）"
+   }
+  ]
+ }
+}
