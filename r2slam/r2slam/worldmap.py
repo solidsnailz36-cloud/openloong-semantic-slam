@@ -34,6 +34,7 @@ not occupied", which is a statement about driveability rather than material.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -90,6 +91,32 @@ OBJ_MIN_VOTES = 2
 # `test_explore` case 4, which asserts exactly that and is why the two layers
 # are separate.
 OBSTACLE_MIN_VOTES = 2
+
+# ... and whether a cell's **floor** evidence may veto that promotion
+# (`0.0` = off, the shipping behaviour -- bit-identical).
+#
+# The layer's two kinds of evidence are not symmetric, and that asymmetry is
+# what sealed the `cap_A0_r2` doorway: `_obs_votes` is monotone and **unopposed**,
+# while the only floor counter, `_ground_after`, is zeroed by the very obstacle
+# return being judged -- so at the instant a cell is promoted its floor evidence
+# has just been erased and cannot argue back.
+#
+# Measured on `cap_A0_r2` (1417 frames, `--dump-obs-features`): the three doorway
+# cells reached vote 2 on two isolated frames and ended with `_obs_votes`
+# 15 / 14 / 9, while **floor returns landed in them on 27 / 19 / 33 frames** --
+# floor outnumbered obstacle by 1.4-3.7x and nothing consulted it.
+#
+# The rule is a straight comparison of frame counts:
+#     promote only if   `_obs_votes >= OBSTACLE_GROUND_RATIO * _ground_votes`
+# so `1.0` reads "obstacle evidence must not be outnumbered by floor evidence".
+#
+# It is a **blunt instrument, not a separator** -- the two populations overlap
+# (doorway cells 1.36 / 1.80 / 3.67 against truth-wall p50 0.72, p75 0.97,
+# p90 2.83), so it drops 1143 of 4886 promoted cells, 574 of them within 0.20 m
+# of a truth wall.  What it does *not* do is open the walls: ablating exactly the
+# cells it would drop, on the same frame's map, moves the map's own `reach` from
+# 175.75 to 177.74 m2 (+1.99).  Off by default; it exists to be measured.
+OBSTACLE_GROUND_RATIO = 0.0
 
 # ... and how long an obstacle survives after the floor is visible again.
 #
@@ -330,6 +357,106 @@ OBSTACLE_STRONG_VOTES = 20
 OBSTACLE_HOLD = "reset"
 OBSTACLE_MIN_POINTS = 1
 
+# B3 topological fuse: the largest loss of the robot's *current* reachable area
+# (m2) that admitting one cell is allowed to cost before that admission is
+# deferred.  `0.0` = off, and with it `WorldMap.add` is bit-identical to the
+# build before the block existed.
+#
+# Requires `WorldMap.reach_cells` to be installed (a callable
+# `(wmap, pose_xy) -> n_cells` giving the robot's reachable component size on
+# the map as it stands); with no hook the fuse is inert even if the number is
+# positive, so a driver that has no planner cannot silently half-enable it.
+#
+# Measured separation on `cap_A0_r3`: ordinary promotions <= 0.06 m2, the doorway
+# 136.3 m2.  Safe band is [0.5, 100] -- below 0.3 the fuse starts refusing real
+# obstacles.  See the note at the call site in `add`.
+OBSTACLE_TOPO_FUSE_M2 = 0.0
+
+
+class TopoFuseProfile:
+    """Opt-in, read-only cost account for the B3 fuse.
+
+    Nothing in the shipped pipeline constructs one, so every branch that reads
+    it is dead by default and the fuse costs exactly what it cost before.  It is
+    installed by the *caller* (the replay's `--b3-prof`, the live pipeline's
+    `--b3-prof`) on three objects that then share it:
+
+        WorldMap.topo_fuse_prof   -- the macro phases, and one row per frame
+        PathPlanner.prof (fuse)   -- the morphology stages inside `free_space`
+        Explorer.reach_cells      -- the `connectedComponents` stage
+
+    Everything is **additive seconds** in `stage`; a consumer takes two
+    snapshots of `stage` and differences them.  `rows` is one dict per call of
+    `_topo_fuse`, i.e. per frame, and `evals_ms` is one entry per *candidate*.
+
+    Why this exists at all: the fuse passed every correctness Gate on the replay
+    and then broke a 5 Hz control loop (`ms_map` p50 15.6 -> 42.1 ms,
+    p90 20.7 -> 147.4, **max 28 -> 2254**).  Replay has no wall-clock budget, so
+    a correctness Gate cannot see this class of failure.  The profiler is the
+    instrument that makes the cost visible where it is paid.
+    """
+
+    __slots__ = ("stage", "rows", "evals_ms")
+
+    def __init__(self):
+        self.stage: dict = {}
+        self.rows: list = []
+        self.evals_ms: list = []
+
+    def add(self, key, seconds):
+        self.stage[key] = self.stage.get(key, 0.0) + seconds
+
+    def get(self, key, default=0.0):
+        return self.stage.get(key, default)
+
+    def snapshot(self):
+        return dict(self.stage)
+
+
+# Stage keys that count events rather than seconds (everything else in
+# `TopoFuseProfile.stage` is seconds and is emitted as milliseconds).
+_PROF_COUNT_KEYS = frozenset({
+    "fs_calls", "fs_hits", "fs_misses",
+    "cc_calls", "reach_calls", "seed_nearest", "seed_maxcomp",
+})
+
+
+def _prof_row(prof, wmap, t_wall0, t_cpu0, snap, n_cand, n_defer_prev):
+    """Append one row (one frame) to `prof.rows`, as deltas since `snap`.
+
+    Three clocks, because they answer three different questions:
+
+        wall_ms    the budget the 5 Hz loop actually charges us.
+        thread_ms  CPU time of **this thread**.  wall >> thread means we were
+                   descheduled (the simulator shares the container), which no
+                   amount of algorithmic work would explain -- and is therefore
+                   the difference between "rewrite this" and "measure again".
+        cpu_ms     CPU time of the whole process.  Contaminated by the capture
+                   thread, so it is the least trustworthy of the three; kept
+                   only because the pair (cpu, thread) makes the contamination
+                   itself visible.
+    """
+    row = {
+        "frame": int(wmap.n_frames),
+        "stamp": float(wmap.t_last or 0.0),
+        "n_cand": int(n_cand),
+        "n_defer_prev": int(n_defer_prev),
+        "n_defer": int(len(wmap._topo_defer)),
+        "wall_ms": (time.perf_counter() - t_wall0) * 1e3,
+        "thread_ms": (time.thread_time() - t_cpu0[1]) * 1e3,
+        "cpu_ms": (time.process_time() - t_cpu0[0]) * 1e3,
+    }
+    t_cpu0[0] = time.process_time()
+    t_cpu0[1] = time.thread_time()
+    for k in set(prof.stage) | set(snap):
+        d = prof.stage.get(k, 0.0) - snap.get(k, 0.0)
+        if k in _PROF_COUNT_KEYS:
+            row[k] = d
+        else:
+            row[k + "_ms"] = d * 1e3
+    prof.rows.append(row)
+
+
 # ... and how many returns in one cell in one frame are needed for that frame to
 # count as obstacle evidence at all.
 #
@@ -475,7 +602,27 @@ class WorldMap:
         self.ground_ever = np.zeros((n, n), bool)
         self.obstacle_now = np.zeros((n, n), bool)
         self._ground_after = np.zeros((n, n), np.int32)
+        # Monotone counterpart of `_obs_votes`: frames that put a **floor**
+        # return in this cell.  `OBSTACLE_GROUND_RATIO` is the only reader; with
+        # the ratio at its default 0.0 it is written and never consulted, so the
+        # shipping behaviour is bit-identical.
+        self._ground_votes = np.zeros((n, n), np.int32)
         self._on_path = np.zeros((n, n), bool)
+        # B3 topological fuse (see `OBSTACLE_TOPO_FUSE_M2`).  `reach_cells` is
+        # installed by the driver that owns a planner; `None` keeps the fuse
+        # inert.  `_topo_defer` survives across frames on purpose -- the point
+        # is to remember that a cell was deferred and keep re-testing it, since
+        # `obstacle` itself is rebuilt from scratch every frame.
+        self.reach_cells = None
+        self._topo_defer: set = set()
+        self._topo_prev = np.zeros((n, n), bool)
+        self._topo_deferred_frames = 0
+        # Optional read-only row log for the fuse (see `_topo_fuse`).
+        self.topo_fuse_log: Optional[List[dict]] = None
+        # Optional read-only **cost** account (see `TopoFuseProfile`).  `None`
+        # is the shipping state and makes every `if prof is not None` branch in
+        # `_topo_fuse` dead code.
+        self.topo_fuse_prof: Optional[TopoFuseProfile] = None
 
     # ------------------------------------------------------------------ cells
     def cell_of(self, x, y):
@@ -496,6 +643,115 @@ class WorldMap:
 
     def _in(self, cx, cy):
         return (cx >= 0) & (cx < self.n) & (cy >= 0) & (cy < self.n)
+
+    def _topo_fuse(self, pose_xy) -> None:
+        """Defer any admission that would amputate the robot's reachable world.
+
+        Called at the very end of `add`, once `ground` has been derived, so the
+        quantity it measures is the one the planner is about to use.
+
+        The definition, and the reason it is written this way:
+
+            base      = the layer with **every candidate under question removed**
+            dreach(c) = reach(base) - reach(base + {c})
+
+        Both sides must be measured against the *same* base.  A first version
+        measured the re-check of an already-deferred cell against a base that
+        also had that cell removed, so both sides were the same map and it
+        reported `dreach = 0.0000 m2` for a cell that costs 136.30 m2 -- the
+        deferral was dropped on the next frame and the door shut anyway.  That
+        is the single most expensive line in this method; do not "simplify" it.
+        """
+        # ---- read-only cost account (see `TopoFuseProfile`) --------------
+        #
+        # `wall` and `cpu` are both kept because they answer different
+        # questions.  The live failure had a **2254 ms** frame; if `cpu` is far
+        # below `wall` on that frame it was the container descheduling us (the
+        # simulator shares the CPU), and no amount of algorithmic work would
+        # have shown up as a spike of that shape.
+        prof = self.topo_fuse_prof
+        if prof is not None:
+            _w0 = time.perf_counter()
+            _c0 = [time.process_time(), time.thread_time()]
+            _snap = prof.snapshot()
+            _t = _w0
+
+            def _mark(key):
+                nonlocal _t
+                now = time.perf_counter()
+                prof.add(key, now - _t)
+                _t = now
+
+        # `set(cands)` is rebuilt on every iteration of the comprehension below:
+        # Python evaluates the condition expression per item.  `_topo_defer` is
+        # a handful of cells in practice, but this is O(n^2) with n = deferred
+        # count and it is on the per-frame path.
+        cands = [tuple(v) for v in np.argwhere(self.obstacle & ~self._topo_prev)]
+        cands += [c for c in sorted(self._topo_defer) if c not in set(cands)]
+        if prof is not None:
+            _mark("t_cand")
+        if not cands:
+            self._topo_prev = self.obstacle.copy()
+            if prof is not None:
+                _mark("t_prev")
+                _prof_row(prof, self, _w0, _c0, _snap, 0, len(self._topo_defer))
+            return
+
+        # `base` = everything except the cells under question.
+        for (cy, cx) in cands:
+            self.obstacle[cy, cx] = False
+        np.logical_and(self.ground_ever, ~self.obstacle, out=self.ground)
+        if prof is not None:
+            _mark("t_mutate_base")
+        base = int(self.reach_cells(self, pose_xy))
+        if prof is not None:
+            _mark("t_base_reach")
+
+        d = {}
+        for (cy, cx) in cands:
+            self.obstacle[cy, cx] = True
+            np.logical_and(self.ground_ever, ~self.obstacle, out=self.ground)
+            if prof is not None:
+                _t_eval = time.perf_counter()
+            d[(cy, cx)] = base - int(self.reach_cells(self, pose_xy))
+            self.obstacle[cy, cx] = False
+            if prof is not None:
+                prof.evals_ms.append((time.perf_counter() - _t_eval) * 1e3)
+        np.logical_and(self.ground_ever, ~self.obstacle, out=self.ground)
+        if prof is not None:
+            _mark("t_loop")
+
+        thr = float(OBSTACLE_TOPO_FUSE_M2) / (self.resolution ** 2)
+        prev = self._topo_defer
+        self._topo_defer = set()
+        for (cy, cx) in cands:
+            if d[(cy, cx)] > thr:
+                self._topo_defer.add((cy, cx))
+            else:
+                self.obstacle[cy, cx] = True
+        if self._topo_defer:
+            self._topo_deferred_frames += 1
+        # Read-only instrument.  `topo_fuse_log` is a list the *caller* installs
+        # (the replay does, for the distribution table); with it left as `None`
+        # this costs one reference check.  The numbers logged are the ones the
+        # decision was actually made from -- not a re-derivation.
+        if self.topo_fuse_log is not None:
+            for (cy, cx) in cands:
+                self.topo_fuse_log.append(dict(
+                    frame=self.n_frames, stamp=self.t_last, cy=int(cy), cx=int(cx),
+                    votes=int(self._obs_votes[cy, cx]),
+                    reach_base=base, reach_with=base - d[(cy, cx)],
+                    dreach=d[(cy, cx)],
+                    dreach_m2=d[(cy, cx)] * self.resolution ** 2,
+                    kind=("recheck" if (cy, cx) in prev else "new"),
+                    deferred=int(d[(cy, cx)] > thr)))
+        np.logical_and(self.ground_ever, ~self.obstacle, out=self.ground)
+        if prof is not None:
+            _mark("t_decide")
+        self._topo_prev = self.obstacle.copy()
+        if prof is not None:
+            _mark("t_prev")
+            _prof_row(prof, self, _w0, _c0, _snap, len(cands), len(prev))
 
     def blocked(self) -> np.ndarray:
         """Cells the robot must not drive into, for the look-ahead only.
@@ -595,7 +851,21 @@ class WorldMap:
                 sm = np.asarray(seen_mask)[finite][ok]
                 self.seen[cyo[sm], cxo[sm]] = True
             self.ground_ever[cyo, cxo] |= g[ok]
-            self.obstacle_now[cyo, cxo] |= o[ok]
+            # **Write only the obstacle points.**  `self.obstacle_now[cyo, cxo]
+            # |= o[ok]` looks equivalent and is not: that form lowers to
+            # `arr[idx] = arr[idx] | mask`, and `__setitem__` on a repeated index
+            # assigns in order with **last write winning**.  `cyo`/`cxo` are
+            # per-point, so two points in one cell give a repeated index, and a
+            # non-obstacle point listed after an obstacle point erased the cell
+            # for that frame.  Measured on `cap_A0_r3`: the three cells that seal
+            # the doorway read `obstacle_now == 0` on 13 of their 23 voting
+            # frames -- exactly the frames where the cell held both an obstacle
+            # point and a non-obstacle one (`13/13`), while cells holding only
+            # obstacle points were right (`10/10`).  `blocked()` ORs this array
+            # in, so those frames were invisible to the throttle's clearance
+            # test.  See `out/_now_write_test.py` (scenario C fails without this
+            # line) and `docs/逐帧状态链与obstacle_now写入bug_20261008.md`.
+            self.obstacle_now[cyo[o[ok]], cxo[o[ok]]] = True
             # One count per cell per frame for the release counter too.  Floor
             # counts first and obstacle evidence comes second, so a cell that
             # shows both in one frame (a person standing *on* the floor) is
@@ -608,6 +878,7 @@ class WorldMap:
                 g_keys = np.unique(kg)
                 for u in g_keys:
                     self._ground_after[int(u) // self.n, int(u) % self.n] += 1
+                    self._ground_votes[int(u) // self.n, int(u) % self.n] += 1
             else:
                 g_keys = None
             if o[ok].any():
@@ -646,6 +917,14 @@ class WorldMap:
         # `votes` is monotone, so promoting it to the map layer every frame
         # converges to the same place as deciding it once at the end.
         np.greater_equal(self._obs_votes, OBSTACLE_MIN_VOTES, out=self.obstacle)
+        # Floor evidence vetoes the promotion (`0.0` = off).  Recomputed every
+        # frame from the monotone counters rather than latched, so a cell whose
+        # obstacle evidence later outweighs its floor evidence promotes then --
+        # the veto delays, it does not forbid.
+        if OBSTACLE_GROUND_RATIO > 0.0:
+            outvoted = (self._obs_votes
+                        < OBSTACLE_GROUND_RATIO * self._ground_votes)
+            np.logical_and(self.obstacle, ~outvoted, out=self.obstacle)
         # Release the transient ones: the newest evidence is floor, and enough of
         # it, and the cell does not carry structural evidence.  Recomputed fresh
         # every frame, so a cell whose obstacle returns come back (the person
@@ -686,6 +965,42 @@ class WorldMap:
         # obstacle layer does not claim.  Recomputed rather than latched, so
         # withdrawing obstacle evidence gives the floor back.
         np.logical_and(self.ground_ever, ~self.obstacle, out=self.ground)
+
+        # ---- B3 topological fuse ----
+        #
+        # Symptom (2026-10-08, `cap_A0_r3`): the robot could not enter a room for
+        # 26.6 s.  It is not a planner problem and it is not one bad cell: a
+        # doorway that is 1.7 m in truth was down to 1.1 m in the map, and then
+        # **two** phantom obstacles -- `(-8.65,-0.25)` at frame 1091 and
+        # `(-8.35,-0.25)` at frame 1141, both empty in truth, both empty in a
+        # 0.8 m neighbourhood -- were promoted one after the other, each
+        # costing 136 m2 of the robot's reachable set in a single frame.
+        #
+        # The mechanism is generically "a promotion that amputates the world",
+        # so the test is generic too:
+        #
+        #     dreach(c) = reach(without c) - reach(with c)
+        #
+        # measured for every cell this frame's filter chain just admitted.  If
+        # it exceeds `OBSTACLE_TOPO_FUSE_M2`, the admission is *deferred*: the
+        # cell is held out of `obstacle` (i.e. kept at `removable`) and
+        # re-tested on every subsequent frame, so it goes in as soon as it stops
+        # being a topological catastrophe.
+        #
+        # Measured separation (`cap_A0_r3`, 7757 admissions): ordinary promotions
+        # cost <= 0.06 m2, the doorway 136.3 m2 -- ~2000x.  So the threshold is
+        # not tuned: any value in [0.5, 100] gives the same answer, and below
+        # 0.3 the fuse starts refusing real obstacles (K=0.2 pulls back 3
+        # truth-occupied cells, K=0.1 pulls 14).  A/B on the replay: the door
+        # stopped closing (26.6 s -> 0 s), the largest single-frame drop went
+        # 136.29 -> 0.64 m2, and 5 cells were deferred, all of them on truth-free
+        # space.  Report: `docs/B3拓扑保险丝_反事实验证_20261008.md`, design
+        # section 69.
+        #
+        # `OBSTACLE_TOPO_FUSE_M2 = 0.0` ships: off, and with it `add` is
+        # bit-identical to the build before this block existed (Gate -1).
+        if OBSTACLE_TOPO_FUSE_M2 > 0.0 and self.reach_cells is not None:
+            self._topo_fuse(pose_xy)
 
         # ---- 3D store ----
         trav_cell = np.zeros(len(v), bool)
@@ -1022,12 +1337,36 @@ class WorldMap:
         img_world = lut[cls]           # (n, n, 3) BGR
 
         # crop a window around the robot, then scale to `size`
+        #
+        # The window is **always exactly 2*half cells square**, and the part
+        # that falls outside the grid is padded with `unknown` instead of the
+        # crop being clamped at the grid edge.  The clamping version made the
+        # window non-square, and everything drawn on top below is transformed
+        # with a single px-per-cell factor `k` taken from the *horizontal*
+        # extent -- so a clamped window stretched the overlay vertically against
+        # a map that had been resized with its own, correct vertical scale.
+        #
+        # Measured on the shipped simulator run (`subr2`): the auto-fit span grew
+        # to 50 m to include a distant object, the window clamped to 427 x 491
+        # cells, and the overlay came out **15.0% taller than the map under it**.
+        # That is the whole of the reported symptom -- the trajectory appeared to
+        # leave the house and the object markers formed a fan outside it -- and it
+        # moves as the robot moves, because the clamp ratio keeps changing, which
+        # is why it reads as *drift* rather than as a fixed offset.
+        #
+        # Padding keeps the geometry exact, and it also keeps the robot centred;
+        # the clamped version silently did not (the robot sat off-centre by
+        # exactly the amount the window had been cut).
         half = max(int(round(span / (2.0 * self.resolution))), 8)
-        x0, x1 = max(cx - half, 0), min(cx + half, n)
-        y0, y1 = max(cy - half, 0), min(cy + half, n)
-        win = img_world[y0:y1, x0:x1]
-        if win.size == 0:
-            return np.zeros((size, size, 3), np.uint8)
+        x0, x1 = cx - half, cx + half
+        y0, y1 = cy - half, cy + half
+        sx0, sx1 = max(x0, 0), min(x1, n)
+        sy0, sy1 = max(y0, 0), min(y1, n)
+        win = np.zeros((y1 - y0, x1 - x0, 3), np.uint8)
+        win[:] = lut[0]                      # whatever lies past the grid is unknown
+        if sx1 > sx0 and sy1 > sy0:
+            win[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img_world[sy0:sy1,
+                                                                 sx0:sx1]
         img = cv2.resize(win, (size, size),
                          interpolation=cv2.INTER_NEAREST)
         k = size / float(max(x1 - x0, 1))       # px per cell, after crop

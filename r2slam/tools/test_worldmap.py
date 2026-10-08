@@ -15,7 +15,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from r2slam import labels as L                                    # noqa: E402
-from r2slam.worldmap import WorldMap, trajectory_runs             # noqa: E402
+from r2slam.worldmap import WorldMap, trajectory_runs, LABEL_COLORS      # noqa: E402
 
 FAILS = []
 N = 0
@@ -295,6 +295,54 @@ def main():
           not w.obstacle[door_cell])
     check("a 13-vote cell next to unseen space is NOT opened",
           w.obstacle[far_cell])
+
+    # ------------------------------------------------------------------ 11
+    print("\n== 11. the panel's overlay lands on the map it is drawn over ==")
+    #
+    # Symptom this prevents: the trajectory and the object markers appearing to
+    # drift off the semantic map.  The crop used to be clamped at the grid edge,
+    # which made it non-square, while the overlay was transformed with one
+    # px-per-cell factor taken from the horizontal extent -- so everything drawn
+    # on top was stretched vertically (measured: 15.0% on the shipped simulator
+    # run) and the offset moved as the robot moved.
+    #
+    # The test is stated in world coordinates and does not reuse the renderer's
+    # own arithmetic: a cell the map calls `ground` has to be a green pixel, a
+    # cell it calls `unknown` has to be a black one, at the pixel the panel's
+    # documented framing puts them at.
+    w = WorldMap()
+    ry = 200                       # cell_y of the robot (world y = -10.0)
+    w.ground[ry, 5:150] = True     # a bar of floor through the robot, along x
+    w.ground[150, 10] = True       # 5 m at -y from the robot
+    w.ground[250, 10] = True       # 5 m at +y from the robot
+    w.seen[ry, 5:150] = True
+    w.seen[150, 10] = True
+    w.seen[250, 10] = True
+    w.traj = [(-29.0, -10.0)]
+    img = w.render(size=540)
+    half = max(int(round(w.base_span / (2.0 * w.resolution))), 8)
+    span_m = 2.0 * half * w.resolution
+    k2 = 540.0 / (2.0 * half)
+    xr, yr = w.traj[-1]
+
+    def pixel_of(x, y):
+        # The panel maps +y downwards (row grows with cell_y), and the window is
+        # square with the robot at its centre -- that is the property under test.
+        return (int(round(270 + (x - xr) / w.resolution * k2)),
+                int(round(270 + (y - yr) / w.resolution * k2)))
+
+    green = tuple(LABEL_COLORS[L.TRAVERSABLE][::-1])
+    for nm, (x, y) in [("5 m along +x", (-24.0, -10.0)),
+                       ("5 m along +y", (-29.0, -5.0)),
+                       ("5 m along -y", (-29.0, -15.0))]:
+        px, py = pixel_of(x, y)
+        inside = 0 <= px < 540 and 0 <= py < 540
+        col = tuple(int(v) for v in img[py, px][::-1]) if inside else None
+        check("%s reads ground at its pixel" % nm, inside and col == green,
+              "px=(%d,%d) inside=%s colour=%s want=%s"
+              % (px, py, inside, col, green))
+    check("... and the panel really is %0.0f m across" % span_m,
+          abs(span_m - 20.0) < 1e-6)
 
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
