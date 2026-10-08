@@ -321,6 +321,14 @@ def main():
                          "stays deferred, so this moves *when* a deferral is "
                          "released; it is the cost lever, see "
                          "`docs/B3成本剖析_20261008.md`.")
+    ap.add_argument("--obstacle-topo-max-eval", type=int, default=None,
+                    metavar="N",
+                    help="`worldmap.OBSTACLE_TOPO_FUSE_MAX_EVAL`.  0 (and the "
+                         "default) measures every candidate every frame.  > 0 "
+                         "bounds the per-frame work; the excess is held over "
+                         "exactly like a deferral.  This is the lever for the "
+                         "measured startup burst (frame 2: 564 candidates, "
+                         "2807 ms), not for the standing deferral set.")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--tgt-clearance", action="store_true",
                     help="record, per arm and per frame, the distance from that "
@@ -428,6 +436,10 @@ def main():
         print("topo fuse   : %.2f m2 (0 = off; a promotion costing more than "
               "this much of the robot's current reach is deferred)"
               % float(a.obstacle_topo_fuse))
+    if a.obstacle_topo_max_eval is not None:
+        _wm_mod.OBSTACLE_TOPO_FUSE_MAX_EVAL = int(a.obstacle_topo_max_eval)
+        print("topo cap    : %d evaluations per frame (0 = no cap)"
+              % int(a.obstacle_topo_max_eval))
     if a.obstacle_topo_retest is not None:
         _wm_mod.OBSTACLE_TOPO_FUSE_RETEST_N = int(a.obstacle_topo_retest)
         print("topo retest : N=%d, R=%d cells (0 = re-measure every deferred "

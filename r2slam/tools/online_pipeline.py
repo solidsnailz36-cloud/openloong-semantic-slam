@@ -128,6 +128,17 @@ def parse_args():
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=0, help="0 = until --duration")
     ap.add_argument("--duration", type=float, default=60.0, help="wall seconds to run")
+    ap.add_argument("--sim-duration", type=float, default=0.0, metavar="S",
+                    help="stop after S seconds of **sensor time** (`stamp` span), "
+                         "not wall time.  `--duration` is wall-clock and Gazebo "
+                         "Classic does not run in real time: measured RTF is 0.75-0.79 "
+                         "on this container and 0.545 on the cloud box, so the same "
+                         "`--duration 400` bought 303 s of simulation on one machine "
+                         "and 215 s on another -- a 30%% spread that turns 'the "
+                         "policy is slower' and 'the machine was busier' into the "
+                         "same observation.  A behaviour A/B must normalise on "
+                         "simulation time; the measured `sim_span` is reported either "
+                         "way.  See docs/行为评测_20261007.md section 3.")
     ap.add_argument("--no-deskew", action="store_true",
                     help="A/B switch: skip motion compensation even if the config asks for it")
     ap.add_argument("--no-detect", action="store_true",
@@ -189,6 +200,13 @@ def parse_args():
                          "*when* a deferral is released -- a behaviour change, "
                          "which is why it needs the closed-loop A/B in "
                          "`docs/B3成本剖析_20261008.md`.")
+    ap.add_argument("--obstacle-topo-max-eval", type=int, default=None,
+                    metavar="N",
+                    help="`worldmap.OBSTACLE_TOPO_FUSE_MAX_EVAL` -- cap on how "
+                         "many candidates the B3 fuse measures in one frame.  "
+                         "0 = no cap (the shipping rule).  The excess is held "
+                         "over exactly like a deferral, so this changes when a "
+                         "promotion is decided, not how it is judged.")
     ap.add_argument("--b3-log", default=None, metavar="FILE",
                     help="read-only row log of the B3 fuse in a **live** run: one "
                          "row per (frame, candidate) evaluation with the dreach "
@@ -520,6 +538,10 @@ def main():
             print("topo fuse   : %.2f m2 (0 = off; a promotion costing more "
                   "than this much of the robot's current reach is deferred)"
                   % float(a.obstacle_topo_fuse))
+        if a.obstacle_topo_max_eval is not None:
+            _worldmap.OBSTACLE_TOPO_FUSE_MAX_EVAL = int(a.obstacle_topo_max_eval)
+            print("topo cap    : %d evaluations per frame (0 = no cap)"
+                  % int(a.obstacle_topo_max_eval))
         if a.obstacle_topo_retest is not None:
             _worldmap.OBSTACLE_TOPO_FUSE_RETEST_N = int(a.obstacle_topo_retest)
             print("topo retest : N=%d, R=%d cells"
@@ -592,6 +614,10 @@ def main():
     n_boxes_detected = 0
     n_objects_localised = 0
     prev_stamp = None
+    # Sensor time of the first frame.  `--sim-duration` measures against this,
+    # not against `t_run`, so a run stops after the same amount of *simulated*
+    # time regardless of how fast the machine happened to be (see the flag).
+    t_first_stamp = None
     # When the wheel is handed to the navigator, and from where.  The finals
     # score path efficiency (30%), so the number has to come from the actual
     # driven segment -- not from the planned path length, which is a plan, not
@@ -606,6 +632,8 @@ def main():
                 continue
             dt_frame = None if prev_stamp is None else float(fr.stamp - prev_stamp)
             prev_stamp = fr.stamp
+            if t_first_stamp is None:
+                t_first_stamp = float(fr.stamp)
             n += 1
 
             # ---------------- ingest ----------------
@@ -1042,6 +1070,14 @@ def main():
                          st["traversable_area_m2"], times["total"][-1]),
                       flush=True)
 
+            if (a.sim_duration > 0.0 and t_first_stamp is not None
+                    and (float(fr.stamp) - t_first_stamp) >= a.sim_duration):
+                print("  reached --sim-duration %.1f s of sensor time "
+                      "(wall %.1f s, RTF %.3f)"
+                      % (a.sim_duration, time.time() - t_run,
+                         (float(fr.stamp) - t_first_stamp)
+                         / max(time.time() - t_run, 1e-9)), flush=True)
+                break
             if ctx is not None and ctx.is_streaming \
                     and (time.time() - t_run) > a.duration:
                 print("  reached --duration %.0f s (live source)" % a.duration,

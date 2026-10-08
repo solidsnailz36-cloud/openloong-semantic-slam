@@ -398,6 +398,27 @@ OBSTACLE_TOPO_FUSE_RETEST_N = 0
 # away than that cannot have altered this cell's answer.
 OBSTACLE_TOPO_FUSE_RETEST_R = 6
 
+# --- B3 per-frame evaluation cap ---------------------------------------------
+#
+# Measured on the replay (`out/island2/retest/`, `cap_A0_r3`, `--limit 1250`):
+# the fuse's cost is **not** spread out, it is one burst -- frame 2 admits **564**
+# cells at once and spends 2807 ms doing it, against a 200 ms budget for the
+# whole 5 Hz frame.  `n_cand` is 3 at the median and 54 at p99.
+#
+# `0` (default) = no cap, byte-identical to the build before the switch.  `> 0`
+# bounds the number of cells *measured* in one frame; the excess is held over
+# exactly like a deferral -- not promoted, still in `obstacle`'s candidate set
+# next frame, measured as soon as there is room.  The judge (`dreach > K`) is
+# untouched; only *when* it runs changes, which is why this needs the same
+# closed-loop A/B as `OBSTACLE_TOPO_FUSE_RETEST_N`.
+#
+# Why it is safe to hold a cell over at all: `blocked()` -- what the look-ahead
+# actually consults -- is `obstacle | obstacle_now`, and `obstacle_now` is this
+# frame's raw returns, written before any filtering.  So a wall the robot is
+# looking at still stops it on the frame it is seen; what is delayed is only the
+# cell's entry into the accumulated layer.
+OBSTACLE_TOPO_FUSE_MAX_EVAL = 0
+
 
 class TopoFuseProfile:
     """Opt-in, read-only cost account for the B3 fuse.
@@ -650,6 +671,7 @@ class WorldMap:
         self._topo_prev_seen: Optional[np.ndarray] = None
         self.n_topo_retest = 0            # deferred cells actually re-measured
         self.n_topo_retest_skipped = 0    # ... and the ones the rule skipped
+        self.n_topo_capped = 0            # ... and the ones the per-frame cap held
         # Optional read-only row log for the fuse (see `_topo_fuse`).
         self.topo_fuse_log: Optional[List[dict]] = None
         # Optional read-only **cost** account (see `TopoFuseProfile`).  `None`
@@ -777,6 +799,17 @@ class WorldMap:
         # question removed, or the two sides of `dreach` are not the same map
         # (that is the mistake the docstring above warns about).
         do_eval = [c for c in cands if c not in skip]
+        # ... and the per-frame cap bounds the measurement itself.  The order of
+        # `cands` is "this frame's new admissions first, then the standing
+        # deferrals", so a cap keeps the decisions the frame actually made and
+        # pushes the backlog -- which is what the startup burst is -- to later
+        # frames.  `_topo_defer` already means "held out, not banned", so a
+        # capped cell rides that same path.
+        if OBSTACLE_TOPO_FUSE_MAX_EVAL > 0 and len(do_eval) > OBSTACLE_TOPO_FUSE_MAX_EVAL:
+            over = do_eval[OBSTACLE_TOPO_FUSE_MAX_EVAL:]
+            skip |= set(over)
+            self.n_topo_capped += len(over)
+            do_eval = do_eval[:OBSTACLE_TOPO_FUSE_MAX_EVAL]
         self.n_topo_retest += len(do_eval)
 
         # `base` = everything except the cells under question.
