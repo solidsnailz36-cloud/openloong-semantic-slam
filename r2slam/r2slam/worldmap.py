@@ -372,6 +372,32 @@ OBSTACLE_MIN_POINTS = 1
 # obstacles.  See the note at the call site in `add`.
 OBSTACLE_TOPO_FUSE_M2 = 0.0
 
+# --- B3 re-test policy: how often a cell that is already on the deferred list
+#     gets re-measured (`docs/B3成本剖析_20261008.md`).
+#
+# The fuse re-tests **every** deferred cell on **every** frame, and that is
+# where its cost lives: `live n_cand` p50 48, of which 89.4% are re-tests, and a
+# deferral set frozen at 48 cells from frame 242 was re-measured for 898 frames
+# -- 86% of the fuse's wall clock, and the reason `ms_map.max` reached 2254 ms
+# on a 200 ms budget.
+#
+# `RETEST_N = 0` (default) is the shipping rule and with it `_topo_fuse` is
+# bit-identical to the build before this switch existed.  `RETEST_N > 0` skips a
+# re-test when **nothing changed near the cell last frame** and the cell has not
+# been tested for `RETEST_N` frames (a a mandatory periodic fallback, so a change
+# that never lands inside the window is still caught).  A skipped cell stays
+# deferred, i.e. it stays out of `obstacle` -- so the *safety* question ("is a
+# real obstacle being held back?") is unchanged; only the moment it is released
+# moves.  That is a behaviour change and it needs the closed-loop A/B in
+# `docs/B3成本剖析_20261008.md`; the switch exists so the A/B can be run without
+# touching the default.
+OBSTACLE_TOPO_FUSE_RETEST_N = 0
+# Chebyshev half-width (cells) of the window that counts as "near".  The bound
+# that makes a window meaningful is the same one section 71 derives: admitting
+# one cell can change `walk` by at most +-4 cells (9x9), so a change further
+# away than that cannot have altered this cell's answer.
+OBSTACLE_TOPO_FUSE_RETEST_R = 6
+
 
 class TopoFuseProfile:
     """Opt-in, read-only cost account for the B3 fuse.
@@ -617,6 +643,13 @@ class WorldMap:
         self._topo_defer: set = set()
         self._topo_prev = np.zeros((n, n), bool)
         self._topo_deferred_frames = 0
+        # Re-test bookkeeping for `OBSTACLE_TOPO_FUSE_RETEST_N`.  Both are only
+        # touched when that switch is on, so with the shipping `0` they cost one
+        # `if` per frame and nothing else.
+        self._topo_last_test: dict = {}
+        self._topo_prev_seen: Optional[np.ndarray] = None
+        self.n_topo_retest = 0            # deferred cells actually re-measured
+        self.n_topo_retest_skipped = 0    # ... and the ones the rule skipped
         # Optional read-only row log for the fuse (see `_topo_fuse`).
         self.topo_fuse_log: Optional[List[dict]] = None
         # Optional read-only **cost** account (see `TopoFuseProfile`).  `None`
@@ -692,10 +725,59 @@ class WorldMap:
             _mark("t_cand")
         if not cands:
             self._topo_prev = self.obstacle.copy()
+            if OBSTACLE_TOPO_FUSE_RETEST_N > 0:
+                self._topo_prev_seen = self.seen.copy()
             if prof is not None:
                 _mark("t_prev")
                 _prof_row(prof, self, _w0, _c0, _snap, 0, len(self._topo_defer))
             return
+
+        # ---- which cells have to be re-measured this frame -----------------
+        #
+        # Only live when `OBSTACLE_TOPO_FUSE_RETEST_N > 0`; see its note.  A cell
+        # already on the deferred list is elbowed out of the loop below when
+        # (a) nothing within `RETEST_R` cells of it changed in the last frame --
+        # `obstacle` or `seen` is the evidence the fuse is made of, and `seen`
+        # grows as the robot maps, which is what eventually releases a deferral --
+        # **and** (b) it has not been measured for `RETEST_N` frames.
+        #
+        # Cost of the test itself: two full-array comparisons plus one `dilate`,
+        # ~2 ms on the real 1200x1200 grid, against ~2.7 ms *per cell it avoids*.
+        # With 48 deferred cells that is the difference between one grid
+        # operation and 48.
+        skip = set()
+        if OBSTACLE_TOPO_FUSE_RETEST_N > 0:
+            if self._topo_prev_seen is None:
+                self._topo_prev_seen = self.seen.copy()
+            changed = ((self.obstacle != self._topo_prev)
+                       | (self.seen != self._topo_prev_seen))
+            self._topo_prev_seen = self.seen.copy()
+            if changed.any():
+                r = max(int(OBSTACLE_TOPO_FUSE_RETEST_R), 0)
+                near = cv2.dilate(changed.astype(np.uint8),
+                                  np.ones((2 * r + 1, 2 * r + 1), np.uint8)) > 0
+            else:
+                near = changed
+            fresh = set(tuple(v) for v in
+                        np.argwhere(self.obstacle & ~self._topo_prev))
+            fr = self.n_frames
+            for c in cands:
+                if c in fresh:
+                    continue
+                if (near[c[0], c[1]]
+                        or (fr - self._topo_last_test.get(c, -10 ** 9)
+                            >= OBSTACLE_TOPO_FUSE_RETEST_N)):
+                    continue
+                skip.add(c)
+            if prof is not None:
+                _mark("t_retest_rule")
+            self.n_topo_retest_skipped += len(skip)
+        # Cells the rule held over are excluded from the *measurement* but
+        # **not** from the base: the base still has to have every cell under
+        # question removed, or the two sides of `dreach` are not the same map
+        # (that is the mistake the docstring above warns about).
+        do_eval = [c for c in cands if c not in skip]
+        self.n_topo_retest += len(do_eval)
 
         # `base` = everything except the cells under question.
         for (cy, cx) in cands:
@@ -708,7 +790,7 @@ class WorldMap:
             _mark("t_base_reach")
 
         d = {}
-        for (cy, cx) in cands:
+        for (cy, cx) in do_eval:
             self.obstacle[cy, cx] = True
             np.logical_and(self.ground_ever, ~self.obstacle, out=self.ground)
             if prof is not None:
@@ -724,27 +806,49 @@ class WorldMap:
         thr = float(OBSTACLE_TOPO_FUSE_M2) / (self.resolution ** 2)
         prev = self._topo_defer
         self._topo_defer = set()
-        for (cy, cx) in cands:
+        for (cy, cx) in do_eval:
             if d[(cy, cx)] > thr:
                 self._topo_defer.add((cy, cx))
             else:
                 self.obstacle[cy, cx] = True
+        # A held-over cell stays deferred and stays **out** of `obstacle`.  Its
+        # last measurement said "promoting this amputates the world", and the
+        # rule above only holds it over while nothing near it has changed.
+        self._topo_defer |= skip
+        for (cy, cx) in skip:
+            self.obstacle[cy, cx] = False
         if self._topo_defer:
             self._topo_deferred_frames += 1
+        if OBSTACLE_TOPO_FUSE_RETEST_N > 0:
+            # Bookkeeping for the re-test rule: remember when each cell was last
+            # measured, and forget cells that are no longer deferred (otherwise
+            # this dict grows with every cell the fuse ever deferred).
+            fr = self.n_frames
+            for c in do_eval:
+                self._topo_last_test[c] = fr
+            keep = self._topo_defer
+            if any(c not in keep for c in self._topo_last_test):
+                self._topo_last_test = {c: t for c, t
+                                        in self._topo_last_test.items()
+                                        if c in keep}
         # Read-only instrument.  `topo_fuse_log` is a list the *caller* installs
         # (the replay does, for the distribution table); with it left as `None`
         # this costs one reference check.  The numbers logged are the ones the
         # decision was actually made from -- not a re-derivation.
         if self.topo_fuse_log is not None:
             for (cy, cx) in cands:
+                _dd = d.get((cy, cx))
+                held = _dd is None
                 self.topo_fuse_log.append(dict(
                     frame=self.n_frames, stamp=self.t_last, cy=int(cy), cx=int(cx),
                     votes=int(self._obs_votes[cy, cx]),
-                    reach_base=base, reach_with=base - d[(cy, cx)],
-                    dreach=d[(cy, cx)],
-                    dreach_m2=d[(cy, cx)] * self.resolution ** 2,
+                    reach_base=base,
+                    reach_with=(None if held else base - _dd),
+                    dreach=(None if held else _dd),
+                    dreach_m2=(None if held else _dd * self.resolution ** 2),
                     kind=("recheck" if (cy, cx) in prev else "new"),
-                    deferred=int(d[(cy, cx)] > thr)))
+                    deferred=(1 if held else int(_dd > thr)),
+                    retest=(0 if held else 1)))
         np.logical_and(self.ground_ever, ~self.obstacle, out=self.ground)
         if prof is not None:
             _mark("t_decide")

@@ -45,6 +45,7 @@ portability, not about the planner.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -73,11 +74,17 @@ class FrontierExplorer:
                  arc_probe_deg: float = 40.0,
                  sweep: bool = True, sweep_radius: float = 0.60,
                  island_link_m: float = 1.5, island_probe_limit: int = 12,
+                 island_probe_count: str = "frame",
+                 island_probe_same_m: float = 0.50,
                  island_min_m2: float = 0.5, island_trigger_m2: float = 4.0,
+                 island_standoff_m: float = 0.0,
+                 island_arrive_m: float = 0.0, island_done_m: float = 0.90,
+                 strand_dump: bool = False,
                  sweep_min_m2: float = 3.0, sweep_min_dist: float = 0.50,
                  sweep_cands_per_patch: int = 1,
                  sweep_cand_sep_m: float = 1.00,
                  sweep_cand_sectors: int = 1,
+                 sweep_value_mode: str = "area", sweep_view_r_m: float = 1.00,
                  cand_local_lambda: float = 0.0,
                  cand_local_radius_m: float = 1.00,
                  cand_local_dist_mode: str = "patch",
@@ -100,6 +107,9 @@ class FrontierExplorer:
                  wedge_frames: int = 20, wedge_deny_m: float = 0.90,
                  goal_blocked_frames: int = 30,
                  score_quantum_m2: float = 0.25, rank_quantum_m: float = 0.25,
+                 disc_lambda: float = 0.0,
+                 fresh_split_m: float = 0.0, patch_probe: bool = False,
+                 island_probe: bool = False,
                  debt_lambda: float = 0.0, debt_grace_s: float = 20.0,
                  debt_idle_cap_s: float = 120.0, debt_cell_m: float = 1.0,
                  debt_known_m2: float = 0.50, debt_fresh_m2: float = 0.25,
@@ -189,6 +199,50 @@ class FrontierExplorer:
         # sectors as seen from the robot.  See  for the measurement
         # that made this necessary.
         self.sweep_cand_sectors = max(int(sweep_cand_sectors), 1)
+        # --- what a "place" is worth ------------------------------------------
+        #
+        # Boss, 2026-10-07, picking option 1 out of section 50.7: "swap the *value*
+        # term and nothing else -- `fresh_split_m` stays 3.0, `d0` untouched."
+        #
+        # Section 50 left the problem in two halves. The *size* half is closed:
+        # objects are now provably at most `fresh_split_m` across, measured 4/4.
+        # The *value* half is the one that re-ranked the world anyway, because the
+        # value was `object area`, and area is a function of how far the object
+        # happens to sprawl -- the 20 m object collected a huge numerator **and**
+        # the smallest `d0` in the house, so it almost always won.
+        #
+        # So this is the numerator, and only the numerator:
+        #
+        #   `"area"`  (default)  `ncell * cell` -- the object's own floor.
+        #            Every place in a patch shares it, which is what makes
+        #            `sweep_cands_per_patch = 4` a one-variable change (section 49).
+        #   `"view"`  the never-visited floor within `sweep_view_r_m` of the place
+        #            the robot would actually drive to (the patch anchor).
+        #
+        # `"view"` is the FUEL / NBV shape read at the scale this project can
+        # afford: all of those score a viewpoint by the **unknown it can reach
+        # from where it stands**, never by the extent of the blob it belongs to.
+        # The robot's LiDAR sees the whole house (40 m), which is exactly why the
+        # raw "visible unknown" is useless here -- so the reach is the project's
+        # own local scale, `sweep_view_r_m`.
+        #
+        # ★ The radius is **pre-registered from a measurement, not chosen**. The
+        # same quantity already exists per place as `local_unfinished`
+        # (`cand_local_radius_m = 1.00`), and its own recorded spread says it
+        # discriminates: measured on the split arms, `u_spread_med` =
+        # **1.74 / 2.17 / 2.27 / 2.21 m2** with `u_flat_frac = 0.0` -- never flat.
+        # At `r >= 1.5 m` the disc is 7.07 m2, i.e. a whole 3 m split patch, so the
+        # value would collapse onto the area it is supposed to replace: that is the
+        # one way this arm could look inert for the wrong reason.
+        #
+        # Same shape as `disc_lambda`: a switch, `"area"` is the standing behaviour
+        # *exactly* (the same expression, not an equivalent one), and an unknown
+        # mode is refused loudly rather than silently falling back to it.
+        self.sweep_value_mode = str(sweep_value_mode).strip().lower()
+        if self.sweep_value_mode not in ("area", "view"):
+            raise ValueError("sweep_value_mode must be 'area' or 'view', got %r"
+                             % (sweep_value_mode,))
+        self.sweep_view_r_m = max(float(sweep_view_r_m), 1e-3)
         # --- the candidate-level term: what *this place* still has left -----
         #
         # Boss, 2026-10-05: "(1) finally connected the ranking to the power, but
@@ -541,6 +595,103 @@ class FrontierExplorer:
         self.score_quantum_m2 = float(score_quantum_m2)
         self.rank_quantum_m = float(rank_quantum_m)
 
+        # --- how travel cost is folded into the value ------------------------
+        #
+        # Every picker in this file turns a "how much is there" into a number to
+        # be ranked, and every one of them folds the distance with the same
+        # shape: `value / (1 + d)`.  That shape is **this project's own**; it is
+        # not what the mature explorers use -- see
+        # `docs/探索算法_成熟方案对标_v2_区域级探索.md` section 3.2: of eleven
+        # systems read at source level (LRAE / TARE / FAEL / FUEL / GBPlanner2 /
+        # mav_active_3d_planning / explore_lite / ros2_explorer / rrt_exploration
+        # / ActiveSLAM / NBVPlanner), none folds a single step by division.  The
+        # common forms are `value * exp(-lambda * d)` (LRAE and FAEL both use
+        # `lambda = 3.0`, from the same two-opt template), a weighted sum
+        # `w_v*value - w_d*d`, an ATSP over a pure cost matrix, or greedy
+        # set-cover.
+        #
+        # So this is a **switch, not a replacement**.  `disc_lambda = 0` is the
+        # standing behaviour *exactly* -- `_fold` falls through to the same
+        # `value / (1.0 + d)` expression, so the arithmetic is bit-for-bit what
+        # it was and `--arms "B0:"` is a real control (checked by md5, the same
+        # discipline that caught `bool("False")` in `r2slam/overrides.py`).
+        #
+        # What makes the two forms different, and why a dose-response ladder is
+        # the right first experiment: at small `d` they nearly agree
+        # (`1/(1+1) = 0.500` vs `exp(-1) = 0.368`), and they separate only with
+        # distance -- which is precisely the regime the project measured in
+        # section 33 (a candidate worth 1.55x was folded away 3x by 3.9 m).  A
+        # ladder of lambdas therefore tests the *shape* claim, not a constant.
+        #
+        # `1/(1+d)` also decays much more slowly than any `exp(-d)`: at 10 m it
+        # still keeps 9.1%, while `exp(-1*10)` keeps 0.005%.  So the ladder is
+        # not "a bit steeper" -- it is a different regime, and the finding that
+        # matters may be "the ranking changes a lot" rather than "it gets better".
+        self.disc_lambda = float(disc_lambda)
+
+        # --- how big is one decision object? ---------------------------------
+        #
+        # Boss, 2026-10-07, after the fold-form A/B (docs section 49): "stop
+        # tuning lambda and stop tuning NMS.  The next cut is the connected
+        # component of `fresh`."  The evidence that made that the next cut and
+        # not another parameter:
+        #
+        #   * on three of four captures the **sweep** layer offered at most one
+        #     candidate on 98-100% of decisions (range 30's 41-of-43, again);
+        #   * `sweep_cands_per_patch = 4` did produce several places -- and the
+        #     first one it changed, versus the one-place arm, moved the target by
+        #     **9.8-13.2 m**, all four captures, always roughly west -> north-east;
+        #   * `sweep_cands_per_patch` only decides *how many places to take from
+        #     each patch*, it does not decide *which patches are eligible*, so the
+        #     two arms' candidates were provably the same object;
+        #   * and the candidates NMS had to reject were >= 1.1 m apart, i.e. NMS
+        #     (`sweep_cand_sep_m = 1.0`) never fired.
+        #
+        # An object that is 13 m across is not a "patch of floor" anything can
+        # reason about: it makes the ranking inert (one object -> one candidate)
+        # and it makes a 13 m target move legal at the point level.  Both symptoms
+        # share one upstream cause -- the size of the object the decision is made
+        # about -- and this is the knob that bounds it.
+        #
+        # `fresh_split_m` splits every connected component of `fresh` into pieces
+        # of **Euclidean diameter <= `fresh_split_m`** (complete linkage, so the
+        # bound is on the whole piece, not on a chain of neighbours -- the same
+        # property `_cluster_rows` gives the region layer, see `rfirst_link_m`).
+        # It is a **switch**: `0` is the standing behaviour exactly, because the
+        # relabelling is skipped rather than made a no-op, and the decision then
+        # runs on the raw `cv2.connectedComponents` labels as it always has.
+        #
+        # Deliberately the *only* thing that changes.  Not the patch score, not
+        # the candidate score, not the survey filter, not `rfirst`, not the
+        # fallback: the object is cut up, and every layer above it is told to
+        # treat each piece as it always treated a patch.  If the decisions then
+        # change, the object size is what changed them.
+        self.fresh_split_m = max(float(fresh_split_m), 0.0)
+
+        # `patch_probe` is the instrument, not a behaviour: it records the
+        # diameter of every decision object on every pick, so "the 13 m object
+        # is gone" is a reading and not an inference.  Off by default, and it
+        # does nothing whatever to the decision -- the same rule as
+        # `--dump-obs-features` (section 46: the dumping arm's decision CSV had
+        # to be md5-identical to the plain one, and was).
+        self.patch_probe = as_bool(patch_probe)
+
+        # `island_probe` is the same kind of instrument for the doorway probe.
+        #
+        # "`island_probes = 12`" reads like "it tried twelve times".  Measured on
+        # the closed-loop runs it means something else: twelve times it was
+        # *chosen*, and eight of twelve runs spent **2.2 s / 12 frames / <0.4 m of
+        # travel** on it, giving up 3-14 m short of the target.  That function has
+        # six early exits and the caller has two more, and the counter
+        # we had said nothing about which one fired -- so "raise `island_min_m2`"
+        # and "give the probe an execution window" were both guesses.  This
+        # records every exit by name, off by default and writing nothing else, so
+        # the same rule as `patch_probe` applies: with it off the decisions must
+        # be bit-identical (verified on the frozen replay, §53).
+        self.island_probe = as_bool(island_probe)
+        self.island_diag: dict = {}
+        self.island_diag_log: dict = {}
+
         # --- unfinished-region debt: the answer to "why did it never go back?"
         #
         # Six runs of one build (four of them the same binary, §18) produced room
@@ -631,6 +782,8 @@ class FrontierExplorer:
         self.debt_switches: List[dict] = []   # first few swaps, for the scan
         self.debt_margin: List[dict] = []     # per pick: the lambda it needed
         self.pick_sizes: List[dict] = []      # per pick: how many candidates
+        self.patch_hist: List[dict] = []      # per pick: how big the objects are
+        self.value_hist: List[dict] = []      # per pick: does the value discriminate
         self.last_sweep_cands: list = []      # the ranked list, for probes
         # Calls to `_pick_target` that returned **zero** candidates, with the
         # balance of every filter that could have emptied the pool.  Separate
@@ -1024,7 +1177,89 @@ class FrontierExplorer:
         # this -- half the house was invisible to the remaining-work budget.
         self.island_link_m = float(island_link_m)
         self.island_probe_limit = int(island_probe_limit)
+        # --- what "one probe" means ------------------------------------------
+        #
+        # `n_island_probes` used to be incremented **every frame** the picker
+        # returned a target, and `_pick_island_probe` is called every frame.  So
+        # `island_probe_limit = 12` -- written to mean "at most twelve doorways" --
+        # was in fact "at most twelve frames", and on the closed-loop runs the
+        # twelve were spent in **2.2 s** (12 x 0.2 s), all of it in `turn`/`arc`
+        # while the robot moved 0.23 m.  Measured to be the reason every island
+        # probe in every run died after ~2 s (§54).
+        #
+        # `"target"` counts a probe when the picker aims at a **different** goal
+        # (or the previous probe has ended, which clears the goal).  The limit
+        # then means what it says: "at most twelve probe targets".
+        #
+        # ⚠️ `"frame"` is the default on purpose: this is a behaviour change, and
+        # it has to be able to lose an A/B.  With `"frame"` (or the attribute
+        # absent) the decisions are bit-identical to the previous build.
+        self.island_probe_count = str(island_probe_count)
+        self.island_probe_same_m = float(island_probe_same_m)
+        self._island_goal: Optional[Tuple[float, float]] = None
+        self._prev_kind = "init"          # last frame's final `_target_kind`
         self.island_min_m2 = float(island_min_m2)
+        # --- D1 (§57): keep the probe goal out of the throttle's blocked band
+        #
+        # Measured 2026-10-07 (`docs/探针执行层逐帧账_20261007.md`): the probe
+        # goal is "the reachable cell nearest the doorway beachhead", and
+        # `reach`'s border **is** the obstacle-inflation border.  So the goal
+        # lands 0.40-0.60 m from the nearest blocked cell -- inside `front_stop`
+        # (0.75 m, checked out to 0.7 m).  As the robot closes on it the
+        # throttle sees `aligned && !ahead`, calls it a `wedge` and backs off
+        # at once; measured on `full54_T0` the robot stalls at `dist ~ 0.30 m`
+        # for 26 frames and ends 0.46 m away, having touched 0.21 m.
+        #
+        # When this is positive the goal is instead the reachable cell that is
+        # **at least this far from any blocked cell** while facing the same
+        # doorway.  `0.0` is the standing behaviour, bit for bit -- the ranking
+        # key below is only replaced when this is positive.
+        self.island_standoff_m = float(island_standoff_m)
+        # --- D3 (§58): an arrival terminal state for the probe ---------------
+        #
+        # Measured 2026-10-07 by D1 (`docs/D1目标点standoff_20261007.md`): once the
+        # goal sits somewhere the robot can actually stand, it **walks onto it**
+        # (`dist_min = 0.07 m`), keeps driving because nothing told it to stop,
+        # overshoots, and then spends the next 48 of 66 frames turning on the
+        # spot with the target behind it (`|err| -> 180 deg`), ending in a
+        # `turn-timeout` backoff.  The probe had already done its job -- standing
+        # at the threshold is exactly what makes it resolve -- but the state
+        # machine has no notion of "I am here".
+        #
+        # `island_arrive_m > 0` means: a probe whose goal is already within this
+        # distance is **finished**.  The place is remembered for
+        # `island_done_m` so the next pick cannot aim back at it, and the run
+        # gets on with something else.  `0.0` is the standing behaviour, bit for
+        # bit -- every line below is behind the `island_arrive_m > 0.0` guard.
+        self.island_arrive_m = float(island_arrive_m)
+        self.island_done_m = float(island_done_m)
+        self._island_done: List[Tuple[float, float]] = []
+        self.n_island_arrived = 0
+        # --- read-only: why does a frame end with **no target at all**? ------
+        #
+        # boss 2026-10-07, after the merged D1+D3 run: the fix removed the wrong
+        # behaviour at the doorway and exposed "there is nowhere to go next"
+        # (`search`, 29 frames, `target_kind` empty).  The question is then
+        # exactly: *given that `_stranded_fresh` floor exists, why does this
+        # frame end with an empty target?*
+        #
+        # Three answers, three different fixes, and nothing on the map tells
+        # them apart:
+        #   A **never generated** -- sweep found no fresh patch and the frontier
+        #     pool was already empty (n_front == 0);
+        #   B **generated, then filtered** -- cells existed but a stage of the
+        #     frontier funnel (range -> size -> distance -> reachability ->
+        #     blacklist -> denied) took the pool to 0, or sweep had fresh floor
+        #     and still returned nothing;
+        #   C **generated and not taken** -- a pick came back and the frame still
+        #     ended with `target_res is None`.
+        #
+        # `strand_dump=False` is a bit-for-bit no-op: every write below is behind
+        # the flag.
+        self.strand_dump = as_bool(strand_dump)
+        self.strand_hist: List[dict] = []
+        self._last_front_bal: dict = {}
+        self._last_sweep_fresh_m2 = 0.0
         # do not go chasing doorways over a scrap of floor
         self.island_trigger_m2 = float(island_trigger_m2)
         self.n_island_probes = 0
@@ -1062,6 +1297,16 @@ class FrontierExplorer:
         # into the shared planner because the navigator must plan on the strict
         # mask -- a route it finds has to be a route the robot fits through.
         self.planner = PathPlanner(robot_radius=float(robot_radius), close_px=5)
+        # The B3 topological fuse asks "what would the reach be if this cell were
+        # not an obstacle", which means `free_space` gets called on maps that are
+        # deliberately wrong.  It must **not** share a planner with the driving
+        # path: `PathPlanner.free_space` caches on
+        # `(ground.sum, seen.sum, radius, close_px)` and hands back a whole mask,
+        # so a counterfactual evaluation that leaves the cache keyed on an
+        # amputated map can hand that map's mask to `_masks` -- the policy then
+        # drives on a map it never built.  Separate instance, separate cache.
+        self.fuse_planner = PathPlanner(robot_radius=float(robot_radius),
+                                        close_px=5)
         self.robot_radius = float(robot_radius)
         self.replan_every = int(replan_every)
         self._mask_key = None
@@ -1112,6 +1357,71 @@ class FrontierExplorer:
         free = wmap.ground & ~wmap.obstacle
         unknown = ~wmap.seen
         return free, unknown
+
+    def reach_cells(self, wmap, pose_xy) -> int:
+        """Robot's reachable component size, on the map exactly as it stands.
+
+        The hook `WorldMap._topo_fuse` calls (see `worldmap.OBSTACLE_TOPO_FUSE_M2`).
+        It is deliberately **not** `_masks`: the fuse mutates `obstacle` and
+        restores it, so anything that caches on the map's content would be
+        poisoned with a counterfactual answer -- and `_masks` *does* cache
+        (`_mask_key`, `_reach`, `_exterior`) and feeds the exploration budget.
+        A stale `_reach` there would silently change what "has work left" means.
+
+        `planner.free_space` caches too, on `(ground.sum, seen.sum, radius,
+        close_px)`; two candidate maps can collide on that key, so the cache is
+        switched **off** rather than invalidated by hand.  Switching it off also
+        skips the two full-array `.sum()` calls the key was built from -- 0.550 ms
+        per call, ~16% of a 2.73 ms evaluation, paid to produce a key that was
+        then discarded unseen (`docs/B3成本剖析_20261008.md`).  The returned mask
+        is identical either way, which `out/_b3_cachekey_check.py` asserts.  The
+        planner here is `fuse_planner`, **not** `self.planner` -- see its comment
+        in `__init__`.
+        """
+        pl = self.fuse_planner
+        pl.use_cache = False
+        # Read-only cost account (`worldmap.TopoFuseProfile`).  `None` unless the
+        # caller installed one; `free_space` then does no accounting at all.
+        prof = getattr(wmap, "topo_fuse_prof", None)
+        pl.prof = prof
+        if prof is not None:
+            prof.add("reach_calls", 1)
+        walk = pl.free_space(wmap)
+        if prof is not None:
+            # Start the clock **after** `free_space` returns.  Timing this from
+            # before the call folds the entire morphology bill into `t_cc`, and
+            # then the two stages add up to 146% of the loop -- which is how the
+            # first version of this instrument read.
+            _t = time.perf_counter()
+        n_lab, lab = cv2.connectedComponents(walk.astype(np.uint8),
+                                             connectivity=4)
+        if prof is not None:
+            prof.add("t_cc", time.perf_counter() - _t)
+            prof.add("cc_calls", 1)
+            _t = time.perf_counter()
+        n = walk.shape[0]
+        cx, cy = (int(v) for v in wmap.cell_of(*pose_xy))
+        seed = 0
+        if 0 <= cx < n and 0 <= cy < n and walk[cy, cx]:
+            seed = int(lab[cy, cx])
+        if seed == 0:
+            near = PathPlanner._nearest_free(walk, cx, cy)
+            if prof is not None:
+                prof.add("seed_nearest", 1)
+            if near[0] is not None:
+                seed = int(lab[near[1], near[0]])
+        if seed == 0:
+            counts = np.bincount(lab.ravel(), minlength=n_lab)
+            counts[0] = 0
+            if counts.any():
+                seed = int(np.argmax(counts))
+            if prof is not None:
+                prof.add("seed_maxcomp", 1)
+        if prof is not None:
+            # Everything after the flood fill: `bincount`/`argmax` when the seed
+            # has to be invented, plus the `lab == seed` reduction.
+            prof.add("t_seed", time.perf_counter() - _t)
+        return int((lab == seed).sum()) if seed else 0
 
     def _masks(self, wmap, pose_xy):
         """Recompute the reachable set and the exterior unknown, once per map.
@@ -1707,6 +2017,75 @@ class FrontierExplorer:
                     w[2] += 1
             out["by_path"] = {k: "%d picks, %d with >=2, %d with >=4" % tuple(v)
                               for k, v in sorted(by_where.items())}
+        # --- Gate C0: the size of the decision objects (see `_note_patch_stats`)
+        #
+        # Reported whether or not `fresh_split_m` is on, because the whole point
+        # of the gate is to compare "the object was 13 m" against "the object is
+        # <= 3 m" on the same instrument.  Absent when `patch_probe` is off, so a
+        # production run pays nothing.
+        if self.patch_hist:
+            one = np.array([p["span_max"] for p in self.patch_hist], np.float64)
+            num = np.array([p["n"] for p in self.patch_hist], np.float64)
+            sep = np.array([p["same_sep"] for p in self.patch_hist], np.float64)
+            ga = np.array([p["n_area"] for p in self.patch_hist], np.float64)
+            gp = np.array([p["n_pass"] for p in self.patch_hist], np.float64)
+            ar = np.array([p["area_med"] for p in self.patch_hist], np.float64)
+            asum = np.array([p["area_sum"] for p in self.patch_hist], np.float64)
+            cl = np.array([p["cells_lab"] for p in self.patch_hist], np.float64)
+            cs = np.array([p["cells_sum"] for p in self.patch_hist], np.float64)
+            out.update(n_patch_seen=len(self.patch_hist),
+                       patch_n_med=round(float(np.median(num)), 1),
+                       patch_n_max=int(num.max()),
+                       patch_area_med=round(float(np.median(ar)), 2),
+                       patch_area_tot_med=round(float(np.median(asum)), 2),
+                       patch_area_tot_p90=round(float(np.percentile(asum, 90)), 2),
+                       # the honest form of "was there anything on the table":
+                       # not the median number of qualifying objects, but how
+                       # often there was at least one.  A median of 0 is
+                       # compatible with "usually none" *and* with "usually one,
+                       # occasionally many", and those need different fixes.
+                       patch_ge_area_frac=round(float((ga >= 1).mean()), 3),
+                       patch_ge_area_p90=round(float(np.percentile(ga, 90)), 1),
+                       # must be 0: splitting an object may not lose a cell
+                       patch_cells_lost=int(cl.sum() - cs.sum()),
+                       patch_ge_area_med=round(float(np.median(ga)), 1),
+                       patch_pass_med=round(float(np.median(gp)), 1),
+                       patch_pass_frac=round(
+                           float(gp.sum() / max(1.0, num.sum())), 3),
+                       patch_pick_max_med=round(float(np.median(one)), 2),
+                       patch_pick_max=round(float(one.max()), 2),
+                       patch_same_sep_max=round(float(sep.max()), 2),
+                       patch_same_sep_med=round(float(np.median(sep)), 2))
+            # `spans` is empty only on a pick where `fresh` had no object at all;
+            # in that case saying "the largest object was 0.0 m" would read as a
+            # result, so the two span fields are simply absent.
+            real = [p["spans"] for p in self.patch_hist if p["spans"]]
+            if real:
+                every = np.concatenate([np.asarray(s, np.float64)
+                                        for s in real])
+                out.update(patch_span_max=round(float(every.max()), 2),
+                           patch_span_p95=round(
+                               float(np.percentile(every, 95)), 2))
+        # --- Gate V0: does the value discriminate (see `_note_value_spread`)
+        if self.value_hist:
+            rr = np.array([p["ratio"] for p in self.value_hist], np.float64)
+            nn = np.array([p["n"] for p in self.value_hist], np.float64)
+            vv = np.array([p["vmed"] for p in self.value_hist], np.float64)
+            oa = np.array([p["v_over_a_med"] for p in self.value_hist], np.float64)
+            multi = rr[nn >= 2]
+            out.update(n_value_seen=len(self.value_hist),
+                       val_n_med=round(float(np.median(nn)), 1),
+                       val_med=round(float(np.median(vv)), 3),
+                       # over the picks that had >= 2 objects to compare
+                       val_ratio_med=(round(float(np.median(multi)), 2)
+                                      if multi.size else None),
+                       val_ratio_p90=(round(float(np.percentile(multi, 90)), 2)
+                                      if multi.size else None),
+                       val_flat_frac=(round(float(np.mean(
+                           [p["flat"] for p in self.value_hist])), 3)),
+                       val_over_area_med=round(float(np.median(oa)), 3),
+                       val_over_area_p90=round(
+                           float(np.percentile(oa, 90)), 3))
         if self.local_margin:
             us = np.array([m["u_max"] for m in self.local_margin])
             spread = np.array([m["u_max"] - m["u_min"] for m in self.local_margin])
@@ -2488,6 +2867,113 @@ class FrontierExplorer:
                                     else self._linked) & ~vis
         return float(stranded.sum()) * wmap.resolution ** 2
 
+    def _strand_row(self, wmap, kind, tgt_none, front_pick=None,
+                    sw=(), reused=None) -> None:
+        """Append one row to the per-frame "why is there no target" account.
+
+        Read-only, and a no-op unless `strand_dump` is on.
+
+        It has to be called from **every** exit of `command()` that can end a
+        frame without a target.  The early `return`s in the `target_res is None`
+        branch happen *before* the normal record point, and those are exactly the
+        frames this instrument exists to explain: first version recorded 1368 of
+        1417 rows on the D1+D3 arm, and the 49 missing rows are the same 49
+        frames that carried an empty `target_kind`.
+
+        `sw` defaults to the string `"unset"` meaning "the sweep was never
+        asked"; passing `None` means "asked, and it had nothing" -- `-1` vs `1`
+        in the `sw_none` column.  Conflating the two would answer "there was
+        nothing to find" with "we did not look".  (First version used an empty
+        tuple as the sentinel, and `None` -- the *asked and empty* case -- then
+        read as `-1` too, i.e. exactly the conflation this docstring warns
+        about.)
+        """
+        if not self.strand_dump:
+            return
+        asked = sw != "unset"
+        row = dict(
+            frame=len(self.strand_hist),
+            stamp=round(float(self._last_stamp or 0.0), 3),
+            kind=str(kind),
+            reused=(-1 if reused is None else int(bool(reused))),
+            tgt_none=int(tgt_none),
+            front_pick=(-1 if front_pick is None else int(bool(front_pick))),
+            sw_none=(-1 if not asked else int(sw is None)),
+            sw_n=0,
+            stranded_m2=round(float(self._stranded_fresh(wmap)), 3),
+            linked_m2=(round(float(self._linked.sum()) * wmap.resolution ** 2, 3)
+                       if self._linked is not None else 0.0),
+            reach_m2=(round(float(self._reach.sum()) * wmap.resolution ** 2, 3)
+                      if self._reach is not None else 0.0),
+            sweep_fresh_m2=round(float(self._last_sweep_fresh_m2), 3))
+        if asked and isinstance(sw, (list, tuple)) and len(sw) > 3:
+            row["sw_n"] = int(sw[3])
+        for _k, _v in (self._last_front_bal or {}).items():
+            row["f_" + _k] = _v
+        self.strand_hist.append(row)
+
+    def _island_note(self, key: str, **kw) -> None:
+        """Record one early exit of `_pick_island_probe`.  No-op when off.
+
+        Every exit gets a name so that "the probe did not fire" can be attributed
+        to exactly one of: no linked patch (`no_linked`), the trip budget
+        (`capped`), everything it would aim at already visited (`all_visited`),
+        the beachhead smaller than `island_min_m2` (`no_probe`), **no single
+        patch** reaching `island_min_m2` (`no_patch`), or `plan()` failing on
+        every candidate (`plan_fail`).  Those six have six different fixes, and
+        before this counter existed we could not tell them apart.
+        """
+        if not self.island_probe:
+            return
+        self.island_diag[key] = self.island_diag.get(key, 0) + 1
+        if kw:
+            log = self.island_diag_log.setdefault(key, [])
+            if len(log) < 400:
+                log.append(kw)
+
+    def island_diag_report(self):
+        """Aggregate `island_probe` diagnostics, or `None` when it is off."""
+        if not self.island_probe:
+            return None
+        out = {"counts": dict(sorted(self.island_diag.items())),
+               "probes_chosen": int(self.n_island_probes),
+               "limit": int(self.island_probe_limit),
+               # D3's own counter: how many times a probe was declared finished
+               # because the robot was already standing at its goal.  A D3 arm
+               # that reports 0 here did not take effect, and that is
+               # indistinguishable from "D3 changed nothing".
+               "arrived": int(self.n_island_arrived),
+               "arrive_m": float(self.island_arrive_m),
+               "done_m": float(self.island_done_m),
+               # ★ Reported so that an A/B can **prove the treatment arm really
+               # turned the new counting on**.  A treatment arm that silently did
+               # not apply looks exactly like "the change made no difference",
+               # which is the failure this whole project has paid for twice.
+               "count_mode": str(self.island_probe_count),
+               "same_m": float(self.island_probe_same_m),
+               "min_m2": float(self.island_min_m2),
+               "link_m": float(self.island_link_m),
+               "trigger_m2": float(self.island_trigger_m2)}
+        np_log = self.island_diag_log.get("no_patch") or []
+        if np_log:
+            tot = [float(x.get("tot", 0.0)) for x in np_log]
+            mx = [float(x.get("max_patch", 0.0)) for x in np_log]
+            out["no_patch_beachhead_total_m2"] = dict(
+                med=round(float(np.median(tot)), 2),
+                p90=round(float(np.percentile(tot, 90)), 2),
+                max=round(float(max(tot)), 2))
+            out["no_patch_largest_patch_m2"] = dict(
+                med=round(float(np.median(mx)), 2),
+                max=round(float(max(mx)), 2))
+        pf = self.island_diag_log.get("plan_fail") or []
+        if pf:
+            out["plan_fail_attempts_med"] = round(
+                float(np.median([float(x.get("tried", 0)) for x in pf])), 1)
+        ok = self.island_diag_log.get("ok") or []
+        if ok:
+            out["ok_first20"] = ok[:20]
+        return out
+
     def _pick_island_probe(self, wmap, x0, y0):
         """Nearest unresolved doorway, as a target the planner can actually reach.
 
@@ -2501,12 +2987,23 @@ class FrontierExplorer:
         Bounded by `island_probe_limit`: a band that is genuinely a wall will
         never resolve, and without a cap the robot would keep going back to it.
         """
+        # A probe ends when the robot **stopped aiming at it last frame**.  Read
+        # `_prev_kind`, not `_target_kind`: see `command()` for why the latter is
+        # already this frame's sweep/frontier answer by the time we get here.
+        if (self.island_probe_count == "target"
+                and self._prev_kind != "island"):
+            self._island_note("goal_reset", kind=str(self._prev_kind))
+            self._island_goal = None
         if self._linked is None or self._probe is None:
+            self._island_note("no_linked")
             return None
         if self.n_island_probes >= self.island_probe_limit:
+            self._island_note("capped", n=self.n_island_probes)
             return None
         probe = self._probe & ~self._visited_mask(wmap)
         if not probe.any():
+            self._island_note("all_visited",
+                              tot=round(float(self._probe.sum()) * wmap.resolution ** 2, 3))
             return None
         # Aim at the cells **nearest to where the robot can already stand**, which
         # is what the docstring above has always claimed and the code did not do:
@@ -2526,7 +3023,18 @@ class FrontierExplorer:
         dt_reach = cv2.distanceTransform((~self._reach).astype(np.uint8),
                                         cv2.DIST_L2, 5)
         cell = wmap.resolution ** 2
+        # --- D1: the quantity the fix acts on --------------------------------
+        # `_ahead_clear` consults `blocked()` (not `obstacle`), so the goal has
+        # to be measured against that same layer -- otherwise "the goal moved
+        # somewhere safer" and "the throttle stopped calling it a wedge" are not
+        # statements about the same thing.
+        dt_bl = None
+        if self.island_standoff_m > 0.0:
+            dt_bl = (cv2.distanceTransform(
+                (~wmap.blocked()).astype(np.uint8), cv2.DIST_L2, 5)
+                * wmap.resolution)
         if int(probe.sum()) * cell < self.island_min_m2:
+            self._island_note("no_probe", tot=round(float(probe.sum()) * cell, 3))
             return None
         ys, xs = np.nonzero(probe)
         # **Aim at the nearest cell the robot can stand in**, not at the patch.
@@ -2556,6 +3064,13 @@ class FrontierExplorer:
         cand_labels = [int(L) for L in range(1, _np_)
                        if areas[L] >= self.island_min_m2]
         if not cand_labels:
+            # **The decisive number for "is `island_min_m2` the wrong scale?"**
+            # If the beachhead totals several m2 and still yields no patch, the
+            # gate is cutting one continuous beachhead into slivers.  If the total
+            # is itself under the gate, there is simply nothing there to aim at.
+            _big = float(areas[1:].max()) if _np_ > 1 else 0.0
+            self._island_note("no_patch", tot=round(float(probe.sum()) * cell, 3),
+                              max_patch=round(_big, 3), n_patch=int(_np_ - 1))
             return None
         cand_labels.sort(key=lambda L: -areas[L])     # biggest room first
         ys, xs = np.nonzero(probe)
@@ -2565,6 +3080,11 @@ class FrontierExplorer:
         reach = self._reach
         n = reach.shape[0]
         tried = 0
+        # D3: candidates refused because the probe was already done, or already
+        # arrived at.  Kept apart from `plan_fail` so the diagnostic does not
+        # read "the planner cannot route to this doorway" when the truth is
+        # "this doorway is finished".
+        d3_skips = 0
         for L in cand_labels:
             m = lab_of == L
             # inside the patch: closest to standing room, then closest to the robot
@@ -2575,6 +3095,10 @@ class FrontierExplorer:
                 tried += 1
                 py, pxx = int(ys[i]), int(xs[i])
                 r = int(dt_reach[py, pxx]) + 2
+                if dt_bl is not None:
+                    # The window must reach past the standoff ring, or the
+                    # filter below finds nothing and falls back every time.
+                    r += int(round(self.island_standoff_m / wmap.resolution)) + 2
                 y0w, y1w = max(py - r, 0), min(py + r + 1, n)
                 x0w, x1w = max(pxx - r, 0), min(pxx + r + 1, n)
                 wy_, wx_ = np.nonzero(reach[y0w:y1w, x0w:x1w])
@@ -2583,11 +3107,92 @@ class FrontierExplorer:
                 wy_ = wy_ + y0w
                 wx_ = wx_ + x0w
                 j = int(np.argmin((wx_ - pxx) ** 2 + (wy_ - py) ** 2))
+                if dt_bl is not None:
+                    # --- D1: re-rank the cells in this window -----------------
+                    # Keep only standing room at least `island_standoff_m` from
+                    # any blocked cell, then take the cell closest to the
+                    # standoff ring (smallest detour that clears the
+                    # constraint), tie-broken by closeness to the doorway and
+                    # then to the robot.  The window is still centred on this
+                    # doorway, so what is on offer still faces *it* -- only
+                    # further back.
+                    d_ = dt_bl[wy_, wx_]
+                    ok_ = d_ >= self.island_standoff_m
+                    if ok_.any():
+                        _wy, _wx = wy_[ok_], wx_[ok_]
+                        # Facing the doorway first -- the smallest step back from
+                        # the beachhead that still clears the constraint -- then
+                        # nearest the robot.  `np.lexsort` sorts by the **last**
+                        # key first.
+                        #
+                        # Ranking by "closest to the standoff ring" was built
+                        # first and **measured wrong**: standing room under the
+                        # robot's own feet already clears 0.8 m, so the goal came
+                        # out 0.37 m away, i.e. under the robot and pointing at
+                        # nothing, and the probe died in 11 frames.  The standoff
+                        # is a **constraint, not an objective**; the objective
+                        # stays "get as close to this doorway as is allowed".
+                        j = int(np.lexsort((
+                            np.hypot(_wx - x0, _wy - y0),
+                            (_wx - pxx) ** 2 + (_wy - py) ** 2))[0])
+                        wy_, wx_ = _wy, _wx
+                    else:
+                        # Nothing in `reach` clears the standoff while still
+                        # facing this doorway.  Keep the standing choice rather
+                        # than refusing the probe -- and count it, because a
+                        # silent fallback looks exactly like "D1 did nothing".
+                        self._island_note("standoff_fallback",
+                                          patch_m2=round(
+                                              float((lp == L).sum()) * cell, 3))
                 gx = (int(wx_[j]) + 0.5) * wmap.resolution - wmap.extent
                 gy = (int(wy_[j]) + 0.5) * wmap.resolution - wmap.extent
+                # --- D3: has this doorway already been dealt with? -----------
+                # Both checks sit **before** `plan()`: an arrival needs no route,
+                # and planning one only to throw it away is work that shows up as
+                # a cost with no effect.
+                if self.island_arrive_m > 0.0:
+                    if any((gx - bx) ** 2 + (gy - by) ** 2
+                           <= self.island_done_m ** 2
+                           for bx, by in self._island_done):
+                        self._island_note("done_skip")
+                        d3_skips += 1
+                        continue
+                    d_here = float(np.hypot(gx - x0, gy - y0))
+                    if d_here <= self.island_arrive_m:
+                        # Already standing at it.  The probe exists to make the
+                        # robot look through the doorway, and from here it has.
+                        # Remember the place so the next pick cannot aim back at
+                        # it, and let the run get on with something else.
+                        self._island_done.append((float(gx), float(gy)))
+                        self.n_island_arrived += 1
+                        self._island_note("arrived", d=round(d_here, 2))
+                        d3_skips += 1
+                        continue
                 path = self.planner.plan(wmap, (x0, y0), (gx, gy))
                 if path:
                     self.n_plans += 1
+                    # --- count this probe -------------------------------------
+                    # Moved here from the two call sites so that "one probe" is
+                    # decided in one place.  Equivalent under `"frame"`: the
+                    # callers increment exactly when this returns, and only when
+                    # it returns.
+                    counted = True
+                    if self.island_probe_count == "target":
+                        g = self._island_goal
+                        counted = (g is None
+                                   or float(np.hypot(gx - g[0], gy - g[1]))
+                                   > self.island_probe_same_m)
+                    if counted:
+                        self.n_island_probes += 1
+                    self._island_goal = (float(gx), float(gy))
+                    self._island_note(
+                        "ok",
+                        t=round(float(self._last_stamp or 0.0), 1),
+                        goal=(round(float(gx), 2), round(float(gy), 2)),
+                        to_robot=round(float(np.hypot(gx - x0, gy - y0)), 2),
+                        patch_m2=round(float((lp == L).sum()) * cell, 3),
+                        n_patch=int(len(cand_labels)),
+                        counted=bool(counted))
                     # `sw[3]` is reported as `candidates` alongside the other
                     # target kinds, so it is a cell count -- the size of the
                     # patch behind this doorway, which is the thing that made it
@@ -2595,6 +3200,11 @@ class FrontierExplorer:
                     return float(gx), float(gy), path, int((lp == L).sum())
             if tried >= self.max_plans_per_pick:
                 break
+        if d3_skips and d3_skips >= tried:
+            self._island_note("done_exhausted", n=int(d3_skips))
+        else:
+            self._island_note("plan_fail", tried=int(tried),
+                              n_patch=int(len(cand_labels)))
         return None
 
     def _is_denied(self, x: float, y: float) -> bool:
@@ -2606,6 +3216,321 @@ class FrontierExplorer:
 
     def _deny(self, x: float, y: float) -> None:
         self._denied.append((float(x), float(y)))
+
+    def _fold(self, value: float, d: float) -> float:
+        """Travel-cost folding.  `disc_lambda <= 0` is the standing `value/(1+d)`.
+
+        One function rather than three edited expressions, because the point of
+        the switch is that the *only* thing that changes between arms is this
+        line -- so every picker that ranks by "how much is there, discounted by
+        how far it is" has to move together.  If only one picker moved, an arm
+        difference could be produced by two of them disagreeing rather than by
+        the shape itself, which is exactly the confound section 34 paid for
+        (`rfirst` + `K=4` + `sectors` moving as one).
+        """
+        if self.disc_lambda > 0.0:
+            # `value * exp(-lambda * d)` -- the LRAE / FAEL form (their
+            # `computeUnity`: `gain * exp(-lambda * cumulative_cost)`,
+            # `lambda = 3.0`).  The `value` factor is the whole point: it is a
+            # *discount*, not a replacement for the value.
+            return float(value) * float(np.exp(-self.disc_lambda * float(d)))
+        return value / (1.0 + float(d))
+
+    # ---- the size of a decision object ------------------------------------
+    @staticmethod
+    def _hull(pts):
+        """Convex hull of a small point set, counter-clockwise.
+
+        Andrew's monotone chain.  Spelled out rather than imported because the
+        shipped runtime is numpy + cv2 + onnxruntime (the same reason
+        `_pick_shadow_target` refuses scipy): a diagnostic must not be able to
+        stop the delivered pipeline from starting, and this one is only ever
+        reached when it is switched on.
+        """
+        p = sorted((float(a), float(b)) for a, b in pts)
+        if len(p) <= 2:
+            return p
+
+        def half(ps):
+            h = []
+            for q in ps:
+                while len(h) >= 2:
+                    (ax, ay), (bx, by) = h[-2], h[-1]
+                    if ((bx - ax) * (q[1] - ay)
+                            - (by - ay) * (q[0] - ax)) <= 0.0:
+                        h.pop()
+                    else:
+                        break
+                h.append(q)
+            return h
+
+        lo = half(p)
+        up = half(reversed(p))
+        return lo[:-1] + up[:-1]
+
+    @classmethod
+    def _diameter(cls, pts, res: float) -> float:
+        """Largest pairwise distance inside a set of cells, in metres, exactly.
+
+        Exact rather than "the bounding box", because the claim this feeds is a
+        bound (`<= fresh_split_m`) and a box would over-report a diagonal room --
+        blurring the one number under test.  Hull first: an object can be
+        thousands of cells while its hull is dozens, so the quadratic pass is
+        only used where it is cheap.
+        """
+        n = len(pts)
+        if n <= 1:
+            return 0.0
+        q = (np.asarray(pts, np.float64) * float(res) if n <= 64
+             else np.asarray(cls._hull(pts), np.float64) * float(res))
+        if len(q) <= 1:
+            return 0.0
+        dx = q[:, 0][:, None] - q[:, 0][None, :]
+        dy = q[:, 1][:, None] - q[:, 1][None, :]
+        return float(np.hypot(dx, dy).max())
+
+    def _split_fresh(self, lab, fresh, depth, wmap):
+        """Re-label `fresh` so every piece has diameter <= `fresh_split_m`.
+
+        Why the *diameter* and not a merge distance.  The defect section 49
+        measured is that one object offered places 9.8-13.2 m apart; a rule that
+        only limits how far a cluster may grow hop by hop (single linkage) would
+        allow exactly that, because a corridor is a chain of short hops.  The
+        bound has to be on any **pair** inside a piece, which is complete linkage
+        -- the same property `_cluster_rows` gives the region layer, and the same
+        reason it is written there.
+
+        Greedy, deterministic, and conservative on purpose: repeatedly take a
+        seed cell, and let its piece be every remaining cell within
+        `fresh_split_m / 2` of it, restricted to the seed's own connected
+        component (a piece must stay a *connected* piece of floor, and a disc is
+        Euclidean -- without that restriction it would reach across a wall).
+        Any two cells of such a piece are at most `fresh_split_m` apart, so the
+        bound holds **by construction** and not by measurement -- which is what
+        makes the follow-up checkable ("the point layer cannot move the target
+        more than `fresh_split_m` inside one object") instead of statistical.
+
+        The **first** seed is the deepest cell in the map, which keeps the
+        standing behaviour's intent: `gather` aims a patch at its deepest cell,
+        so the piece owning the deepest cell is anchored exactly where the
+        un-split patch was anchored, and its candidates are the ones the old code
+        would have offered first.
+
+        Every seed after that is the **farthest remaining cell from what is
+        already covered** -- the max of a distance transform of the uncovered
+        set.  Seeding on `depth` again was the first version and it is measurably
+        wrong: since `depth` is largest in the middle of a room, the second seed
+        lands on the rim of the first disc (still the deepest uncovered cell), the
+        third on the rim of that, and so on, tiling a 6 x 4 m room into sixteen
+        ragged crescents instead of the four balls a cover needs.  A coverage
+        radius is a *position* rule, so the second seed has to be chosen by
+        position, not by how deep the floor is.  Measured on the same three
+        shapes (`out/_split_unit.py`): sixteen pieces become four, and the bound
+        is unchanged.
+
+        Seeding this way also keeps the greedy within a constant factor of the
+        fewest pieces possible (it is the standard farthest-point k-centre
+        heuristic), which matters because every extra piece is an extra object
+        competing for `sweep_min_m2` -- and "the objects got smaller so fewer are
+        eligible" is the one way this change could make the candidate count
+        *fall*.
+
+        Conservative in the other direction too: the radius is
+        `fresh_split_m / 2`, the radius of a **ball**, not of the largest shape
+        that fits.  So it may cut a piece a perfect clustering would have kept.
+        That direction is the safe one: the failure it can produce is "more,
+        smaller objects", which the candidate count reads directly, while the
+        failure of cutting too little is the 13 m object this exists to remove.
+        """
+        res = float(wmap.resolution)
+        r_px = max(1, int(round(self.fresh_split_m * 0.5 / res)))
+        ys0, xs0 = np.nonzero(fresh)
+        if ys0.size == 0:
+            m = int(lab.max()) + 1
+            return m, lab, np.bincount(lab.ravel(), minlength=m)
+        # Work inside the bounding box of `fresh`: on a 600 x 600 map the cells
+        # outside it are most of the array, and this runs on every frame.
+        y0b, y1b = int(ys0.min()), int(ys0.max()) + 1
+        x0b, x1b = int(xs0.min()), int(xs0.max()) + 1
+        sub = np.ascontiguousarray(fresh[y0b:y1b, x0b:x1b], dtype=bool)
+        comp = np.ascontiguousarray(lab[y0b:y1b, x0b:x1b], np.int32)
+        dsub = np.asarray(depth, np.float64)[y0b:y1b, x0b:x1b]
+        h, w = sub.shape
+        yy, xx = np.mgrid[-r_px:r_px + 1, -r_px:r_px + 1]
+        disc = (yy * yy + xx * xx) <= r_px * r_px
+        dy, dx = yy[disc], xx[disc]
+        rem = sub.copy()
+        out = np.zeros((h, w), np.int32)
+        k = 0
+        first = True
+        while rem.any():
+            if first:
+                field = np.where(rem, dsub, -1.0)
+                j = int(np.argmax(field))
+                if field.reshape(-1)[j] < 0.0:
+                    break                  # nothing left to seed from
+                first = False
+            else:
+                # `DIST_L2` on the uncovered set: each remaining cell's distance
+                # to the nearest cell that is already covered, so its maximum is
+                # the point furthest from everything settled -- exactly the next
+                # k-centre seed.
+                dt = cv2.distanceTransform(rem.astype(np.uint8),
+                                           cv2.DIST_L2, 5)
+                j = int(np.argmax(dt))
+                if dt.reshape(-1)[j] <= 0.0:
+                    break
+            cy, cx = divmod(j, w)
+            ry, rx = cy + dy, cx + dx
+            ok = (ry >= 0) & (ry < h) & (rx >= 0) & (rx < w)
+            ry, rx = ry[ok], rx[ok]
+            own = comp[ry, rx] == comp[cy, cx]
+            ry, rx = ry[own], rx[own]
+            hit = rem[ry, rx]
+            ry, rx = ry[hit], rx[hit]
+            if ry.size == 0:               # the seed always survives; belt+braces
+                rem[cy, cx] = False
+                continue
+            k += 1
+            out[ry, rx] = k
+            rem[ry, rx] = False
+        full = np.zeros(lab.shape, np.int32)
+        full[y0b:y1b, x0b:x1b] = out
+        n = k + 1
+        return n, full, np.bincount(full.ravel(), minlength=n)
+
+    def _note_patch_stats(self, lab, cands, wmap, depth) -> None:
+        """Gate C0: how large the objects on the table were, in metres.
+
+        The candidate-count table (`_note_pick_size`) says whether the ranking
+        had anything to rank; this says *why*.  Both halves of section 49's
+        finding are read off it:
+
+        * `span_max` / `span_p95` over every object of `fresh` -- the 13 m
+          diameter that made one object offer places a house apart, and the
+          number `fresh_split_m` is supposed to bound;
+        * `same_sep` -- the largest distance between two places taken from the
+          *same* object at this decision.  That is the 9.8-13.2 m first-switch
+          reading in its own units, before it is confused with a trajectory;
+        * `area_max` -- so "more objects" can be told apart from "the same
+          objects, cut up" and from "objects so small nothing is eligible".
+
+        It measures the map, not the decision, so it is identical between a
+        control and a treatment arm whenever the treatment does not change the
+        objects; that is what makes the row a control as well as a reading.
+        """
+        if not self.patch_probe:
+            return
+        res = float(wmap.resolution)
+        cell = res * res
+        dflat = np.asarray(depth, np.float64)
+        # --- why an object did *not* become a candidate --------------------
+        #
+        # `gather` keeps an object only if `area >= sweep_min_m2` **and** its
+        # deepest cell is at least `sweep_min_dist` from anything visited.  Those
+        # are the two numbers that decide whether "more objects" becomes "more
+        # candidates", and they are exactly the ones a size bound collides with:
+        # a piece cut to 3 m across is at most 7.07 m2, so most *partial* pieces
+        # fall under the 3.0 m2 gate that the single whole-house object passed
+        # trivially.  Counted here, on the objects themselves, so this is a
+        # reading rather than a story about the code.
+        min_area = float(self.sweep_min_m2)
+        min_dep = float(self.sweep_min_dist) / res
+        ys, xs = np.nonzero(lab)
+        spans: List[float] = []
+        areas: List[float] = []
+        n_area = 0
+        n_pass = 0
+        cells_sum = 0
+        if ys.size:
+            ls = lab[ys, xs]
+            o = np.argsort(ls, kind="stable")
+            ls, ys, xs = ls[o], ys[o], xs[o]
+            top = int(ls[-1])
+            edges = np.searchsorted(ls, np.arange(1, top + 2), side="left")
+            for L in range(1, top + 1):
+                a, b = int(edges[L - 1]), int(edges[L])
+                if b <= a:
+                    continue
+                area = (b - a) * cell
+                cells_sum += (b - a)
+                spans.append(round(self._diameter(
+                    list(zip(xs[a:b].tolist(), ys[a:b].tolist())), res), 3))
+                areas.append(round(area, 3))
+                if area < min_area:
+                    continue
+                n_area += 1
+                if float(dflat[ys[a:b], xs[a:b]].max()) >= min_dep:
+                    n_pass += 1
+        by_obj: dict = {}
+        for c in cands:
+            by_obj.setdefault(c[5], []).append((float(c[2]), float(c[3])))
+        same_sep = 0.0
+        for ps in by_obj.values():
+            if len(ps) >= 2:
+                same_sep = max(same_sep, self._diameter(ps, 1.0))
+        self.patch_hist.append(dict(
+            t=round(float(self._last_stamp or 0.0), 1), n=len(spans),
+            n_area=n_area, n_pass=n_pass,
+            # conservation: splitting an object must not lose a cell, and the
+            # two numbers below are the whole of that check.  Without it a
+            # splitter that quietly dropped cells would look like "the objects
+            # got smaller", which is the direction the gate is looking for.
+            cells_lab=int((lab > 0).sum()),
+            cells_sum=int(cells_sum),
+            span_max=(round(max(spans), 3) if spans else 0.0),
+            span_p95=(round(float(np.percentile(spans, 95)), 3)
+                      if spans else 0.0),
+            area_max=(round(max(areas), 3) if areas else 0.0),
+            area_med=(round(float(np.median(areas)), 3) if areas else 0.0),
+            area_sum=round(float(sum(areas)), 3),
+            same_sep=round(same_sep, 3), spans=spans))
+        if len(self.patch_hist) > 600:
+            del self.patch_hist[:300]
+
+    def _note_value_spread(self, cands, cell) -> None:
+        """Gate V0: does the value term actually distinguish the objects?
+
+        Boss, 2026-10-07 (section 50.7 option 1): the next cut is the *value*, not
+        the size.  The whole risk of that experiment is the failure mode section 49
+        already paid for once -- a term with no spread makes the ranking
+        *degenerate*, and a degenerate term reads as "the mechanism was inert"
+        when the truth is "there was nothing to rank".  So this is measured before
+        any decision is read.
+
+        Recorded per pick, over the **patches on the table** (not the places: the
+        value is a property of the patch, see `sweep_value_mode`):
+
+        * `n` and `vmin/vmax/vmed` -- the raw values;
+        * `ratio = vmax/vmin` -- the spread, the same shape as `u_spread_med`;
+        * `flat` -- every patch carried the same value, so this pick's ranking was
+          decided by `d0` alone;
+        * `v_over_a_med` -- the median of `value / patch_area`.  This is the one
+          that guards against a **silent no-op**: if the new value is a constant
+          multiple of the area it replaced, the arm is not testing a different
+          value, it is testing the same one through extra arithmetic.  It must not
+          sit at a constant.
+        """
+        if not self.patch_probe:
+            return
+        by_obj: dict = {}
+        for c in cands:
+            by_obj[c[5]] = (float(c[23]), float(c[4]) * cell)
+        if not by_obj:
+            return
+        vals = np.array([v for v, _ in by_obj.values()], np.float64)
+        ars = np.array([a for _, a in by_obj.values()], np.float64)
+        vmin, vmax = float(vals.min()), float(vals.max())
+        ratio = (vmax / vmin) if vmin > 0.0 else (1e3 if vmax > 0.0 else 1.0)
+        self.value_hist.append(dict(
+            t=round(float(self._last_stamp or 0.0), 1), n=len(vals),
+            vmin=round(vmin, 3), vmax=round(vmax, 3),
+            vmed=round(float(np.median(vals)), 3),
+            ratio=round(min(ratio, 1e3), 3),
+            flat=bool(vmax <= vmin + 1e-12),
+            v_over_a_med=round(float(np.median(vals / np.maximum(ars, 1e-9))), 3)))
+        if len(self.value_hist) > 600:
+            del self.value_hist[:300]
 
     def _rank_key(self, score: float, d: float, px: float, py: float,
                   cx: float = None, cy: float = None,
@@ -2709,6 +3634,13 @@ class FrontierExplorer:
             k = max(1, int(round(self.sweep_radius / wmap.resolution)))
             c = wmap.cell_of(x0, y0)
             cv2.circle(fresh.view(np.uint8), (int(c[0]), int(c[1])), k, 0, -1)
+        # Read-only: how much "walkable floor neither reached nor visited" was
+        # on offer when the sweep was asked.  `> 0` with a `None` return is the
+        # B case ("generated, then filtered"); `== 0` is the A case ("nothing
+        # was there").  Measured after the robot's own footprint is punched out,
+        # because that footprint is what the frame-one guard removes.
+        if self.strand_dump:
+            self._last_sweep_fresh_m2 = float(fresh.sum()) * wmap.resolution ** 2
         if not fresh.any():
             return None
         n, lab = cv2.connectedComponents(fresh.astype(np.uint8), connectivity=8)
@@ -2719,6 +3651,21 @@ class FrontierExplorer:
         sx, sy = self._start_xy if self._start_xy is not None else (x0, y0)
         depth = self._fresh_depth(wmap)
         min_depth = self.sweep_min_dist / wmap.resolution
+
+        # --- the one line that changes what a "decision object" is -----------
+        #
+        # Boss, 2026-10-07 (docs section 49): "only add complete-linkage to
+        # `fresh`, `link_m = 3.0 m` -- nothing else."  Everything downstream of
+        # this point takes `lab` / `n` / `sz` as given and knows nothing about
+        # where they came from, so cutting the components up here changes the
+        # object granularity and *only* the object granularity: `gather`, the
+        # patch score, `patch_points`, the survey filter, `rfirst` and the
+        # fallbacks all keep operating on "a patch" exactly as before.
+        #
+        # `fresh_split_m = 0` skips the call rather than making it a no-op, so
+        # the standing behaviour is not merely equivalent but the same code.
+        if self.fresh_split_m > 0.0:
+            n, lab, sz = self._split_fresh(lab, fresh, depth, wmap)
 
         # Which patches are eligible: the locked one alone, or all of them.
         # The lock is followed by **overlap**, not by label -- connected-
@@ -2818,6 +3765,34 @@ class FrontierExplorer:
                 return 0.0
             return float(fresh[ys_i[ok], xs_i[ok]].sum()) * cell
 
+        # --- the value term, when it is "what you can see from where you stand"
+        #
+        # The same masked sum, on the same mask, with the radius the experiment is
+        # about.  Separate from `local_unfinished` on purpose: that one is the
+        # *candidate-level* term (`cand_local_lambda`, default 0) and its radius
+        # (`cand_local_radius_m`) is part of that term.  Reusing one for the other
+        # would make two knobs move together, which is exactly the confound
+        # section 34 paid for.
+        #
+        # The quantity is read at the **patch anchor** -- the place the robot would
+        # actually drive to -- not at each of a patch's places.  Keeping it one
+        # number per patch is what holds the `sweep_cands_per_patch = 4` change at
+        # one variable (section 49): "which of these places do I go to" stays a
+        # question about where they are, never about what they are worth.
+        _v_px = max(1, int(round(self.sweep_view_r_m / wmap.resolution)))
+        _vdy, _vdx = np.mgrid[-_v_px:_v_px + 1, -_v_px:_v_px + 1]
+        _voff = np.argwhere((_vdy * _vdy + _vdx * _vdx) <= _v_px * _v_px) - _v_px
+
+        def view_floor(px: float, py: float) -> float:
+            """m2 of never-visited floor within `sweep_view_r_m` of `(px, py)`."""
+            cxx, cyy = wmap.cell_of(px, py)
+            xs_i = int(cxx) + _voff[:, 1]
+            ys_i = int(cyy) + _voff[:, 0]
+            ok = (xs_i >= 0) & (xs_i < _nx) & (ys_i >= 0) & (ys_i < _ny)
+            if not ok.any():
+                return 0.0
+            return float(fresh[ys_i[ok], xs_i[ok]].sum()) * cell
+
         def gather(labels, min_area, keep=None):
             out = []
             rows = []
@@ -2850,7 +3825,14 @@ class FrontierExplorer:
                 # nowhere else.  `base` already carries the unfinished *amount*
                 # (the patch area) and the travel cost (the `1/(1+d)`), so what
                 # the debt adds is the *time*.
-                base = ncell * cell / (1.0 + d0)
+                # The value term.  `"area"` is the standing expression, character
+                # for character; `"view"` scores the patch by the never-visited
+                # floor around the place the robot would actually stand at.  See
+                # the note on `sweep_value_mode` in `__init__` for why this is the
+                # *only* thing this arm changes.
+                val = (view_floor(tx_anchor, ty_anchor)
+                       if self.sweep_value_mode == "view" else ncell * cell)
+                base = self._fold(val, d0)
                 idle_s = self._debt_idle_of_patch(ys, xs)
                 w = self.debt_lambda * self._debt_f(idle_s)
                 score = base * (1.0 + w)
@@ -2911,7 +3893,7 @@ class FrontierExplorer:
                         # the patch debt, so the two are one variable apart.
                         r_t = score * r_dhat
                     rows.append(dict(px=px, py=py, cd=cd, lu=lu, u_term=u_term,
-                                     d0=d0, ncell=ncell, L=L, base=base,
+                                     d0=d0, ncell=ncell, L=L, base=base, val=val,
                                      ax=tx_anchor, ay=ty_anchor, bonus=bonus,
                                      idle_s=idle_s, w=w, score=score,
                                      score_r=score + self.region_lambda * r_t,
@@ -3020,13 +4002,15 @@ class FrontierExplorer:
                     # point-level swap that changes `c[22]` is impossible by
                     # construction (`_ckey`), so any move between regions in the
                     # record is the region layer's doing and nothing else.
-                    ci))              # 22  the region's rank
+                    ci,               # 22  the region's rank
+                    r["val"]))        # 23  the raw *value* term, before folding
             # Region first, then the old key.  With `rfirst` off every `c[22]`
             # is 0, so this is the same total order the policy had before --
             # and with it on, the point key is only ever reached inside one
             # region.  Both are quantised, so two patches a few percent apart
             # still cannot change places on a floating-point hiccup.
             out.sort(key=lambda c: (c[22], c[0]))
+            self._note_value_spread(out, cell)
             self.last_sweep_cands = out
             return out
 
@@ -3098,6 +4082,7 @@ class FrontierExplorer:
         else:
             cands = (unfiltered if unfiltered is not None
                      else gather(range(1, n), self.sweep_min_m2))
+        self._note_patch_stats(lab, cands, wmap, depth)
         self._note_pick_size("survey" if survey_pick else
                              ("locked" if locked else "global"),
                              cands, x0, y0)
@@ -3478,7 +4463,7 @@ class FrontierExplorer:
             # same window bonus to these candidates as to the sweep's and it only
             # made the term noisier: a point-like candidate can never express
             # "a large unfinished region" (see the note on `debt_lambda`).
-            score = area / (1.0 + d0)
+            score = self._fold(area, d0)
             cands.append((self._rank_key(score, d0, vx, vy),
                           vx, vy, mx, my, int(sz[L])))
         cands.sort(key=lambda c: c[0])
@@ -3685,6 +4670,15 @@ class FrontierExplorer:
             pool = [i for i in pool if not self._is_denied(float(wx[i]),
                                                            float(wy[i]))]
         n_den = len(pool)
+        # Read-only, **every** frame (not only when the pool is empty): the pool
+        # shrinks through exactly these stages, so the first stage that reads 0
+        # names the filter that emptied it.  "Which stage killed it" and "was
+        # there anything there at all" are different questions.
+        if self.strand_dump:
+            self._last_front_bal = dict(
+                n_front=int(np.size(ys)), n_in_range=int(len(in_range)),
+                n_big=int(n_big), n_far=int(n_far), n_fu=int(n_fu),
+                n_bl=int(n_bl), n_den=int(n_den))
         if not pool:
             # **Which filter emptied the pool.**  "No candidates" is the trigger
             # the fallback design (§39) is built on, and "the pool was empty" is
@@ -3713,7 +4707,7 @@ class FrontierExplorer:
             # Quantised: see `_rank_key`.  The frontier score has the same
             # near-tie problem as the sweep and shadow scores -- `size/(1+d)`
             # between a 30-cell and a 31-cell cluster is a coin flip.
-            return self._rank_key(fsize[i] / (1.0 + dist[i]), float(dist[i]),
+            return self._rank_key(self._fold(fsize[i], dist[i]), float(dist[i]),
                                   float(wx[i]), float(wy[i]))
 
         reps = {}
@@ -4015,6 +5009,24 @@ class FrontierExplorer:
         # `__init__`: the region reachability gate plans each region's
         # representative and `_plan_first` then tries the same places again, so
         # without this cache the same A* search would run twice for every accept.
+        # What the **previous frame** ended up aiming at.
+        #
+        # `_target_kind` cannot be read for this from inside the frame: the
+        # sweep/frontier stage sets it before the island probe gets its turn, so
+        # "the last frame was not an island probe" came out true on *every* island
+        # frame and every probe looked like a new one (measured: 44 resets for 44
+        # calls).  Saved here, before anything in this frame can overwrite it.
+        self._prev_kind = self._target_kind
+        # Read-only (`strand_dump`): did the frontier picker come back with a
+        # cell this frame?  None = that stage was not reached at all; the
+        # difference between "generated and thrown away" (C) and "never asked"
+        # is exactly this.
+        front_pick_ok = None
+        if self.strand_dump:
+            # Reset per frame: a stage that was **not reached** must read as
+            # "not asked" (-1 / absent), never as last frame's answer.
+            self._last_front_bal = {}
+            self._last_sweep_fresh_m2 = -1.0
         self._plan_cache = {}
 
         # ---- stagnation guard, before anything else --------------------------
@@ -4364,17 +5376,27 @@ class FrontierExplorer:
             # one trip, and `island_probe_limit` caps the whole thing in case the
             # band turns out to be a wall that will never resolve.
             used_probe = False
+            if self.island_probe and sw is None:
+                self._island_note("path1_no_sweep")
             # A blind spot in mapped space outranks a sweep -- see the block
             # above, which is where that decision is actually made.
             if sw is not None:
                 stranded = self._stranded_fresh(wmap)
+                if self.island_probe:
+                    self._island_note(
+                        "path1_stranded_ge_trigger"
+                        if stranded >= self.island_trigger_m2
+                        else "path1_stranded_small",
+                        stranded=round(float(stranded), 2))
                 if stranded >= self.island_trigger_m2:
                     probe = self._pick_island_probe(wmap, x0, y0)
                     if probe is not None:
                         sw = probe
                         used_probe = True
                         used_shadow = False
-                        self.n_island_probes += 1
+                        # `n_island_probes` is incremented inside
+                        # `_pick_island_probe`, so "one probe" is defined in
+                        # exactly one place (see `island_probe_count`).
             if sw is not None:
                 target_res = (sw[0], sw[1])
                 route = sw[2]
@@ -4390,6 +5412,7 @@ class FrontierExplorer:
                 pick, route, n_cand = self._pick_target(
                     wmap, x0, y0, yaw, (x0, y0), wx, wy, dist, fsize,
                     in_range, xs, ys, front, frontier_used)
+                front_pick_ok = pick is not None
                 target_res = None
                 if pick is not None:
                     # The frontier is what we mean to *look at*; the viewpoint is
@@ -4411,12 +5434,13 @@ class FrontierExplorer:
                 # room was outside `reach`) and the robot orbited the living room
                 # for the rest of the run while four rooms' worth of floor sat
                 # untouched behind their doors.
+                if self.island_probe:
+                    self._island_note("path2_called")
                 sw = self._pick_island_probe(wmap, x0, y0)
                 if sw is not None:
                     target_res = (sw[0], sw[1])
                     route = sw[2]
                     self._target_kind = "island"
-                    self.n_island_probes += 1
                     n_cand = sw[3]
             if target_res is None and self.fb_relax > 0:
                 # ---- the relax ladder: last question before `search` --------
@@ -4453,6 +5477,12 @@ class FrontierExplorer:
                         bl_places=len(self._barren_spots),
                         denied=(len(self._denied) if self._denied else 0)))
             if target_res is None:
+                # **This is the frame the account exists for.**  Every exit
+                # below ends the frame with no target, so the balance is
+                # recorded here, before any of them fires.
+                self._strand_row(wmap, kind="(none)", tgt_none=1,
+                                 front_pick=front_pick_ok, sw=sw,
+                                 reused=False)
                 self._target = None
                 self._target_anchor = None
                 self._target_standoff = False
@@ -4581,6 +5611,18 @@ class FrontierExplorer:
                      "wedge": bool(mode == "wedge"),
                      "route_m": round(path_length(route), 2) if route else 0.0,
                      "routed": bool(route)})
+
+        # One row per frame: **given that `_stranded_fresh` floor exists, why did
+        # this frame end with no target?**  Reached only when the frame kept its
+        # target; the "no target" exits record themselves earlier (see
+        # `_strand_row`).
+        _L = locals()
+        self._strand_row(
+            wmap, kind=self._target_kind,
+            tgt_none=(-1 if _L.get("target_res") is None else 0),
+            front_pick=_L.get("front_pick_ok"),
+            sw=(_L["sw"] if "sw" in _L else ()),
+            reused=_L.get("reuse"))
 
         # --- stuck recovery -------------------------------------------------
         #

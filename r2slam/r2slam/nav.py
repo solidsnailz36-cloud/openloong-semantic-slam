@@ -27,6 +27,7 @@ from __future__ import annotations
 import difflib
 import heapq
 import re
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -453,6 +454,27 @@ class PathPlanner:
         self.close_px = int(close_px)
         self._cache_key = None
         self._cache_free = None
+        # Whether `free_space` may serve a cached mask.  `False` is for a caller
+        # that mutates the map between calls and would therefore always miss:
+        # `FrontierExplorer.reach_cells` does exactly that (the B3 fuse flips one
+        # cell, re-derives `ground` and asks again), and it used to force a miss
+        # by hand with `pl._cache_key = None`.
+        #
+        # Forcing the miss costs more than the miss.  The key is
+        # `(ground.sum(), seen.sum(), radius, close_px)` and those two `.sum()`
+        # calls are full-array reductions over a 600x600 (sim) or 1200x1200
+        # (real) boolean grid -- **0.550 ms per call, 16% of a 2.73 ms fuse
+        # evaluation**, paid to produce a key that is then compared and thrown
+        # away (`docs/B3成本剖析_20261008.md` section "white-paid cache key").
+        # Nothing about the returned mask changes; only the accounting does.
+        self.use_cache = True
+        # Opt-in, read-only cost account (see `worldmap.TopoFuseProfile` and the
+        # `--b3-prof` switch).  `None` is the shipping state: every branch below
+        # is guarded on it, so with no profiler installed this method is exactly
+        # the build that came before.  It is only ever installed on
+        # `FrontierExplorer.fuse_planner`, never on the driving planner, so the
+        # numbers are the fuse's alone.
+        self.prof = None
 
     def free_space(self, wmap) -> np.ndarray:
         """Known-traversable cells, shrunk by the robot radius.
@@ -461,10 +483,32 @@ class PathPlanner:
         re-eroding a 1200x1200 mask each time costs more than the search.
         """
         import cv2
-        key = (int(wmap.ground.sum()), int(wmap.seen.sum()),
-               float(self.robot_radius), int(self.close_px))
-        if key == self._cache_key and self._cache_free is not None:
-            return self._cache_free
+        # Stage account.  `prof is None` short-circuits inside `_mark`, so the
+        # only unconditional cost is one Python call per boundary -- measured
+        # at ~0.1 us against a ~2 ms body.
+        prof = self.prof
+        _since = [0.0]
+        if prof is not None:
+            prof.add("fs_calls", 1)
+            _since[0] = time.perf_counter()
+
+        def _mark(name):
+            if prof is None:
+                return
+            now = time.perf_counter()
+            prof.add(name, now - _since[0])
+            _since[0] = now
+
+        key = None
+        if self.use_cache:
+            key = (int(wmap.ground.sum()), int(wmap.seen.sum()),
+                   float(self.robot_radius), int(self.close_px))
+            if key == self._cache_key and self._cache_free is not None:
+                if prof is not None:
+                    prof.add("fs_hits", 1)
+                return self._cache_free
+        if prof is not None:
+            prof.add("fs_misses", 1)
         # `ground` already had the *confirmed* obstacle layer removed upstream
         # (`&= ~obstacle`, two frames of evidence), and that is all the planner
         # uses.
@@ -483,6 +527,7 @@ class PathPlanner:
         # still stops the robot from the very next command.  What it must not do
         # is *route* around evidence that will be gone next frame.
         free = wmap.ground.copy()
+        _mark("t_copy")
         if self.close_px > 1:
             # Closing fills gaps in the floor mask -- and it will equally fill
             # the single-cell gap that a wall appears as, which is how a
@@ -495,14 +540,22 @@ class PathPlanner:
                 free.astype(np.uint8), cv2.MORPH_CLOSE,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                           (self.close_px, self.close_px))) > 0
+            _mark("t_close")
             solid = cv2.dilate(wmap.obstacle.astype(np.uint8),
                                np.ones((3, 3), np.uint8)) > 0
+            _mark("t_solid")
             free = closed & ~solid
+            _mark("t_and")
         if self.robot_radius > 0:
             k = max(1, int(round(2 * self.robot_radius / wmap.resolution)) | 1)
             bad = cv2.dilate(((~free).astype(np.uint8)),
                              np.ones((k, k), np.uint8))
+            # NOTE: there is no `erode` call in this method.  The robot-radius
+            # shrink is written as a dilate of the *complement*, which is why
+            # "erode" never appears in the profile -- `t_radius` IS the erosion.
+            _mark("t_radius")
             free = free & (bad == 0)
+            _mark("t_and2")
         self._cache_key, self._cache_free = key, free
         return free
 
