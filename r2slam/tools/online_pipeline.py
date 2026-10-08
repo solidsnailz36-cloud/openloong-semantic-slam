@@ -60,6 +60,7 @@ from r2slam.traversable import (fit_ground, ground_tolerance,        # noqa: E40
                                 GROUND_TOL_BASE, GROUND_TOL_SLOPE)
 from r2slam import sysinfo                                           # noqa: E402
 from r2slam.worldmap import WorldMap                                 # noqa: E402
+from r2slam import worldmap as _worldmap                             # noqa: E402
 from r2slam.worldmap import (OBSTACLE_MIN_VOTES,                     # noqa: E402
                              OBSTACLE_OPEN_PX,
                              OBSTACLE_RELEASE_FRAMES,
@@ -162,6 +163,53 @@ def parse_args():
                          "motive, leaving only frontier (the A/B control for "
                          "measuring what it is worth)")
     ap.add_argument("--w-max", type=float, default=0.9, help="rad/s")
+    ap.add_argument("--obstacle-ground-ratio", type=float, default=None,
+                    metavar="R",
+                    help="`worldmap.OBSTACLE_GROUND_RATIO`: promote a cell to "
+                         "`obstacle` only if `obs_votes >= R * ground_votes`.  "
+                         "0 (today) = off; 1 = floor evidence may veto.")
+    ap.add_argument("--obstacle-topo-fuse", type=float, default=None,
+                    metavar="M2",
+                    help="`worldmap.OBSTACLE_TOPO_FUSE_M2`, the B3 topological "
+                         "fuse: a cell the filter chain just admitted is kept "
+                         "out of `obstacle` again if admitting it would cost "
+                         "more than M2 of the robot's *current* reachable area, "
+                         "and re-tested every frame.  Measured separation on "
+                         "`cap_A0_r3`: ordinary promotions <= 0.06 m2, the "
+                         "doorway 136.3 m2; safe band [0.5, 100], below 0.3 it "
+                         "starts refusing real obstacles.  0 = off.")
+    ap.add_argument("--obstacle-topo-retest", type=int, default=None,
+                    metavar="N",
+                    help="`worldmap.OBSTACLE_TOPO_FUSE_RETEST_N` -- the B3 cost "
+                         "lever.  0 (the default) re-measures every deferred "
+                         "cell every frame; > 0 skips a re-test while nothing "
+                         "changed within `OBSTACLE_TOPO_FUSE_RETEST_R` cells and "
+                         "the cell has not been measured for N frames.  A "
+                         "held-over cell stays deferred, so this only moves "
+                         "*when* a deferral is released -- a behaviour change, "
+                         "which is why it needs the closed-loop A/B in "
+                         "`docs/B3成本剖析_20261008.md`.")
+    ap.add_argument("--b3-log", default=None, metavar="FILE",
+                    help="read-only row log of the B3 fuse in a **live** run: one "
+                         "row per (frame, candidate) evaluation with the dreach "
+                         "the decision was made from.  It is the same instrument "
+                         "`replay_explore.py --b3-log` writes; the mechanism "
+                         "itself lives in `worldmap._topo_fuse` and is not "
+                         "touched by this flag.  Inert unless "
+                         "`--obstacle-topo-fuse` > 0.")
+    ap.add_argument("--b3-prof", default=None, metavar="FILE",
+                    help="read-only **cost** account of the B3 fuse in a live "
+                         "run: one CSV row per frame plus a per-candidate timing "
+                         "list.  Answers 'which step inside the fuse eats the "
+                         "budget', including whether a slow frame burned CPU or "
+                         "was simply descheduled (`cpu_ms` vs `wall_ms`).  Pure "
+                         "timing: it changes no mechanism, and inert unless "
+                         "`--obstacle-topo-fuse` > 0.")
+    ap.add_argument("--b3-prof-evals", default=None, metavar="FILE",
+                    help="write the per-candidate timing list of `--b3-prof` to "
+                         "its own one-column file (one float per candidate, ms), "
+                         "so the distribution can be taken without parsing a "
+                         "ragged column.")
     ap.add_argument("--explore-set", action="append", default=[],
                     metavar="KEY=VALUE",
                     help="override any FrontierExplorer parameter, e.g. "
@@ -246,6 +294,11 @@ def dump_grids(dest, wmap, cfg):
             "obstacle_open_px": int(OBSTACLE_OPEN_PX),
             "obstacle_release_frames": int(OBSTACLE_RELEASE_FRAMES),
             "obstacle_release_ratio": float(OBSTACLE_RELEASE_RATIO),
+            # `0.0` = the floor evidence does not veto a promotion (today).
+            # Read off the **module**, not off a `from ... import` binding: the
+            # CLI sets the module attribute (that is what `WorldMap.add` reads),
+            # and a binding copied at import time would keep reporting 0.
+            "obstacle_ground_ratio": float(_worldmap.OBSTACLE_GROUND_RATIO),
             "arrays": ["ground", "obstacle", "seen", "ground_ever",
                        "obstacle_votes", "obstacle_now", "ground_after_obstacle",
                        "on_path", "traj"]}
@@ -423,6 +476,10 @@ def main():
              cfg.lidar.time_offsets_from, deskewer.sign,
              deskewer.period or 0.0))
 
+    if a.obstacle_ground_ratio is not None:
+        _worldmap.OBSTACLE_GROUND_RATIO = float(a.obstacle_ground_ratio)
+        print("ground veto : ratio=%.3f (0 = today)" % float(a.obstacle_ground_ratio))
+
     wmap = WorldMap(resolution=rt.map_resolution, extent=rt.map_extent,
                     voxel=rt.pcd_voxel)
 
@@ -458,6 +515,30 @@ def main():
               "sweep=%s" % (a.v_max, a.w_max, not a.no_sweep))
         for k, val in _explore_overrides(a.explore_set).items():
             print("  override  : %s = %r" % (k, val))
+        if a.obstacle_topo_fuse is not None:
+            _worldmap.OBSTACLE_TOPO_FUSE_M2 = float(a.obstacle_topo_fuse)
+            print("topo fuse   : %.2f m2 (0 = off; a promotion costing more "
+                  "than this much of the robot's current reach is deferred)"
+                  % float(a.obstacle_topo_fuse))
+        if a.obstacle_topo_retest is not None:
+            _worldmap.OBSTACLE_TOPO_FUSE_RETEST_N = int(a.obstacle_topo_retest)
+            print("topo retest : N=%d, R=%d cells"
+                  % (int(a.obstacle_topo_retest),
+                     int(getattr(_worldmap, "OBSTACLE_TOPO_FUSE_RETEST_R", 6))))
+        if float(getattr(_worldmap, "OBSTACLE_TOPO_FUSE_M2", 0.0)) > 0.0:
+            # The fuse needs a planner; installing the hook is what makes it
+            # live (`worldmap.OBSTACLE_TOPO_FUSE_M2`).
+            wmap.reach_cells = explorer.reach_cells
+        if a.b3_log and float(getattr(_worldmap, "OBSTACLE_TOPO_FUSE_M2", 0.0)) > 0.0:
+            wmap.topo_fuse_log = []
+        if a.b3_prof and float(getattr(_worldmap, "OBSTACLE_TOPO_FUSE_M2", 0.0)) > 0.0:
+            # Cost account.  The same object is handed to the fuse's *own*
+            # planner (never the driving one) so the morphology stages and the
+            # flood fill are attributed to the fuse alone.
+            _prof = _worldmap.TopoFuseProfile()
+            wmap.topo_fuse_prof = _prof
+            explorer.fuse_planner.prof = _prof
+            print("topo prof   : on -> %s" % a.b3_prof)
     if explorer is not None or navigator is not None:
         sender = VelocitySender().start()
 
@@ -1129,6 +1210,13 @@ def main():
                      "frames_arc": explorer.n_arc_frames,
                      "sweep_targets": explorer.n_sweep_targets,
                      "island_probes": explorer.n_island_probes,
+                     # Which of the probe's eight exits fired, by name.  With
+                     # `island_probe=False` (the default) this key is None and
+                     # nothing is recorded -- the report is an instrument, not a
+                     # behaviour, same rule as `patch_probe` (see §53).
+                     "island_diag": (explorer.island_diag_report()
+                                     if hasattr(explorer, "island_diag_report")
+                                     else None),
                      "sweep_abandoned": explorer.n_sweep_abandoned,
                      # --- finishing a patch, and the map's blind spots -------
                      # `patch_locks` counts how many distinct unvisited patches
@@ -1342,6 +1430,59 @@ def main():
     if a.dump_grids:
         dump_grids(a.dump_grids, wmap, cfg)
         print("  grids written to %s" % a.dump_grids)
+
+    if a.b3_log:
+        _rows = wmap.topo_fuse_log
+        if _rows:
+            with open(a.b3_log, "w", newline="", encoding="utf-8") as fh:
+                cols = ["frame", "stamp", "cx", "cy", "wx", "wy", "votes",
+                        "reach_base", "reach_with", "dreach_cells",
+                        "dreach_m2", "kind", "deferred"]
+                w = csv.writer(fh)
+                w.writerow(cols)
+                for r in _rows:
+                    w.writerow([
+                        r["frame"], repr(r["stamp"]), r["cx"], r["cy"],
+                        "%.3f" % (r["cx"] * wmap.resolution - wmap.extent),
+                        "%.3f" % (r["cy"] * wmap.resolution - wmap.extent),
+                        r["votes"], r["reach_base"], r["reach_with"],
+                        r["dreach"], "%.4f" % r["dreach_m2"], r["kind"],
+                        r["deferred"]])
+            _def = {(r["cy"], r["cx"]) for r in _rows if r["deferred"]}
+            print("b3 log      : %s (%d rows, %d distinct cells deferred)"
+                  % (a.b3_log, len(_rows), len(_def)))
+        else:
+            print("b3 log      : nothing to write (%s had 0 rows -- the fuse "
+                  "either never ran or never saw a candidate)" % a.b3_log)
+
+    if a.b3_prof:
+        _prof = getattr(wmap, "topo_fuse_prof", None)
+        _pr = _prof.rows if _prof is not None else []
+        if _pr:
+            cols = ["frame", "stamp", "n_cand", "n_defer_prev", "n_defer",
+                    "wall_ms", "thread_ms", "cpu_ms"]
+            extra = sorted({k for r in _pr for k in r} - set(cols))
+            with open(a.b3_prof, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(cols + extra)
+                for r in _pr:
+                    w.writerow([r.get(c, "") for c in cols]
+                               + ["%.4f" % r[c]
+                                  if isinstance(r.get(c), float)
+                                  else r.get(c, "") for c in extra])
+            _sum = sum(r["n_cand"] for r in _pr)
+            print("b3 prof     : %s (%d frames, %d candidate evals)"
+                  % (a.b3_prof, len(_pr), _sum))
+            if a.b3_prof_evals and _prof.evals_ms:
+                with open(a.b3_prof_evals, "w", encoding="utf-8") as fh:
+                    fh.write("eval_ms\n")
+                    for v in _prof.evals_ms:
+                        fh.write("%.5f\n" % v)
+                print("b3 prof ev  : %s (%d evals)"
+                      % (a.b3_prof_evals, len(_prof.evals_ms)))
+        else:
+            print("b3 prof     : %s *** empty -- the fuse never ran ***"
+                  % a.b3_prof)
 
     with open(os.path.join(a.out, "frames.csv"), "w", newline="",
               encoding="utf-8") as fh:

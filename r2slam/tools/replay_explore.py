@@ -202,6 +202,45 @@ def main():
                          "so the run itself is unchanged; only the dumped "
                          "classification differs.  Sanity check: without this "
                          "flag the same dump reproduces exactly.")
+    ap.add_argument("--cf-hold-cells", default=None, metavar="FILE",
+                    help="COUNTERFACTUAL, read-only, off by default.  A JSON "
+                         "list of `[x, y]`: those cells are forced out of the "
+                         "`obstacle` layer on **every** frame, right after "
+                         "`WorldMap.add`, and `ground` is re-derived from "
+                         "`ground_ever` with the same expression the map itself "
+                         "uses.  This is \"pretend this cell never got "
+                         "promoted\", i.e. keep it `removable` forever.  "
+                         "`--ablate-cells` answers the same question but only "
+                         "for the dumped classification; this one changes the "
+                         "map the explorer sees, so the whole run is the "
+                         "counterfactual.  Nothing else is touched: not the "
+                         "vote threshold, not the release rule, not "
+                         "`obstacle_now`, not the planner.  Prints how many "
+                         "frames actually cleared a cell, so an inert "
+                         "counterfactual cannot pass as a negative result.")
+    ap.add_argument("--b3-log", default=None, metavar="FILE",
+                    help="CSV row log of the production B3 fuse "
+                         "(`worldmap.OBSTACLE_TOPO_FUSE_M2`, see "
+                         "`--obstacle-topo-fuse`): one row per (frame, "
+                         "candidate) evaluation, including the ones that were "
+                         "admitted.  Read-only -- the numbers are the ones the "
+                         "decision was made from, not a re-derivation.  Columns: "
+                         "frame, stamp, cx, cy, wx, wy, votes, reach_base, "
+                         "reach_with, dreach_cells, dreach_m2, kind, deferred. "
+                         "Inert unless the fuse is on.")
+    ap.add_argument("--b3-prof", default=None, metavar="FILE",
+                    help="read-only **cost** account of the production B3 fuse: "
+                         "one CSV row per frame (candidate count, wall/cpu time, "
+                         "and every inner stage) plus `--b3-prof-evals`.  Pure "
+                         "timing -- it changes no mechanism and is inert unless "
+                         "the fuse is on.  Note the replay has **no wall-clock "
+                         "budget**: its candidate density (~6/frame) is NOT the "
+                         "closed loop's (~19/frame), so use this to attribute "
+                         "cost to a stage, and the live pipeline to decide "
+                         "whether the stage fits the frame.")
+    ap.add_argument("--b3-prof-evals", default=None, metavar="FILE",
+                    help="per-candidate timing of `--b3-prof`, one float per "
+                         "line (ms).")
     ap.add_argument("--map-hold", default=None,
                     choices=["reset", "total", "suspend", "suspend_vote"],
                     help="what an obstacle return does to the floor counter of "
@@ -242,7 +281,54 @@ def main():
                          "`last_sweep_cands` is only rebound when the sweep "
                          "path is taken, so on a `shadow` frame it still holds "
                          "the previous decision's list.")
+    ap.add_argument("--strand-dump", action="store_true",
+                    help="also write, per arm, one row per frame giving the "
+                         "balance of every stage that could have produced a "
+                         "target (`_stranded_fresh`, the sweep's fresh floor, "
+                         "the frontier funnel, and what the frame ended up "
+                         "aiming at).  Read-only, off by default so decision "
+                         "CSVs stay bit-comparable with earlier runs.  File is "
+                         "<out>_<arm>_strand.csv.")
+    ap.add_argument("--obstacle-ground-ratio", type=float, default=None,
+                    metavar="R",
+                    help="`worldmap.OBSTACLE_GROUND_RATIO`: a cell is promoted to "
+                         "`obstacle` only if `obs_votes >= R * ground_votes`, "
+                         "i.e. its floor evidence may veto it.  0 (today) = off. "
+                         "`1` reads \"obstacle evidence must not be outnumbered by "
+                         "floor evidence\" and is what stops the three `cap_A0_r2` "
+                         "doorway cells (floor 27/19/33 frames against obstacle "
+                         "15/14/9).  Blunt: it also drops 574 cells that sit on a "
+                         "truth wall, at a measured cost of +1.99 m2 of `reach`.")
+    ap.add_argument("--obstacle-topo-fuse", type=float, default=None,
+                    metavar="M2",
+                    help="`worldmap.OBSTACLE_TOPO_FUSE_M2`, the B3 topological "
+                         "fuse.  A cell the filter chain just admitted is kept "
+                         "out of `obstacle` again if admitting it would cost "
+                         "more than M2 of the robot's *current* reachable area; "
+                         "it is re-tested every frame and goes in as soon as it "
+                         "stops doing that ('deferred', not 'banned').  "
+                         "Requires the planner hook, which this tool installs "
+                         "when the value is positive.  Measured separation on "
+                         "`cap_A0_r3`: ordinary promotions <= 0.06 m2, the "
+                         "doorway 136.3 m2, safe band [0.5, 100].  0 = off.")
+    ap.add_argument("--obstacle-topo-retest", type=int, default=None,
+                    metavar="N",
+                    help="`worldmap.OBSTACLE_TOPO_FUSE_RETEST_N`.  0 (and the "
+                         "default) re-measures every deferred cell every frame.  "
+                         "> 0 skips a re-test while nothing changed within "
+                         "`OBSTACLE_TOPO_FUSE_RETEST_R` cells of it and it has "
+                         "not been measured for N frames.  A held-over cell "
+                         "stays deferred, so this moves *when* a deferral is "
+                         "released; it is the cost lever, see "
+                         "`docs/B3成本剖析_20261008.md`.")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--tgt-clearance", action="store_true",
+                    help="record, per arm and per frame, the distance from that "
+                         "arm's own target to the nearest **blocked** cell "
+                         "(metres).  This is the quantity a standoff change acts "
+                         "on, so it has to be read on the map of that frame. "
+                         "Read-only, and off by default so the decision CSV stays "
+                         "bit-comparable with earlier runs.")
     ap.add_argument("--no-detect", action="store_true",
                     help="skip the detector (faster, but the obstacle layer then "
                          "contains the people the fusion is supposed to remove)")
@@ -287,6 +373,12 @@ def main():
         _wm_mod.OBSTACLE_MIN_POINTS = int(a.map_min_points)
         print("map min pts : %d (1 = today; only the map memory changes, "
               "obstacle_now is set earlier)" % int(a.map_min_points))
+    if a.obstacle_ground_ratio is not None:
+        # Module attribute, same reason as `--map-hold`: `WorldMap.add` reads
+        # `OBSTACLE_GROUND_RATIO` as a module global.
+        _wm_mod.OBSTACLE_GROUND_RATIO = float(a.obstacle_ground_ratio)
+        print("ground veto : ratio=%.3f (0 = today; promote only if "
+              "obs_votes >= ratio * ground_votes)" % float(a.obstacle_ground_ratio))
     if a.map_hold:
         # Set the **module** attribute, not an instance one: `WorldMap.add`
         # reads `OBSTACLE_HOLD` as a module global, so an instance attribute
@@ -331,6 +423,22 @@ def main():
         arms.append(("base", FrontierExplorer(v_max=0.55, w_max=0.9,
                                               **parse_overrides(a.set))))
     explorer = arms[0][1]
+    if a.obstacle_topo_fuse is not None:
+        _wm_mod.OBSTACLE_TOPO_FUSE_M2 = float(a.obstacle_topo_fuse)
+        print("topo fuse   : %.2f m2 (0 = off; a promotion costing more than "
+              "this much of the robot's current reach is deferred)"
+              % float(a.obstacle_topo_fuse))
+    if a.obstacle_topo_retest is not None:
+        _wm_mod.OBSTACLE_TOPO_FUSE_RETEST_N = int(a.obstacle_topo_retest)
+        print("topo retest : N=%d, R=%d cells (0 = re-measure every deferred "
+              "cell every frame)"
+              % (int(a.obstacle_topo_retest),
+                 int(getattr(_wm_mod, "OBSTACLE_TOPO_FUSE_RETEST_R", 6))))
+    # The fuse needs a planner; installing the hook is what makes it live, and
+    # leaving it uninstalled keeps `OBSTACLE_TOPO_FUSE_M2` inert instead of
+    # half-on.
+    if float(getattr(_wm_mod, "OBSTACLE_TOPO_FUSE_M2", 0.0)) > 0.0:
+        wmap.reach_cells = explorer.reach_cells
     # The replay has no driver, so the explorer must be told the same thing the
     # live run told it: a *fresh* instance starts at "init".
     print("explorer    : %s" % ("sweep+shadow" if explorer.sweep else "frontier only"))
@@ -356,6 +464,35 @@ def main():
         map_at = sorted(float(v) for v in secs.split(",") if v.strip())
     t_first = [None]
 
+    # ---- B3 fuse: the mechanism lives in `worldmap.py`; this tool only -------
+    # ---- installs the planner hook and, on request, the read-only row log ---
+    if a.obstacle_topo_fuse is not None:
+        _wm_mod.OBSTACLE_TOPO_FUSE_M2 = float(a.obstacle_topo_fuse)
+    b3_on = float(getattr(_wm_mod, "OBSTACLE_TOPO_FUSE_M2", 0.0)) > 0.0
+    b3_log_rows: list = []
+    if a.b3_log:
+        if b3_on:
+            # The mechanism is in `worldmap.py`; the tool only collects its rows.
+            wmap.topo_fuse_log = b3_log_rows
+        else:
+            print("b3 log      : ignored -- `--b3-log` needs "
+                  "`--obstacle-topo-fuse` > 0 (there is nothing to log with the "
+                  "fuse off, and an empty log is not evidence of a quiet fuse)")
+
+    b3_prof = None
+    if a.b3_prof:
+        if b3_on:
+            # Same object on all three: the map's macro phases, the fuse's own
+            # planner (morphology) and `reach_cells` (flood fill).
+            b3_prof = _wm_mod.TopoFuseProfile()
+            wmap.topo_fuse_prof = b3_prof
+            explorer.fuse_planner.prof = b3_prof
+            print("b3 prof     : on -> %s (candidate evals -> %s)"
+                  % (a.b3_prof, a.b3_prof_evals or "-"))
+        else:
+            print("b3 prof     : ignored -- `--b3-prof` needs "
+                  "`--obstacle-topo-fuse` > 0")
+
     ablate = None
     if a.ablate_cells:
         with open(a.ablate_cells, encoding="utf-8") as fh:
@@ -365,6 +502,25 @@ def main():
         _aj = np.floor((np.array([c[1] for c in _cl]) + wmap.extent)
                        / wmap.resolution).astype(int)
         ablate = (_ai, _aj)
+
+    # ---- counterfactual: hold cells out of the obstacle layer, every frame ---
+    cf = None
+    cf_hits = [0]
+    if a.cf_hold_cells:
+        with open(a.cf_hold_cells, encoding="utf-8") as fh:
+            _hl = [(float(x), float(y)) for x, y in json.load(fh)]
+        # Same cell convention as everywhere else: `floor`, never a cast.
+        cf = (np.floor((np.array([c[0] for c in _hl]) + wmap.extent)
+                       / wmap.resolution).astype(np.int64),
+              np.floor((np.array([c[1] for c in _hl]) + wmap.extent)
+                       / wmap.resolution).astype(np.int64))
+        _ok = wmap._in(cf[0], cf[1])
+        print("cf hold     : %d/%d cells inside the grid -> %s"
+              % (int(_ok.sum()), len(_hl),
+                 ["(%.2f, %.2f)" % (c[0], c[1])
+                  for i, c in enumerate(_hl) if _ok[i]]))
+        if not _ok.any():
+            raise SystemExit("--cf-hold-cells: every listed cell is off-grid")
 
     probe_ix = probe_iy = None
     probe_rows = []
@@ -446,6 +602,30 @@ def main():
             rng=np.zeros(OF_N * OF_N, np.float64),        # sum of ranges
             nb8=np.zeros((OF_N * OF_N, 9), np.int32),     # 8-neighbour obstacle count
             nground=np.zeros(OF_N * OF_N, np.int32),      # frames that ALSO put floor here
+            # **Frames that put a floor return here, regardless of obstacle.**
+            # This is the quantity production code does not have: `ground_ever`
+            # is a latched *bool*, and `_ground_after` is zeroed by any obstacle
+            # return in the same cell -- so at the moment a cell is promoted to
+            # `obstacle` its floor evidence has just been erased and cannot
+            # argue back.  Measured on `cap_A0_r2`: the three cells that seal
+            # the doorway have 15/14/9 obstacle frames against **1220/1182/1235**
+            # floor frames, while the structure next to them has 226 against 462.
+            # The gate that would separate them needs this ratio, so it is
+            # accumulated here (read-only) before anything is changed.
+            gframes=np.zeros(OF_N * OF_N, np.int32),
+            # ---- **when** the votes happened, not just how many -----------
+            # `OBSTACLE_STRONG_VOTES` is compared against a bare count, and a
+            # count has no time in it: a cell seen 20 times over 1100 frames
+            # and a cell seen 20 times back-to-back cast the same "strong"
+            # vote.  These four monotone counters are enough to tell the two
+            # apart offline, before anyone is allowed to touch `20`.
+            # `vfirst`/`vlast` are 1-based frame numbers (`-1` = never voted),
+            # in the same numbering as the `--probe-cells` CSV.
+            vfirst=np.full(OF_N * OF_N, -1, np.int32),
+            vlast=np.full(OF_N * OF_N, -1, np.int32),
+            vmaxgap=np.zeros(OF_N * OF_N, np.int32),   # biggest gap between votes
+            vrun=np.zeros(OF_N * OF_N, np.int32),      # current consecutive run
+            vrunmax=np.zeros(OF_N * OF_N, np.int32),   # longest consecutive run
         )
     prev_stamp = None
     n = 0
@@ -530,12 +710,35 @@ def main():
                  persons_xy=persons_world, obj_labels=obj_label,
                  objects_xy=objects_world, seen_mask=informative)
 
+        if cf is not None:
+            # `--cf-hold-cells`: the cells never enter the memory layer.  Set it
+            # *after* `add` because `add` rebuilds `obstacle` from scratch every
+            # frame, and re-derive `ground` with the map's own expression --
+            # `np.logical_and(ground_ever, ~obstacle, out=ground)` is literally
+            # the last thing `WorldMap.add` does, so this keeps the
+            # counterfactual inside the map's semantics instead of inventing a
+            # second one.  `obstacle_now` (this frame's returns, the safety
+            # layer) is deliberately left alone.
+            _hit = bool(wmap.obstacle[cf[1], cf[0]].any())
+            wmap.obstacle[cf[1], cf[0]] = False
+            np.logical_and(wmap.ground_ever, ~wmap.obstacle, out=wmap.ground)
+            if _hit:
+                cf_hits[0] += 1
+
+
         if of is not None:
             # Accumulate the returns, not the votes.  `obstacle_now` is exactly
             # "this frame's raw returns" and is set inside `add` before any
             # threshold, so it is the right thing to read for the neighbourhood.
             _fin = (np.isfinite(world_pts[:, 0]) & np.isfinite(world_pts[:, 1])
                     & np.isfinite(h))
+            _g = ground_mask & _fin
+            if _g.any():
+                _gi, _gj = wmap.cell_of(world_pts[_g, 0], world_pts[_g, 1])
+                _kg = wmap._in(_gi, _gj)
+                if _kg.any():
+                    _gu = np.unique(_gj[_kg].astype(np.int64) * OF_N + _gi[_kg])
+                    of["gframes"][_gu] += 1
             _m = obstacle_mask & _fin
             if _m.any():
                 _ci, _cj = wmap.cell_of(world_pts[_m, 0], world_pts[_m, 1])
@@ -547,6 +750,26 @@ def main():
                     key, cnt = np.unique(flat, return_counts=True)
                     of["nframes"][key] += 1
                     of["npts"][key] += cnt
+                    # `key` is unique (it comes out of `np.unique`), so plain
+                    # fancy assignment is correct here -- no `np.add.at` and no
+                    # duplicate-index race.  `n` is the same 1-based frame
+                    # counter the `--probe-cells` CSV writes.
+                    _first = of["vfirst"][key] < 0
+                    _gap = np.where(_first, n + 1,
+                                    n - of["vlast"][key].astype(np.int64)
+                                    ).astype(np.int32)
+                    of["vmaxgap"][key] = np.maximum(of["vmaxgap"][key], _gap)
+                    _run = np.where(_gap <= 1,
+                                    of["vrun"][key] + 1, 1).astype(np.int32)
+                    of["vrun"][key] = _run
+                    of["vrunmax"][key] = np.maximum(of["vrunmax"][key], _run)
+                    # `_first` is as long as `key` (the cells that voted this
+                    # frame), **not** as long as the whole grid -- indexing the
+                    # full array with it is a dimension mismatch, and it is the
+                    # kind of mismatch that only shows up on a frame that has
+                    # already voted somewhere else.
+                    of["vfirst"][key[_first]] = n
+                    of["vlast"][key] = n
                     np.add.at(of["pts"], (key, np.minimum(cnt, 8)), 1)
                     hb = np.clip((( _hh - OF_H0) / OF_DH).astype(np.int64),
                                  0, OF_HB - 1)
@@ -583,8 +806,66 @@ def main():
             results.append((name, exr, _v, _w, _e))
 
         if probe_ix is not None:
+            # ---- read-only replay of the obstacle-layer filter chain --------
+            # `wmap.obstacle` is the **end** of a five-step chain, so a cell
+            # reading 0 there could have been emptied by any one of four rules:
+            #     obstacle = votes >= 2
+            #     obstacle &= ~outvoted      (OBSTACLE_GROUND_RATIO, off today)
+            #     obstacle &= ~released      (OBSTACLE_RELEASE_*)
+            #     obstacle &= ~on_path
+            #     obstacle &= ~removable     (opening + seen + STRONG_VOTES)
+            # `removable` is a local inside `WorldMap.add` and is never stored,
+            # so the chain is recomputed here from the same arrays the map uses.
+            # **Nothing is written back** -- this only exists to turn "why is
+            # this cell 0" into a per-frame fact instead of an inference.
+            _v = wmap._obs_votes
+            _pre = _v >= _wm_mod.OBSTACLE_MIN_VOTES
+            if _wm_mod.OBSTACLE_GROUND_RATIO > 0.0:
+                _out = _pre & ~(_v < _wm_mod.OBSTACLE_GROUND_RATIO
+                                * wmap._ground_votes)
+            else:
+                _out = _pre
+            if _wm_mod.OBSTACLE_RELEASE_FRAMES > 0:
+                _rel = ((wmap._ground_after >= _wm_mod.OBSTACLE_RELEASE_FRAMES)
+                        & (wmap._ground_after * 1.0
+                           >= _wm_mod.OBSTACLE_RELEASE_RATIO * _v))
+            else:
+                _rel = np.zeros_like(_pre)
+            _aft = _out & ~_rel & ~wmap._on_path
+            if _wm_mod.OBSTACLE_OPEN_PX > 0:
+                _opn = cv2.morphologyEx(
+                    _aft.astype(np.uint8), cv2.MORPH_OPEN,
+                    np.ones((_wm_mod.OBSTACLE_OPEN_PX,) * 2, np.uint8)) > 0
+            else:
+                _opn = _aft.copy()
+            _unk = cv2.dilate((~wmap.seen).astype(np.uint8),
+                              np.ones((3, 3), np.uint8)) > 0
+            # The three-way condition that decides whether the opening may drop
+            # the cell.  `False` here means "keep it in the map layer".
+            _rem = (_aft & ~_opn & ~_unk
+                    & (_v < _wm_mod.OBSTACLE_STRONG_VOTES))
+            # Two columns that decide between the surviving explanations of
+            # "`obs_votes` rose but `obstacle_now` is 0":
+            #   * `now_total` -- if the whole array is empty this frame, the
+            #     writeback in `add` is being undone, and it is a map bug;
+            #   * `pts_here` / `pts_obs_here` -- if the cell really had obstacle
+            #     returns this frame, then `obstacle_now` disagrees with its own
+            #     source and it is a writeback/indexing bug; if it had none, the
+            #     vote came from somewhere other than this frame's points.
+            # Recomputed from `obstacle_mask` with the same `finite` and
+            # `_in` gates `add` uses, so the two are comparable by construction.
+            _now_total = int(wmap.obstacle_now.sum())
+            _fh = (np.isfinite(world_pts[:, 0]) & np.isfinite(world_pts[:, 1])
+                   & np.isfinite(h))
+            _cxh = np.floor((world_pts[:, 0] + wmap.extent)
+                            / wmap.resolution).astype(np.int64)
+            _cyh = np.floor((world_pts[:, 1] + wmap.extent)
+                            / wmap.resolution).astype(np.int64)
             for _k in range(len(probe_ix)):
                 _i, _j = int(probe_ix[_k]), int(probe_iy[_k])
+                _here = _fh & (_cxh == _i) & (_cyh == _j)
+                _npts_here = int(_here.sum())
+                _nobs_here = int((_here & obstacle_mask).sum())
                 probe_rows.append((
                     n, repr(float(fr.stamp)), _k,
                     repr(float(t[0])), repr(float(t[1])),
@@ -592,14 +873,41 @@ def main():
                     int(wmap.obstacle_now[_j, _i]),
                     int(wmap._obs_votes[_j, _i]),
                     int(wmap._ground_after[_j, _i]),
-                    int(wmap._on_path[_j, _i]), int(wmap.seen[_j, _i])))
+                    int(wmap._on_path[_j, _i]), int(wmap.seen[_j, _i]),
+                    int(_pre[_j, _i]), int(_out[_j, _i]), int(_rel[_j, _i]),
+                    int(_aft[_j, _i]), int(_opn[_j, _i]), int(_unk[_j, _i]),
+                    int(_rem[_j, _i]), _now_total,
+                    _npts_here, _nobs_here))
+
+        # --- D1's verdict quantity (boss 2026-10-07) -------------------------
+        # "goal -> nearest obstacle must visibly increase".  It is the variable a
+        # standoff change acts on, so it has to be read on the map **of this
+        # frame** rather than reconstructed from a final one.  Every arm shares
+        # this map (see the `a.poses` note below), so one distance transform per
+        # frame serves all of them.  `blocked()`, not `obstacle`: that is the
+        # layer the throttle will consult when the robot arrives.
+        _dtb = None
+        if a.tgt_clearance:
+            try:
+                _dtb = (cv2.distanceTransform(
+                    (~wmap.blocked()).astype(np.uint8), cv2.DIST_L2, 5)
+                    * wmap.resolution)
+            except Exception as exc:          # a probe must never crash a run
+                if idx % 200 == 0:
+                    print("  (tgt clearance skipped at frame %d: %s)"
+                          % (idx, exc))
 
         if t_first[0] is None:
             t_first[0] = float(fr.stamp)
         if map_at:
             while map_at and (float(fr.stamp) - t_first[0]) >= map_at[0]:
                 Tt = map_at.pop(0)
-                save_map("%s_%03d.npz" % (map_at_prefix, int(round(Tt))),
+                # `round(Tt)` collided: asking for 97.7 and 97.95 and 98.2 wrote
+                # one file named `_098.npz` three times, silently.  The whole
+                # point of this flag is to catch a one-frame event, so the name
+                # has to keep enough resolution to tell two neighbouring frames
+                # apart.
+                save_map("%s_%05d.npz" % (map_at_prefix, int(round(Tt * 10))),
                          explorer, wmap, t, "%gs" % Tt, ablate=ablate)
 
         if a.poses:
@@ -615,6 +923,19 @@ def main():
                               int(wmap.seen.sum()),
                               int(wmap.blocked().sum()),
                               int(_r.sum()), int(_e.sum())))
+            # **Only `arms[0]` gets a pose log, and that is correct, not a gap.**
+            #
+            # In this harness every arm sees the *same* map: the pose comes from
+            # KISS-ICP reading the recorded clouds, and an arm's `(v, w)` is
+            # written to its CSV and never fed back to anything.  So `ground`,
+            # `seen`, `blocked` and `reach` are **identical across arms** -- a
+            # per-arm copy would be N copies of one column.  What differs between
+            # arms is the *decision* record, which is the per-frame CSV.
+            #
+            # Consequence for reading any scan that uses this flag: `reach` and
+            # the mapped-floor curve **cannot** be an arm-comparison metric here
+            # (that is what the live simulator runs are for).  Decisions,
+            # counters, switch distances and target sets can.
 
         if idx in probes or (n - 1) in probes:
             probes[idx if idx in probes else n - 1].append(
@@ -836,7 +1157,17 @@ def main():
                             ncell=int(c[4])))
                     except (TypeError, ValueError, IndexError):
                         continue
-            rows_out.setdefault(name, []).append(dict(
+            # D1's verdict variable: how far this arm's own target is from the
+            # nearest blocked cell, on the map of this frame.  Blank when the
+            # flag is off or the target is off-map, never 0 by accident.
+            _tb = None
+            _tg = _e.get("target")
+            if _dtb is not None and _tg:
+                _cx, _cy = wmap.cell_of(float(_tg[0]), float(_tg[1]))
+                _cx, _cy = int(_cx), int(_cy)
+                if 0 <= _cx < _dtb.shape[0] and 0 <= _cy < _dtb.shape[1]:
+                    _tb = round(float(_dtb[_cy, _cx]), 3)
+            _rec = dict(
                 frame=idx, stamp=float(fr.stamp), x=float(t[0]), y=float(t[1]),
                 yaw=yaw, v=float(_v), w=float(_w),
                 state=str(_e.get("state", "")), mode=str(_e.get("mode", "")),
@@ -854,11 +1185,89 @@ def main():
                 debt_f=_e.get("debt_f_pick", ""),
                 local_u=_e.get("local_u_pick", ""),
                 local_term=_e.get("local_term_pick", ""),
-            ))
+            )
+            # The clearance column exists **only** when the flag is on.  Adding
+            # it unconditionally changes the decision CSV for every run and makes
+            # the md5 comparison against earlier builds meaningless -- which is
+            # exactly how this was caught: `A0` matched `S0` but stopped
+            # matching the recorded `ab54_A0` (23 columns became 24).
+            if _dtb is not None:
+                _rec["tgt_to_blocked"] = "" if _tb is None else _tb
+            rows_out.setdefault(name, []).append(_rec)
 
         if a.every > 1 and n % a.every:
             continue
 
+    if b3_on:
+        # A row held over by the re-test rule carries no `dreach` (it was not
+        # measured this frame), so sorting on it has to say what that means:
+        # held over == "still over the threshold as far as we know", i.e. the
+        # previous verdict stands.
+        _def = sorted({(r["cy"], r["cx"]) for r in b3_log_rows if r["deferred"]},
+                      key=lambda k: -max((r["dreach_m2"] or 0.0)
+                                         for r in b3_log_rows
+                                         if (r["cy"], r["cx"]) == k))
+        _held = sum(1 for r in b3_log_rows if r.get("retest") == 0)
+        print("b3 fuse     : threshold %.2f m2 ; %d candidates evaluated ; "
+              "%d distinct cells deferred ; %d frames with a deferral"
+              % (float(_wm_mod.OBSTACLE_TOPO_FUSE_M2), len(b3_log_rows),
+                 len(_def), wmap._topo_deferred_frames))
+        print("b3 retest   : N=%d R=%d ; %d of %d rows held over (%.1f%%) ; "
+              "re-measured %d / skipped %d"
+              % (int(getattr(_wm_mod, "OBSTACLE_TOPO_FUSE_RETEST_N", 0)),
+                 int(getattr(_wm_mod, "OBSTACLE_TOPO_FUSE_RETEST_R", 6)),
+                 _held, len(b3_log_rows),
+                 100.0 * _held / max(len(b3_log_rows), 1),
+                 int(getattr(wmap, "n_topo_retest", 0)),
+                 int(getattr(wmap, "n_topo_retest_skipped", 0))))
+    if a.b3_log and b3_log_rows:
+        _cols = ["frame", "stamp", "cx", "cy", "wx", "wy", "votes", "reach_base",
+                 "reach_with", "dreach_cells", "dreach_m2", "kind", "deferred",
+                 "retest"]
+        with open(a.b3_log, "w", newline="", encoding="utf-8") as _fh:
+            _w = csv.writer(_fh)
+            _w.writerow(_cols)
+            for _r in b3_log_rows:
+                _w.writerow([
+                    _r["frame"], repr(_r["stamp"]), _r["cx"], _r["cy"],
+                    "%.3f" % (_r["cx"] * wmap.resolution - wmap.extent),
+                    "%.3f" % (_r["cy"] * wmap.resolution - wmap.extent),
+                    _r["votes"], _r["reach_base"], _r["reach_with"],
+                    "" if _r["dreach"] is None else _r["dreach"],
+                    "" if _r["dreach_m2"] is None else "%.4f" % _r["dreach_m2"],
+                    _r["kind"], _r["deferred"], _r.get("retest", 1)])
+        print("b3 log      : %s (%d rows)" % (a.b3_log, len(b3_log_rows)))
+    if b3_prof is not None:
+        _pr = b3_prof.rows
+        if _pr:
+            _cols = ["frame", "stamp", "n_cand", "n_defer_prev", "n_defer",
+                     "wall_ms", "thread_ms", "cpu_ms"]
+            _extra = sorted({k for _r in _pr for k in _r} - set(_cols))
+            with open(a.b3_prof, "w", newline="", encoding="utf-8") as _fh:
+                _w = csv.writer(_fh)
+                _w.writerow(_cols + _extra)
+                for _r in _pr:
+                    _w.writerow([_r.get(_c, "") for _c in _cols]
+                                + ["%.4f" % _r[_c]
+                                   if isinstance(_r.get(_c), float)
+                                   else _r.get(_c, "") for _c in _extra])
+            print("b3 prof     : %s (%d frames, %d candidate evals)"
+                  % (a.b3_prof, len(_pr), sum(_r["n_cand"] for _r in _pr)))
+            if a.b3_prof_evals and b3_prof.evals_ms:
+                with open(a.b3_prof_evals, "w", encoding="utf-8") as _fh:
+                    _fh.write("eval_ms\n")
+                    for _v in b3_prof.evals_ms:
+                        _fh.write("%.5f\n" % _v)
+                print("b3 prof ev  : %s (%d evals)"
+                      % (a.b3_prof_evals, len(b3_prof.evals_ms)))
+        else:
+            print("b3 prof     : %s *** empty -- the fuse never ran ***"
+                  % a.b3_prof)
+    if cf is not None:
+        print("cf hold     : cleared a cell on %d of %d frames "
+              "(0 would mean the counterfactual was inert, and an inert "
+              "counterfactual cannot produce a negative result)"
+              % (cf_hits[0], n))
     print("frames       : %d" % n)
     info = explorer.info() if hasattr(explorer, "info") else {}
     for k in ("n_picks", "n_reused", "n_arrivals", "n_backoffs",
@@ -953,6 +1362,12 @@ def main():
                    npts=of["npts"][idx], pts=of["pts"][idx],
                    h=of["h"][idx], rng_sum=of["rng"][idx],
                    nb8=of["nb8"][idx], nground=of["nground"][idx],
+                   gframes=of["gframes"][idx],
+                   # Vote timing.  `vfirst`/`vlast` are 1-based frame numbers,
+                   # `-1` on a cell that never voted (impossible for a cell in
+                   # this list, but the column keeps its own convention).
+                   vfirst=of["vfirst"][idx], vlast=of["vlast"][idx],
+                   vmaxgap=of["vmaxgap"][idx], vrunmax=of["vrunmax"][idx],
                    n=int(wmap.n), resolution=np.float64(wmap.resolution),
                    extent=np.float64(wmap.extent),
                    h_bins=np.int32(OF_HB), h0=np.float64(OF_H0),
@@ -971,7 +1386,10 @@ def main():
             wr = csv.writer(fh)
             wr.writerow(["frame", "stamp", "cell", "rx", "ry", "ground",
                          "obstacle", "obstacle_now", "obs_votes",
-                         "ground_after", "on_path", "seen"])
+                         "ground_after", "on_path", "seen",
+                         "votes_ge_min", "after_outvoted", "released",
+                         "after_rel_onp", "opened_keeps", "all_nb_seen",
+                         "removable", "now_total", "pts_here", "pts_obs_here"])
             for row in probe_rows:
                 wr.writerow(row)
         print("  probe series : %s  (%d rows = %d frames x %d cells)"
@@ -1023,6 +1441,23 @@ def main():
                 for r in rows:
                     wr.writerow(r)
             print("  written      : %s" % path)
+            # `--strand-dump`: one row per frame, the balance of every stage
+            # that could have produced a target.  Written beside the decision
+            # CSV so the two can be joined on frame index.
+            if a.strand_dump and getattr(exr, "strand_hist", None):
+                sp = "%s_%s_strand.csv" % (os.path.splitext(a.out)[0], name)
+                keys: list = []
+                for _r in exr.strand_hist:
+                    for _k in _r:
+                        if _k not in keys:
+                            keys.append(_k)
+                with open(sp, "w", encoding="utf-8", newline="") as fh:
+                    wr = csv.DictWriter(fh, fieldnames=keys)
+                    wr.writeheader()
+                    for _r in exr.strand_hist:
+                        wr.writerow(_r)
+                print("  written      : %s  (%d rows)"
+                      % (sp, len(exr.strand_hist)))
 
     # ---- multi-arm scan: the comparison, and when the arms first disagreed ---
     #
@@ -1087,6 +1522,102 @@ def main():
         for name, exr in arms:
             if hasattr(exr, "pick_stats"):
                 print("  %-14s %s" % (name, exr.pick_stats().get("by_path", {})))
+            # ---- island probe: which early exit fired, by name ----------------
+            # `island_probes` counts times the probe was *chosen*; this says which
+            # of the eight ways it can decline actually declined.  Printed for
+            # every arm so the diagnostic can be exercised on a frozen capture
+            # long before it is worth spending simulator time on.
+            if hasattr(exr, "island_diag_report"):
+                rep = exr.island_diag_report()
+                if rep:
+                    print("  %-14s island_diag %s"
+                          % (name, json.dumps(rep, ensure_ascii=False)))
+
+        # ---- Gate C0: the size of the decision objects ----------------------
+        #
+        # Boss, 2026-10-07 (docs section 49): "do not tune lambda, do not tune
+        # NMS -- first answer whether the 10-13 m object is actually gone."
+        # The table above says whether the ranking had something to rank; this
+        # one says why it did not, and it is the only place the claim
+        # `<= fresh_split_m` is checked against a measurement rather than against
+        # the construction of `_split_fresh`.
+        #
+        # `same-obj sep` is the one to read first: it is the largest distance
+        # between two places taken from **one** object at a decision, i.e. the
+        # 9.8-13.2 m first-switch reading in its own units, before it gets mixed
+        # up with a trajectory that can no longer be compared across arms.
+        print()
+        print("===== Gate C0: decision-object scale (metres) =====")
+        print("  %-14s %6s %9s %9s %11s %11s %11s"
+              % ("arm", "#obj med", "span max", "span p95", "pick max med",
+                 "same-obj sep", "same sep med"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %6s %9s %9s %11s %11s %11s"
+                  % (name, st.get("patch_n_med", "-"),
+                     st.get("patch_span_max", "-"), st.get("patch_span_p95", "-"),
+                     st.get("patch_pick_max_med", "-"),
+                     st.get("patch_same_sep_max", "-"),
+                     st.get("patch_same_sep_med", "-")))
+        print("  （`span max` = 全场所有对象的最大直径；`same-obj sep` = 一次决策里"
+              "取自同一对象的两点最远距离；两者都要求 `patch_probe=True`）")
+        # The other half of the gate: an object only becomes a candidate if it
+        # clears `sweep_min_m2` and `sweep_min_dist`, so "more objects" is not
+        # "more candidates" until those two are read alongside.
+        print("  %-14s %9s %9s %9s %9s %9s"
+              % ("arm", "area med", ">=min_m2", "passes", "pass frac",
+                 "cand max"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %9s %9s %9s %9s %9s"
+                  % (name, st.get("patch_area_med", "-"),
+                     st.get("patch_ge_area_med", "-"),
+                     st.get("patch_pass_med", "-"),
+                     st.get("patch_pass_frac", "-"), st.get("cand_max", "-")))
+        print("  %-14s %9s %9s %9s %9s"
+              % ("arm", "area tot", "cells lost", "#obj max", "span max"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %9s %9s %9s %9s"
+                  % (name, st.get("patch_area_tot_med", "-"),
+                     st.get("patch_cells_lost", "-"), st.get("patch_n_max", "-"),
+                     st.get("patch_pick_max", "-")))
+        print("  %-14s %9s %9s %9s %9s"
+              % ("arm", "fresh p90", "P(>=1 elig)", "#elig p90", "passes med"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %9s %9s %9s %9s"
+                  % (name, st.get("patch_area_tot_p90", "-"),
+                     st.get("patch_ge_area_frac", "-"),
+                     st.get("patch_ge_area_p90", "-"),
+                     st.get("patch_pass_med", "-")))
+        print("  （`>=min_m2` = 面积 >= `sweep_min_m2` 的对象数；`passes` = 再满足"
+              " `sweep_min_dist` 的；`pass frac` = 全部对象里真正能成为候选的比例）")
+        print("  （`cells lost` 必须是 0：切分不能丢格，否则'对象变小'会是丢格造成的假象）")
+
+        # ---- Gate V0: does the *value* term discriminate? -------------------
+        #
+        # Boss, 2026-10-07 (section 50.7 option 1): the next cut is the value, not
+        # the size.  Same rule as every other gate -- read it before any decision
+        # table, because a term with no spread makes the ranking degenerate and a
+        # degenerate term *looks* like an inert mechanism.
+        #
+        # `val/area` is the anti-silent-no-op column: if the new value is a fixed
+        # multiple of the area it replaced, the arm is not testing a new value.
+        print()
+        print("===== Gate V0: does the value term discriminate =====")
+        print("  %-14s %8s %8s %9s %9s %10s %11s %11s"
+              % ("arm", "#picks", "#obj med", "val med", "ratio med", "ratio p90",
+                 "flat frac", "val/area med"))
+        for name, exr in arms:
+            st = exr.pick_stats() if hasattr(exr, "pick_stats") else {}
+            print("  %-14s %8s %8s %9s %9s %10s %11s %11s"
+                  % (name, st.get("n_value_seen", "-"), st.get("val_n_med", "-"),
+                     st.get("val_med", "-"), st.get("val_ratio_med", "-"),
+                     st.get("val_ratio_p90", "-"), st.get("val_flat_frac", "-"),
+                     st.get("val_over_area_med", "-")))
+        print("  （`ratio` = 桌上最大/最小价值；`flat frac` = 某次决策桌上所有对象价值全同的占比；")
+        print("    `val/area` 若卡在一个常数上 ⇒ 新价值只是旧面积的换算式，等于没改）")
 
         # ---- the candidate-level term's own instrument ---------------------
         #
