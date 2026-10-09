@@ -48,7 +48,7 @@ from r2slam import load_config, open_source, viz                     # noqa: E40
 from r2slam import labels as L                                        # noqa: E402
 from r2slam.deskew import Deskewer                                   # noqa: E402
 from r2slam.detect import (OnnxYoloDetector, load_names,        # noqa: E402
-                           load_class_map)
+                           load_class_map, DEFAULT_MODEL_FILE)
 from r2slam.explore import FrontierExplorer, VelocitySender           # noqa: E402
 from r2slam.frames import Frame                                      # noqa: E402
 from r2slam.fusion import object_3d, project_person_back              # noqa: E402
@@ -498,7 +498,7 @@ def main():
     # on that side there is no way to tell "removed false positives" from "lost
     # real objects", so the switch is a decision the operator makes; this default
     # records the one that was taken and the number that was known at the time.
-    det_model = _resolve_vendor(a.model, "yolo26n.onnx")
+    det_model = _resolve_vendor(a.model, DEFAULT_MODEL_FILE)
     det_names = _resolve_vendor(a.names, "coco.names")
     names = load_names(det_names) if os.path.exists(det_names) else None
     det = None

@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from r2slam import load_config                                    # noqa: E402
 from r2slam import labels as L                                     # noqa: E402
 from r2slam.deskew import Deskewer                                 # noqa: E402
-from r2slam.detect import OnnxYoloDetector                         # noqa: E402
+from r2slam.detect import OnnxYoloDetector, DEFAULT_MODEL_FILE    # noqa: E402
 from r2slam.explore import FrontierExplorer                        # noqa: E402
 from r2slam.fusion import object_3d, project_person_back           # noqa: E402
 from r2slam.nav import ObjectRegistry                              # noqa: E402
@@ -400,11 +400,18 @@ def main():
 
     det = None
     if not a.no_detect:
-        name = os.environ.get("R2SLAM_DET", "yolo26n.onnx")
+        # The class map is loaded by the detector itself (see `detect.py`), so a
+        # baked-vocabulary model needs no argument here.  It used to be absent
+        # from this call site, which was harmless only while the default was a
+        # COCO model.
+        name = os.environ.get("R2SLAM_DET", DEFAULT_MODEL_FILE)
         det = OnnxYoloDetector(_resolve_vendor(None, name),
                                conf=rt.person_conf,
                                num_threads=rt.detector_threads)
-        print("detector    : %s (%s)" % (det.kind, name))
+        print("detector    : %s (%s)  vocab %s"
+              % (det.kind, name,
+                 "COCO 80 (no sidecar)" if det.class_map is None
+                 else "%d baked classes" % len(det.class_map)))
 
     arms: list = []
 

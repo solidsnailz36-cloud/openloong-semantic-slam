@@ -11,30 +11,22 @@
 - ⚠️ 技能 `robot-policy-replay-ab/SKILL.md` 已 187 KB，该按主题拆（未做）。
 
 ## 结论索引
-1. **漂移**：真实侧不显著（ATE p50 0.276 m/102 m）；仿真侧＝少数帧被打偏且不恢复，根因＝**官方仿真器航向不可观测（LiDAR 不随车体转）**，非 `heading.py` bug。
-2. **B3 已收线停投**：成本门 PASS（`ms_map` p90 OFF ≤31.4 / ON ≥94.9 ms，**只看 p90**）；效果门 FAIL 撤回（里程 128.90→82.43 m p=0.0047；`plan_failures` ×12.7 ⇒ 规划器在走不通的地图上反复失败）。归因＝成本上界 `max-eval` 语义缺陷；无上界消融跑不完。`OBSTACLE_TOPO_FUSE_M2` 默认 0.0。
-3. **渲染↔规划一致性**（`b0bd756`）：曾有空类（`seen & ~ground & ~obstacle`，6466 格）被画成障碍 ⇒ 一格两个答案。定论：`GROUND_COVER_INFORMATIVE` + 删渲染补丁，**`render` 只画 `ground`（= `free_space` 读的同一数组）**。**画面可以有颜色，不能有第二个判据。** 默认仍 False；指标 `summary["map"]["seen_not_classified_cells"]` 归零即一致。
-4. **靠墙灰带**（`fe9e0a3`）：`ground = ground_ever & ~obstacle` 非单调 ⇒ 障碍 178.4 m² 里 120.9 曾为地面；`OBSTACLE_RELEASE` 永不触发。修法 **`OBSTACLE_GROUND_RATIO=1.0`**（ground 489→549、obstacle 178→118.5 m²）。安全：放掉的 60 m² 里 99.8% 是矛盾格，纯墙 votes≥20 一格没碰。闭环 A/B 仿真 n=3v3 过；**默认已改 1.0**（boss 批准）。Gate −1 已验 md5 `b664e5cfb6f76076`。
+1. **漂移**：真实侧不显著（ATE p50 0.276 m/102 m）；仿真侧＝少数帧被打偏且不恢复，根因＝**官方仿真器航向不可观测（LiDAR 不随车体转）**，非 `heading.py` bug。见 `docs/漂移归因_20261008.md`。
+2. **B3 已收线停投**：成本门 PASS（`ms_map` p90 OFF ≤31.4 / ON ≥94.9 ms，**只看 p90**）；**效果门 FAIL 撤回**（里程 128.90→82.43 m p=0.0047；`plan_failures` ×12.7 ⇒ 规划器在走不通的地图上反复失败）。归因＝成本上界 `max-eval` 语义缺陷；无上界消融跑不完。`OBSTACLE_TOPO_FUSE_M2` 默认 0.0。
+3. **渲染↔规划一致性**（`b0bd756`）：曾有空类（`seen & ~ground & ~obstacle`）被画成障碍 ⇒ 一格两个答案。定论：**`render` 只画 `ground`**（= `free_space` 读的同一数组）。**画面可以有颜色，不能有第二个判据。** 一致性指标＝`summary["map"]["seen_not_classified_cells"]`（**归零即一致**）；`GROUND_COVER_INFORMATIVE` 默认仍 False（见下"灰斑"）。
+4. **靠墙灰带**（`fe9e0a3`）：`ground = ground_ever & ~obstacle` 非单调 ⇒ 障碍 178.4 m² 里 120.9 曾为地面；`OBSTACLE_RELEASE` 永不触发。修法 **`OBSTACLE_GROUND_RATIO=1.0`**（ground 489→549、obstacle 178→118.5 m²）；放掉的 60 m² 里 99.8% 是矛盾格，纯墙 votes≥20 一格没碰。闭环 A/B 仿真 n=3v3 过；**默认已改 1.0**。
+   - **★ 灰斑问答（2026-10-09，boss 问"灰斑又变明显了"）**：**不是回归**。面板两种灰＝`blocked`（障碍，今天 11847 格）＋**`seen, not blocked`（空类，今天 6831 格）**。他上次看到的灰少那版 `online_real_def` 是 **ratio Gate−1 的对照臂**、**带着 `--ground-cover-informative`**（日志 `ground rule : TOTAL`）⇒ 只剩 1467 格。更早的交付图 `online_real_v6` 空类 = 6466 格 ⇒ **今天的灰 ≈ 交付图的灰**。要消掉＝开 `GROUND_COVER_INFORMATIVE`（行为零影响、只差 `traversable_m2`，代价是地图层时间）—— **新决定，待拍**。
 5. **类别表自定，39 类 / 51 条 prompt**：组委会不给列表 ⇒ `labels.py::_SPECS` 是我们的选择。已追加 13 COCO 类（零推理成本）+ 几何类（`unclassified object` / `railing`）+ 3 个**不在 COCO 80** 的类（38 `fire extinguisher` / 39 `gym equipment` / 40 `humanoid robot`）＋ 15 条别名 prompt。旧 id 全稳定。**"没标出来"= ①词表缺类 ②远处点云稀被 LiDAR 门拒 ③无实例层 ④YOLO 漏小目标**；换 3D 检测器只治 ③④。★ **措辞救不了模型看不见的类**（见索引 8 第五轮）。
-6. **边缘算力是规则要求** ⇒ 顺序重排：① 先拿回预算（render 下关键路径 → 地图层平方律，都要 A/B 门；算数代价 p50 170–264 ms vs 5 Hz 预算 200 ms；render 占 24–35% 且非算法）② 零新模型的免费覆盖（实例层 + 扩词表 + 几何类）③ 需任意类别 → 2D YOLO-World **替换** yolo26n（在线成本为零）④ 3D 大模型判死、IGLOSS 降级。**先量逐阶段预算，别加模型。**
-7. **实例层**（`r2slam/instances.py`，默认关）——能力有、**判据被真值证伪**：BEV 栅格 + `connectedComponents` + `reduceat`，3.7 ms/帧（合成）、p50 9.5 ms（全量）。行为中性已证（决策 md5 `b664e5cfb6f76076`）。真值：家具 16.2% / 真人 19.3% / 只落墙 63.4% / 空地 0.0% ⇒ **精度 35.9%**；召回 12/22=55%。错误单向（on nothing=0%）⇒ 判据目标＝提高"落家具上"占比、保持"落空地"≈0。**在此之前不再改几何阈值。**
-8. **⑤ 开放词汇**（doc + `823b559`、A 方案 `9cb03bc`）：
-   - 词表真相：烘焙 36 条 prompt 全是 COCO 类；`yolo26n` 本就是 COCO 80 ⇒ **换 YOLO-World 词表 80→36 是负收益**。q320 多检出真因是 backbone 更强。
-   - 接线缺陷已修：`online_pipeline.py` 从未传 `class_map` ⇒ idx 1–35 全 → `None` 静默丢弃。Gate −1 只差 10 个 `ms_*`。
-   - 顺带修 `detect.py` 硬编码 640：新增 `_declared_side()`，**图的形状是权威**。
-   - INT8 零检出根因：输出端 `Concat` 共用尺度 ⇒ 类别通道压成 0；修法 `quantize_onnx.py --exclude-tail 2`。**量化只值 1.35–1.42×，分辨率才是主杠杆。**
-   - 全量 1427 帧：q320 **45.3 ms / 13.31 MB**；拒收率 22.3% vs yolo26n 23.7%；`seen_cells` 均 68215。320 丢"小且静止"物体（丢了 `suitcase`）。
-   - **A 方案结果**：加 38 `fire extinguisher` / 39 `gym equipment` / 40 `humanoid robot` ⇒ 39 类。**`fire extinguisher` 6/6 检出（人眼确认），`yolo26n` 3 帧瞎、1 帧误判 person**；零回归。**`gym equipment` / `humanoid robot` 松门也是 0 ⇒ CLIP 无响应。** id 41/42 = `unclassified object` / `railing`（全库符号引用，安全）。
-   - `floor mat` 故意没加（厚度 < 0.2 m 门）。⚠️ 全部 CPU 本机数；**Orin 逐阶段预算仍未做**。
-   - **★ 第五轮（boss 选 3）—— 措辞无效、量化在 51 类上失效、但都不需要**（doc §21–§27）：
-     `labels.PROMPT_VARIANTS`（按**名字**索引）＋ `prompt_list()` 支持**一个 label 烤多条 prompt**（`index_to_label` 多对一，canonical 保留 ⇒ 前 37 索引逐位不变、两代可比）⇒ `yoloworld_alias_320.onnx`（51 类）。
-     **① 措辞无效**：15 条别名只有 `stationary bicycle` 响应（`max` 0.187 < 0.30 门）；强开门唯一框是**画面边缘假框**。
-     `humanoid robot` 四条措辞 **max ≤ 0.011**，**而目标确实在帧里**（帧 196 白色圆头人形机器人）⇒ 上一轮"被 person 压住"**证伪**，是**模型能力**问题。
-     ⚠️ **仪器教训**：`detect_mapped` 只留 **top-1 类** ⇒ 只看 label 计数会把"有响应但没赢"读成"没响应"；必须报 **`max`/`any≥x`/`top1`/`top1@conf`** 四列（新工具 `tools/probe_openvocab.py`）。
-     **② 量化在 51 类上失效**：fp32 0.62 → int8 0.43 框/帧（−31%）；同套量化在 36 类上无害（0.68）；`--exclude-tail 4/6` 无效、`--per-channel` 反而多出 `potted plant` 假框 ⇒ **51 类只能 fp32**；而 fp32 detect p50 **62.2 ms 比现役 64.6 快** ⇒ 不需要量化。
-     **③ 全量 1427 帧**：`fire extinguisher` **0 → 25 观测 / 5 实例 / 112 点**（首次进地图）；`clock`/`handbag` 也有；代价＝丢 `suitcase`/`bottle`（320 小目标，与 §15 一致，非别名造成）。
-     ★ **位姿/几何列 1427 帧逐位相同**，差异只在检测派生列 ⇒ **换检测器只改标签**。★ **确定性门**：yolo26n 重跑 vs 昨日 **决策 md5 逐位相同 `9b2b284631d9acb4fb96a22acad1d851`**。★ 顺带纠正：yolo26n 的 `suitcase`(-16.25,0.73) 其实是**红色消防器材箱**，新模型标 `fire extinguisher` 更对。
-     ⇒ **账"正但小"，换不换进交付＝"多一个类 vs 丢 suitcase"，等 boss 拍。** 新工具 `out/_alias_ab.py`；新技能 `openvocab-detector-attribution`。
+6. **边缘算力是规则要求** ⇒ 顺序重排：① 先拿回预算（render 下关键路径 → 地图层平方律，**都要 A/B 门**；算数代价 p50 170–264 ms vs 5 Hz 预算 200 ms）② 零新模型的免费覆盖（实例层 + 扩词表 + 几何类）③ 需任意类别 → 换检测器 ④ 3D 大模型判死、IGLOSS 降级。**先量逐阶段预算，别加模型。**
+7. **实例层**（`r2slam/instances.py`，默认关）——能力有、**判据被真值证伪**：非地面回波 → BEV 栅格 + `connectedComponents` + `reduceat`，3.7 ms/帧（合成）、p50 9.5 ms（全量）。行为中性已证（决策 md5 与只差这一个开关的跑逐位相同）。真值：家具 16.2% / 真人 19.3% / **只落墙 63.4%** / 空地 0.0% ⇒ **精度 35.9%**；召回 12/22=55%。错误单向（on nothing=0%）⇒ 判据目标＝提高"落家具上"占比、保持"落空地"≈0。**在此之前不再改几何阈值。**
+8. **⑤ 开放词汇 —— 已落地**（全部推导与逐轮数字在 `docs/开放词汇边缘化_第一轮实测_20261009.md` §1–§31，此处只留结论）：
+   - **现状**：默认检测器 = `detect.py::DEFAULT_MODEL_FILE = yoloworld_alias_320.onnx`（**51 类** fp32@320，**opset 19**）。
+   - **唯一能力增量**：`fire extinguisher`（**不在 COCO 80 里**）第一次进地图 —— 25 观测 / 5 实例 / 112 点；`clock`/`handbag` 也有。代价＝320 丢"小且静止"（`suitcase` 98 点 / `bottle` 43 点归零）。
+   - **判死（不再投）**：`gym equipment` / `humanoid robot` 检不到，且**不是措辞问题** —— 15 条别名 + **单类隔离**（`["robot"]` @320 **和** @640 都是零响应）+ **阳性对照**（`["person"]` max 0.816 / 105 框）三条路全 0 ⇒ 只能换文本塔/骨干/检测器家族。
+   - **量化判死**：INT8 在 36 类上无害（0.68 框/帧），在 **51 类上失效**（0.43 vs fp32 0.62）；`--exclude-tail 4/6` 无效、`--per-channel` 多出 `potted plant` 假框 ⇒ **51 类只能 fp32**（fp32 detect p50 61.7 ms ≤ 现役 64.6，**不需要量化**）。
+   - **仪器教训**：`detect_mapped` 只留 **top-1 类** ⇒ 只看 label 计数会把"有响应但没赢"读成"没响应"；必须报 **`max`/`any≥x`/`top1`/`top1@conf`** 四列（`tools/probe_openvocab.py`）。
+   - **确定性门**：同模型重跑决策 md5 逐位相同（yolo26n `9b2b284631d9acb4fb96a22acad1d851`；51 类 `77627ff49e072a912fe686e6611daf33`）。★ 换检测器**只改检测派生列**，位姿/几何列 1427 帧逐位相同。
+   - 旧轮次（`class_map` 接线缺陷 / `_declared_side` / INT8 零检出根因 / q320 对比 / 36→39 类）见 doc §1–§20。新工具 `out/_alias_ab.py`；新技能 `openvocab-detector-attribution`。
 9. **§73**：报覆盖必须同时报 `wall_s` 与 `sim_span`（RTF）。
 
 ## 渲染（定论）
@@ -50,8 +42,10 @@
 
 ## 环境
 - 仿真＝Docker 容器 `r2sim`；`/work` = `D:/E-Downd/sim_official`；容器内代码 `/work/r2slam_ws`。产物落宿主盘，不必 `docker cp`。**改完必须 `sync_to_container.sh`**。`PKG_PATHS` 是手工白名单，`replay_explore.py` 不在 ⇒ 单独 cp。`out/*.py` 跑法 `cd /work/r2slam_ws && python3 out/xxx.py`。
-- 只读复算：`export MSYS_NO_PATHCONV=1 && docker exec -i r2sim python3 - <<'EOF'`（漏 `-i` 静默无输出）。
-- 真实侧本机 `.venv`；`wsl.exe` / `wmic.exe` 被拦（用 `tasklist //FO CSV`）。
+- **★ 容器运行时**：`python3 3.8.10` / **`onnxruntime 1.16.3`（只保证到 opset 19，20 直接拒收）** / `cv2 5.0.0` / **无 `onnx` 模块**。⇒ **导出模型一律 `--opset 19`**，否则静默回退 cv2。
+- **★ 杀仿真**：容器里跑 **`docker exec r2sim bash /work/killbot.sh`**。⚠️ **`vendor/sim_scripts/kill_sim.sh` 在宿主上跑等于没跑**（它 pkill 的是宿主进程，且照样打印 `[kill_sim] done`）；容器里没有这个文件，`sync_to_container.sh` 也不发它。
+- 只读复算：`export MSYS_NO_PATHCONV=1 && docker exec -i r2sim python3 - <<'EOF'`（漏 `-i` 静默无输出）；**需要 cwd 时用 `docker exec -w /work/r2slam_ws`**（否则 `NoSuchFile` 会被误读成"模型坏了"）。
+- 真实侧本机 `.venv`（py 3.13.14 / ORT 1.30.0）；`wsl.exe` / `wmic.exe` 被拦（用 `tasklist //FO CSV`）。
 - `Xvfb :99` 被 kill 不清理 `/tmp/.X99-lock` ⇒ 相机不发、LiDAR 照常 ⇒ **就绪门必须查两个话题**。
 - "Docker 死机"不是容器 OOM；`/work` 是 bind mount ⇒ 产物全在。
 - 短跑机理：`sim_ros1.py:122` 循环条件 `not rospy.is_shutdown()` ⇒ ROS master 一断就 `return`（退出码 0、summary 完整）。**有效性门：`exit==0 && frames.csv 跨度 ≥ 0.97×目标`。**
@@ -65,7 +59,7 @@
 `/root/.gazebo/models/house.world` 烘焙 model/link/collision 世界位姿 ⇒ `out/_truth_geo.py`（**必须传 `--map`**，否则静默 `return 0`）。COLLADA 是 XML，`up_axis` 不可信（按底部贴地自适应）。**地图系＝世界系。**
 
 ## 感知 / 地图（定论）
-- `labels.py` ＝类别表唯一源；检测器 `yolo26n.onnx`（9.43 MB，回退 `yolo11n`），换模型**必须**跑 `tools/check_onnx_parity.py`。
+- `labels.py` ＝类别表唯一源；检测器默认＝**`detect.py::DEFAULT_MODEL_FILE` = `yoloworld_alias_320.onnx`**（51 类 fp32@320，opset 19，回退 `yolo26n.onnx` / `yolo11n.onnx`）；`OnnxYoloDetector` **自己加载旁边 sidecar**（`class_map` 默认哨兵 `_AUTO_CLASS_MAP`，显式 `None` 才当 COCO）；换模型**必须**跑 `tools/check_onnx_parity.py`。
 - 语义地图：绿 = `ground_ever & ~obstacle`；**格子有回波才算 seen**。
 - 障碍层（`worldmap.py`）：`MIN_VOTES=2`（数帧）｜`LO/HI=0.35/2.00`｜`RELEASE_FRAMES/RATIO=2/0.30`｜`OPEN_PX=3`｜`STRONG_VOTES=20`｜`HOLD="reset"`｜`MIN_POINTS=1`｜**`GROUND_RATIO=1.0`**｜`GROUND_COVER_INFORMATIVE=False`｜`blocked()=obstacle|obstacle_now`。⚠️ **别再退回 `votes<12`**。`obstacle_now` 写入 bug 已修（行为零变化）。`free_space` 读 `wmap.ground` 不是 `blocked()`。`add()` 末句 `ground = ground_ever & ~obstacle` ⇒ **ground 是 obstacle 的纯函数**。
 - 格索引：`floor((xy+extent)/resolution)`；真实 res 0.10 / extent 60.0 / n 1200，仿真 extent 30.0 / n 600。`cell_of` 返回 `(cx,cy)`。**必须 floor。**

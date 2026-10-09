@@ -59,6 +59,12 @@ ROOT_PATHS=(
   "vendor/detector/yolo26n.onnx"
   "vendor/detector/yolo11n.onnx"
   "vendor/detector/coco.names"
+  # The current default detector (`r2slam/detect.py::DEFAULT_MODEL_FILE`) and the
+  # sidecar that says which baked prompt each class index is.  Omitting the
+  # sidecar does not fail -- it silently drops every class but `person`, because
+  # the graph's indices are our prompt order and not COCO's.
+  "vendor/detector/yoloworld_alias_320.onnx"
+  "vendor/detector/yoloworld_alias_320.classmap.json"
   "vendor/sim_scripts/sim_truth_model_states.json"
 )
 

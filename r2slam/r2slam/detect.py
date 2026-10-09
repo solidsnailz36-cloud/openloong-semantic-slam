@@ -48,6 +48,21 @@ except ImportError:                     # run as a loose script
 PERSON_CLASS = 0
 COCO80 = None
 
+# The model the pipeline uses when `--model` is not given.  One constant, read
+# by `online_pipeline.py`, `replay_explore.py` and this file's own CLI, so
+# swapping the detector is one edit rather than three that can drift -- the two
+# previous detector swaps each shipped a stale default in one of the three.
+# It is a *baked-vocabulary* export (`tools/fetch_yoloworld.py`): its class
+# indices are our own prompt order, not COCO's, and the mapping lives in the
+# `.classmap.json` sidecar beside it.
+DEFAULT_MODEL_FILE = "yoloworld_alias_320.onnx"
+
+# Sentinel for `OnnxYoloDetector(class_map=...)`: "not specified" means "load the
+# sidecar beside the model if there is one", which is the only safe default.
+# An explicit `None` still means "treat this as a COCO model", so the escape
+# hatch survives.
+_AUTO_CLASS_MAP = object()
+
 # Letterbox padding colour.  Must match ultralytics' `LetterBox.padding_value`,
 # because a different border changes the model's input and therefore its boxes.
 PAD_VALUE = 114
@@ -104,6 +119,20 @@ def load_names(path: str) -> List[str]:
     return COCO80
 
 
+def load_sidecar(onnx_path: str) -> Optional[dict]:
+    """The whole sidecar dict, or None.  See `load_class_map` for what it is."""
+    if not onnx_path:
+        return None
+    side = os.path.splitext(str(onnx_path))[0] + ".classmap.json"
+    if not os.path.isfile(side):
+        return None
+    try:
+        with open(side, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:                              # noqa: BLE001
+        return None
+
+
 def load_class_map(onnx_path: str) -> Optional[Dict[int, int]]:
     """`index -> project label` sidecar for a baked-vocabulary model.
 
@@ -112,17 +141,11 @@ def load_class_map(onnx_path: str) -> Optional[Dict[int, int]]:
     `detect_mapped` falls back to `labels.COCO_TO_LABEL`, so a missing file
     produces the old behaviour rather than a silent relabelling.
     """
-    if not onnx_path:
-        return None
-    side = os.path.splitext(str(onnx_path))[0] + ".classmap.json"
-    if not os.path.isfile(side):
-        return None
+    d = load_sidecar(onnx_path) or {}
     try:
-        with open(side, encoding="utf-8") as fh:
-            d = json.load(fh)
         m = d.get("index_to_label") or {}
         return {int(k): int(v) for k, v in m.items()} or None
-    except Exception:
+    except Exception:                              # noqa: BLE001
         return None
 
 
@@ -155,8 +178,9 @@ class OnnxYoloDetector:
 
     def __init__(self, model: str, conf: float = 0.30, size: Optional[int] = None,
                  backend: str = "auto", num_threads: int = 2,
-                 class_map: Optional[Dict[int, int]] = None):
+                 class_map=_AUTO_CLASS_MAP):
         self.conf = float(conf)
+        self.model_path = str(model)
         # Prefilter for the raw anchor tensor.  It must be **no higher than the
         # lowest per-class floor in the label table**, otherwise a box that
         # clears its own class floor could be thrown away before any per-class
@@ -181,6 +205,17 @@ class OnnxYoloDetector:
         # in the .classmap.json next to the .onnx -- and applying
         # `COCO_TO_LABEL` to it would relabel every box silently.  None means
         # "this is a COCO model", which is the case for yolo26n.onnx.
+        #
+        # Loading the sidecar **by default** rather than asking callers to
+        # remember: two call sites (`online_pipeline.py`, then `replay_explore.py`)
+        # each shipped without the argument, and each therefore silently dropped
+        # every class but `person` the moment a baked model became the default.
+        # The failure is invisible -- boxes still appear, the log is healthy --
+        # so the safe direction is to make the correct behaviour the one you get
+        # by doing nothing.  A caller that really wants the COCO mapping passes
+        # an explicit `None`.
+        if class_map is _AUTO_CLASS_MAP:
+            class_map = load_class_map(model)
         self.class_map: Optional[Dict[int, int]] = (
             {int(k): int(v) for k, v in class_map.items()}
             if class_map else None)
@@ -263,24 +298,43 @@ class OnnxYoloDetector:
 
     # ------------------------------------------------------------------ input
     def _declared_side(self) -> Optional[int]:
-        """The square input side the graph declares, or None if it is not a
-        static square tensor.
+        """The square input side the graph declares, or None if it cannot be
+        established.
 
-        Only onnxruntime can be asked; `cv2.dnn` does not expose the input
-        shape before a forward pass, so that backend keeps the previous
-        default.  Returning None rather than raising keeps a dynamic-shape
-        export working exactly as it did before this existed.
+        Two sources, in order of authority:
+
+        1. the graph itself, via onnxruntime's input signature -- the shape the
+           session will actually enforce;
+        2. failing that, the **sidecar's `imgsz`**, which is the side the export
+           was made at (`tools/fetch_yoloworld.py` records it).
+
+        The second exists because `cv2.dnn` cannot be asked for an input shape
+        before a forward pass, and the old code answered that with a constant.
+        Measured in the simulator container on 2026-10-09: onnxruntime 1.16.3
+        refuses the opset-20 export, the detector silently falls back to cv2,
+        `_declared_side()` returned None and the pipeline reported `input_px`
+        640 for a **320** graph.  cv2 accepted the oversized blob without
+        erroring -- the boxes come out plausible and misplaced, which is the
+        exact failure the old comment here predicted and did not prevent.
+
+        Returning None still means "guess from the dialect", so a COCO model
+        with neither a session shape nor a sidecar behaves exactly as before.
         """
-        if self.backend != "onnxruntime":
-            return None
+        if self.backend == "onnxruntime":
+            try:
+                shp = self.sess.get_inputs()[0].shape
+            except Exception:                       # noqa: BLE001 - old runtimes
+                shp = None
+            if (shp and len(shp) == 4
+                    and all(isinstance(d, int) and d > 0 for d in shp[1:])
+                    and shp[2] == shp[3]):
+                return int(shp[2])
         try:
-            shp = self.sess.get_inputs()[0].shape
-        except Exception:                       # noqa: BLE001 - old runtimes
-            return None
-        if (shp and len(shp) == 4
-                and all(isinstance(d, int) and d > 0 for d in shp[1:])
-                and shp[2] == shp[3]):
-            return int(shp[2])
+            imgsz = (load_sidecar(self.model_path) or {}).get("imgsz")
+            if imgsz and int(imgsz) > 0:
+                return int(imgsz)
+        except Exception:                           # noqa: BLE001
+            pass
         return None
 
     @staticmethod
@@ -580,7 +634,8 @@ if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.path.join(here, "..", "..", "vendor",
-                                                    "detector", "yolo26n.onnx"))
+                                                    "detector",
+                                                    DEFAULT_MODEL_FILE))
     ap.add_argument("--names", default=os.path.join(here, "..", "..", "vendor",
                                                     "detector", "coco.names"))
     ap.add_argument("--glob", required=True)

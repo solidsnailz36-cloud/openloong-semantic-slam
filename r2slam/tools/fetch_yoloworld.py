@@ -90,40 +90,63 @@ def main() -> int:
                          "chosen: the published edge number is for the l variant, "
                          "so `s` is the conservative pick for a 5 Hz budget.")
     ap.add_argument("--imgsz", type=int, default=640)
-    ap.add_argument("--opset", type=int, default=20,
-                    help="20 is the floor the AMD/Ryzen AI walkthrough gives for "
-                         "YOLO-World ONNX export; lower versions drop ops the "
-                         "NPU providers need.")
+    ap.add_argument("--opset", type=int, default=19,
+                    help="19 rather than 20.  The AMD/Ryzen AI walkthrough gives "
+                         "20 as the floor for NPU providers, but this project's "
+                         "runtime is onnxruntime, and onnxruntime only "
+                         "*guarantees* an opset up to its own release: 1.16.3 "
+                         "(the simulator container's) refuses an opset-20 graph "
+                         "outright, which silently demotes the detector to the "
+                         "cv2 backend.  Measured 2026-10-09.  19 loads in both "
+                         "the container and the dev venv, and the graph needs "
+                         "nothing from 20.")
     ap.add_argument("--out", default="../vendor/detector/yoloworld_s.onnx")
+    ap.add_argument("--prompts", default="",
+                    help="dev only: bake exactly these comma-separated prompts "
+                         "instead of the label table's, every index mapped to "
+                         "--alias-label.  For isolation tests -- 'is the text "
+                         "tower blind to this word, or is it merely diluted by "
+                         "the other fifty classes?' -- which the table cannot "
+                         "ask, because the table always bakes all of it.")
+    ap.add_argument("--alias-label", type=int, default=0,
+                    help="label id that every --prompts entry maps to")
     ap.add_argument("--check", action="store_true",
                     help="print the prompt list and exit, without downloading "
                          "anything -- use this to see what WOULD be baked.")
     a = ap.parse_args()
 
-    labs, prompts = prompt_list()
-    print("prompts: %d  ->  %d distinct labels%s"
-          % (len(prompts), len(set(labs)),
-             "" if len(labs) == len(set(labs)) else "   (aliases present)"))
-    for i, (lab, p) in enumerate(zip(labs, prompts)):
-        mark = "" if p == L.name(lab) else "   <- alias"
-        print("  idx %2d -> label %2d  %-18s%s" % (i, lab, p, mark))
+    if a.prompts:
+        prompts = [p.strip() for p in a.prompts.split(",") if p.strip()]
+        labs = [int(a.alias_label)] * len(prompts)
+        print("prompts: %d (dev override, all -> label %d)"
+              % (len(prompts), a.alias_label))
+        for i, p in enumerate(prompts):
+            print("  idx %2d -> label %2d  %s" % (i, a.alias_label, p))
+    else:
+        labs, prompts = prompt_list()
+        print("prompts: %d  ->  %d distinct labels%s"
+              % (len(prompts), len(set(labs)),
+                 "" if len(labs) == len(set(labs)) else "   (aliases present)"))
+        for i, (lab, p) in enumerate(zip(labs, prompts)):
+            mark = "" if p == L.name(lab) else "   <- alias"
+            print("  idx %2d -> label %2d  %-18s%s" % (i, lab, p, mark))
 
-    # Two ways the 1:1 assumption could rot now that aliases exist, both silent
-    # at run time and both therefore checked here: a label with no prompt at all
-    # can never be produced by the detector, and a label whose canonical name
-    # was replaced by an alias would make two models incomparable while looking
-    # identical in the table.
-    obj = [l for l in sorted(L.LABEL_NAMES)
-           if l > L.TRAVERSABLE and l not in L.GEOMETRIC_OBJECT_LABELS]
-    miss = [l for l in obj if l not in labs]
-    no_canon = sorted(
-        l for l in set(labs)
-        if sum(1 for x, y in zip(labs, prompts)
-               if x == l and y == L.name(l)) != 1)
-    if miss or no_canon:
-        print("*** prompt table is inconsistent: missing %s / non-canonical %s"
-              % (miss, no_canon))
-        return 3
+        # Two ways the 1:1 assumption could rot now that aliases exist, both
+        # silent at run time and both therefore checked here: a label with no
+        # prompt at all can never be produced by the detector, and a label whose
+        # canonical name was replaced by an alias would make two models
+        # incomparable while looking identical in the table.
+        obj = [l for l in sorted(L.LABEL_NAMES)
+               if l > L.TRAVERSABLE and l not in L.GEOMETRIC_OBJECT_LABELS]
+        miss = [l for l in obj if l not in labs]
+        no_canon = sorted(
+            l for l in set(labs)
+            if sum(1 for x, y in zip(labs, prompts)
+                   if x == l and y == L.name(l)) != 1)
+        if miss or no_canon:
+            print("*** prompt table is inconsistent: missing %s / non-canonical %s"
+                  % (miss, no_canon))
+            return 3
     if a.check:
         return 0
 
