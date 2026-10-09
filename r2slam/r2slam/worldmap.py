@@ -1506,11 +1506,27 @@ class WorldMap:
                                                                  sx0:sx1]
         img = cv2.resize(win, (size, size),
                          interpolation=cv2.INTER_NEAREST)
+        # ★ World +y must point UP the panel.
+        #
+        # `win` is built with the grid's row index (which grows with world +y)
+        # straight into the image row, and image rows grow downward -- so
+        # without this flip the panel is the vertical MIRROR of a top-down view
+        # and, for a viewer reading it as a floor plan, the robot's left and
+        # right are swapped: a right turn is drawn as a left one.  Reported off
+        # the real run on 2026-10-09 ("the video turns right, the semantic map
+        # turns left"), and `tools/test_worldmap.py` section 12 states the
+        # invariant and measures it off the rendered pixels.
+        #
+        # The flip is applied to the RASTER ONLY.  The legend, the scale bar and
+        # the robot marker are drawn after this point and have to stay upright,
+        # which is why the flip is here rather than on the finished panel.
+        img = cv2.flip(img, 0)
         k = size / float(max(x1 - x0, 1))       # px per cell, after crop
 
         def to_px(x, y):
-            px = (self.cell_of(x, y)[0] - x0) * k
-            py = (self.cell_of(x, y)[1] - y0) * k
+            c = self.cell_of(x, y)
+            px = (c[0] - x0) * k
+            py = ((y1 - y0 - 1) - (c[1] - y0)) * k   # flipped, see above
             return px.astype(np.int32), py.astype(np.int32)
 
         # trajectory

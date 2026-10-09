@@ -325,11 +325,22 @@ def main():
     k2 = 540.0 / (2.0 * half)
     xr, yr = w.traj[-1]
 
+    # The panel's framing, written out rather than borrowed: the window is
+    # `2*half` cells on a side, centred on the robot's cell, world +x runs to
+    # the RIGHT and world +y runs UP the screen (section 12 is what pins that
+    # last one down), and the pixel of a cell is its left/top edge after that
+    # orientation is applied.
+    #
+    # An earlier version of this helper said "+y downwards" -- which is exactly
+    # the mirror section 12 exists to catch -- so it agreed with the broken
+    # renderer and reported "ok" on a mirrored panel.
+    cxr, cyr = w.cell_of(xr, yr)
+    x0c, y0c, Hc = int(cxr) - half, int(cyr) - half, 2 * half
+
     def pixel_of(x, y):
-        # The panel maps +y downwards (row grows with cell_y), and the window is
-        # square with the robot at its centre -- that is the property under test.
-        return (int(round(270 + (x - xr) / w.resolution * k2)),
-                int(round(270 + (y - yr) / w.resolution * k2)))
+        c = w.cell_of(x, y)                    # the project's cell indexing
+        return (int(round((int(c[0]) - x0c) * k2)),
+                int(round((Hc - 1 - (int(c[1]) - y0c)) * k2)))
 
     green = tuple(LABEL_COLORS[L.TRAVERSABLE][::-1])
     for nm, (x, y) in [("5 m along +x", (-24.0, -10.0)),
@@ -343,6 +354,60 @@ def main():
               % (px, py, inside, col, green))
     check("... and the panel really is %0.0f m across" % span_m,
           abs(span_m - 20.0) < 1e-6)
+
+    # ------------------------------------------------------------------
+    # 12. the panel has to read like a floor plan: the robot's left is the
+    #     panel's left.
+    #
+    # `render()` wrote the grid's row index straight into the image row, and
+    # image rows grow DOWNWARD, so world +y came out pointing down the screen.
+    # That makes the panel the vertical mirror of a top-down view, and a right
+    # turn appear as a left one.  Reported off the real run on 2026-10-09:
+    # "the video turns right, the semantic map turns left".
+    #
+    # The invariant is stated the way a person reads a map rather than in pixel
+    # arithmetic: **a robot heading to the right of the panel must carry its
+    # left hand up the panel.**  (Facing east, your left is north.)  Section 11
+    # could not catch this -- it reused a hand-written `pixel_of` that encoded
+    # the same y-down convention, so it passed on the mirrored image too.
+    #
+    # The geometry below is measured off the RENDERED PIXELS, not recomputed.
+    # ------------------------------------------------------------------
+    w = WorldMap()
+    r0, c0 = w.cell_of(0.0, 0.0)
+    r0, c0 = int(r0), int(c0)
+    cells = int(round(6.0 / w.resolution))
+    w.ground[r0, c0:c0 + cells + 1] = True       # floor 6 m along +x = heading
+    w.ground[r0:r0 + cells + 1, c0] = True       # floor 6 m along +y = the LEFT
+    w.seen[r0, c0:c0 + cells + 1] = True
+    w.seen[r0:r0 + cells + 1, c0] = True
+    w.traj = [(0.0, 0.0)]
+    img = w.render(size=540)
+
+    green = np.all(img == np.array(LABEL_COLORS[L.TRAVERSABLE], np.uint8), axis=2)
+    ys, xs = np.nonzero(np.all(img == np.uint8(255), axis=2))
+    if len(xs) == 0:
+        check("the robot marker is drawn (else this section cannot run)", False)
+    else:
+        rx, ry = int(np.median(xs)), int(np.median(ys))
+        b = 3
+        x_spur = np.nonzero(green[ry - b:ry + b + 1, :].any(axis=0))[0]
+        y_spur = np.nonzero(green[:, rx - b:rx + b + 1].any(axis=1))[0]
+        check("heading (+x) is drawn to the RIGHT of the robot",
+              len(x_spur) and x_spur.max() >= rx + 5,
+              "robot col %d, +x spur spans %s" % (rx, (x_spur.min(), x_spur.max())
+                                                  if len(x_spur) else None))
+        check("... and nothing is drawn to its left along that row",
+              len(x_spur) and x_spur.min() >= rx - b - 1,
+              "+x spur reaches col %d, robot at %d" % (x_spur.min() if len(x_spur) else -1, rx))
+        check("the robot's LEFT (+y) is drawn UP the panel",
+              len(y_spur) and y_spur.min() <= ry - 5,
+              "robot row %d, +y spur spans %s" % (ry, (y_spur.min(), y_spur.max())
+                                                  if len(y_spur) else None))
+        check("... and NOT down the panel (this is the handedness)",
+              len(y_spur) and y_spur.max() <= ry + b + 1,
+              "+y spur reaches row %d, robot at %d -- the panel is mirrored"
+              % (y_spur.max() if len(y_spur) else -1, ry))
 
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
