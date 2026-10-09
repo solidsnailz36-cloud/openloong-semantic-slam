@@ -357,6 +357,13 @@ OBSTACLE_STRONG_VOTES = 20
 OBSTACLE_HOLD = "reset"
 OBSTACLE_MIN_POINTS = 1
 
+# Display only.  A `seen` cell that the obstacle layer did NOT promote, and whose
+# eight neighbours are all traversable, is drawn as traversable rather than as a
+# grey dot in the middle of the floor.  It changes no map array -- see the note
+# in `WorldMap.render`, which carries the measurement behind it.  Set to False to
+# see the raw classification.
+RENDER_FILL_LONE_SEEN = True
+
 # B3 topological fuse: the largest loss of the robot's *current* reachable area
 # (m2) that admitting one cell is allowed to cost before that admission is
 # deferred.  `0.0` = off, and with it `WorldMap.add` is bit-identical to the
@@ -1452,6 +1459,31 @@ class WorldMap:
         cls[self.seen] = 3
         cls[self.seen & self.obstacle] = 2
         cls[self.ground] = 1
+
+        # A lone `seen` cell in the middle of the floor is not a thing, and the
+        # map has already said so: class 3 is `~obstacle`, i.e. the obstacle
+        # layer declined to promote it.
+        #
+        # Measured on the real corridor: the grey specks inside green are 1006
+        # components with a MEDIAN SIZE OF ONE CELL (19.6 m2 in total, largest
+        # 0.15 m2), and going back to the camera at those places shows plain
+        # floor -- painted lines, timber, tile -- with nothing 0.35-2 m tall.
+        # Each cell holds 2-3 points, and the same cells also hold points ~1.4 m
+        # BELOW the floor plane, which nothing physical explains.  These are
+        # sparse multi-path returns, and the observation layer cannot separate
+        # them from real structure: the point-cloud discriminator was already
+        # tried and landed at AUC 0.638.
+        #
+        # So this is a DRAWING rule and nothing else.  `self.seen`, `ground`,
+        # `obstacle` and the pcd are untouched, so the planner, the coverage
+        # figure and the replay are all unaffected; only the panel changes.
+        if RENDER_FILL_LONE_SEEN:
+            green = (cls == 1)
+            nb = (cv2.filter2D(green.astype(np.float32), -1,
+                               np.ones((3, 3), np.float32))
+                  - green)                      # green neighbours, centre excluded
+            cls[(cls == 3) & (nb >= 8)] = 1
+
         if centre is None:
             centre = self.traj[-1] if self.traj else (0.0, 0.0)
         cx, cy = self.cell_of(centre[0], centre[1])

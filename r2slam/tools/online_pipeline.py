@@ -605,6 +605,14 @@ def main():
     n_skipped = 0
     n_unmapped_total = 0
     n_yaw_missing = 0
+    # Width of the camera half of the sheet, pinned by the first rendered frame.
+    # `camera_panel` scales by the frame's own aspect, and a couple of frames in
+    # the real bag arrive with a different image size -- measured on the r2 bag,
+    # 2 frames of 1427 came out 1080 px wide where the rest were 1206, and the
+    # encoder then squeezed those two into the fixed output size.  Pinning the
+    # width costs a resize on those frames and makes every sheet the same shape,
+    # which is what a video file needs anyway.
+    panel_w = None
     # Why a detection that the detector reported did not become an object.  Both
     # counts are reported at the end: a gate that silently removes things is
     # indistinguishable from a detector that never saw them.
@@ -891,12 +899,18 @@ def main():
 
             # ---------------- render ----------------
             if (not a.no_render) and (n - 1) % max(a.every, 1) == 0:
+                import cv2
                 if fr.image is not None:
                     left = annotate(fr.image, boxes, names, a.panel_h,
                                     note="detected %d -> localised %d"
                                          % (len(boxes), len(objects)))
                 else:
                     left = viz.topdown(cloud, size=a.panel_h)
+                if panel_w is None:
+                    panel_w = left.shape[1]
+                elif left.shape[1] != panel_w:
+                    left = cv2.resize(left, (panel_w, left.shape[0]),
+                                      interpolation=cv2.INTER_AREA)
                 right = wmap.render(size=left.shape[0], zoom=a.zoom)
                 sheet = np.hstack([left, right])
                 # H.264 with yuv420p needs even dimensions, and the fisheye

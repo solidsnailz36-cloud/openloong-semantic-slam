@@ -468,6 +468,72 @@ def main():
           got["obstacle + ground_ever"] == blocked, "got %s" % (got["obstacle + ground_ever"],))
     check("ground is drawn green", got["ground"] == green, "got %s" % (got["ground"],))
 
+    # ------------------------------------------------------------------
+    # 14. a lone dot in the middle of the floor is drawn as floor
+    #
+    # The camera said it is floor: going back to the frames that observed these
+    # cells shows painted lines, timber and tile, with nothing 0.35-2 m tall.
+    # They are sparse returns (2-3 points per cell, plus neighbours 1.4 m below
+    # the floor plane) that the obstacle layer never promoted -- so class 3 by
+    # definition, and 1006 of them, median size ONE cell, is the salt-and-pepper
+    # in the green.  The fill is a drawing rule; the arrays are untouched, so
+    # the planner and every metric are unaffected.  What must NOT happen is a
+    # promoted obstacle being filled, or a genuine cluster being filled.
+    # ------------------------------------------------------------------
+    import r2slam.worldmap as _wm
+
+    def build(patch):
+        """`patch` maps (dcol, drow) -> 'g'|'u'|'b'; the rest of a 5x5 is 'g'."""
+        m = _wm.WorldMap()
+        m.traj = [(-29.0, -10.0)]
+        c0, r0 = 28, 198
+        for dc in range(5):
+            for dr in range(5):
+                col, row = c0 + dc, r0 + dr
+                kind = patch.get((dc, dr), "g")
+                m.seen[row, col] = True
+                if kind == "u":                      # seen, never promoted
+                    pass
+                elif kind == "b":                    # blocked: obstacle owns it
+                    m.obstacle[row, col] = True
+                else:                                # ground
+                    m.ground_ever[row, col] = True
+        np.logical_and(m.ground_ever, ~m.obstacle, out=m.ground)
+        return m
+
+    def colour(m, dc, dr):
+        # Pixel of the CENTRE of a grid cell, from the indices.  Two traps here,
+        # both hit on the first run of this section: going via world coordinates
+        # round-trips through `floor((x + extent)/res)` and lands a cell short
+        # when the quotient is 27.999999x, and sampling the cell's top-left edge
+        # rounds to the previous cell when the edge is at x.4 px (cell 32 ->
+        # 329.4 -> 329, which is cell 31).  The centre has neither problem.
+        cxr, cyr = w.cell_of(-29.0, -10.0)
+        x0c, y0c = int(cxr) - half, int(cyr) - half
+        k = 540.0 / (2.0 * half)
+        col, row = 28 + dc, 198 + dr
+        px = int(round((col - x0c + 0.5) * k))
+        py = int(round((2 * half - 1 - (row - y0c) + 0.5) * k))
+        return tuple(int(v) for v in m.render(size=540)[py, px])
+
+    green = tuple(int(v) for v in LABEL_COLORS[L.TRAVERSABLE])
+    dim = (48, 48, 56)
+    wall = (95, 95, 105)
+
+    got = colour(build({}), 2, 2)
+    check("plain ground still renders green", got == green, "got %s" % (got,))
+    got = colour(build({(2, 2): "u"}), 2, 2)
+    check("a LONE unpromoted cell inside green is filled (drawn green)",
+          got == green, "got %s -- still a grey dot" % (got,))
+    got = colour(build({(2, 2): "u", (3, 2): "u"}), 2, 2)
+    check("... but a CLUSTER of unpromoted cells is NOT filled",
+          got == dim, "got %s" % (got,))
+    got = colour(build({(2, 2): "b"}), 2, 2)
+    check("a lone BOUNDED cell is never filled", got == wall, "got %s" % (got,))
+    got = colour(build({(2, 2): "u", (4, 4): "b"}), 2, 2)
+    check("... and filling one cell does not disturb its neighbours",
+          got == green and colour(build({(2, 2): "u", (4, 4): "b"}), 4, 4) == wall)
+
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
         for f in FAILS:
