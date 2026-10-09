@@ -30,6 +30,20 @@
    - **确定性门**：同模型重跑决策 md5 逐位相同（yolo26n `9b2b284631d9acb4fb96a22acad1d851`；51 类 `77627ff49e072a912fe686e6611daf33`）。★ 换检测器**只改检测派生列**，位姿/几何列 1427 帧逐位相同。
    - 旧轮次（`class_map` 接线缺陷 / `_declared_side` / INT8 零检出根因 / q320 对比 / 36→39 类）见 doc §1–§20。新工具 `out/_alias_ab.py`；新技能 `openvocab-detector-attribution`。
 9. **§73**：报覆盖必须同时报 `wall_s` 与 `sim_span`（RTF）。
+10. **★ 改进空间与外部参考**（完整分档与出处：`docs/改进空间评估_20261009.md`）：
+   - **★★ 我们一直喂 CLIP 光秃秃的名词**：本机核实 `ultralytics/nn/tasks.py:1131 get_text_pe` **直接 tokenize 给的字符串、不加模板**。
+     杠杆是真的大（`a photo of a fire extinguisher` **0.942** vs 裸名 **0.563**），**但整表套模板是净回归**
+     （51 类全套 ⇒ 框 124→**386**，而 **`person` 115→3**、`tv` 1→**241**；越具体的描述越糟，`a white robot with a round head` 完全无响应）。
+     ⇒ **形式是杠杆，但不能整表套；要用它必须逐类标定门槛。**
+   - **★★ 最大的结构性缺口＝没有尺子**：真实侧无真值 ⇒ 所有"检出/改善"都是自证的（上面那条就是"数字大涨、地图变烂"的标本）。
+     最小可行：**人工标注 30–50 帧** ⇒ 逐类 P/R + 定位误差 p50/p90；此后一切词表/模板/检测器改动先过它。
+   - **★★ 下一步最值得做的"换武器"：YOLOE**（清华 THU-MIG，ICCV 2025）。三种提示模式：
+     文本 `get_text_pe` / **视觉 `get_visual_pe`（给参照框，不用词）** / **免提示 `set_vocab`（内置 4585 类）**，
+     后两种正好绕开"文本塔看不见我们的词"。**★ 本机 `ultralytics 8.4.172` 已自带 `YOLOE`，三个 API 都在**；
+     接入成本≈换一次检测器（仍需 `--opset 19`）。
+   - 其他参考：ConceptGraphs / OVO / Octree-Graph / DovSG（开放词汇 3D 场景图，**都假设 RGB-D**）；
+     PointPainting / synesthesiaX（2D 语义画到点云，与我们同源）；LVI-SAM·R3LIVE·FAST-LIVO2（**我们有个 400 Hz IMU 完全没用**）。
+   - **★ 硬事实**：新默认下全帧 `ms_total` p50 **222 ms ＞ 5 Hz 的 200 ms 预算**；扣掉 `render`(58.6) 才 ~163 ms ⇒ **render 必须在关键路径外（一直没做）**。
 
 ## 渲染（定论）
 - `render()` 只画 `ground`。**画面可以有颜色，不能有第二个真相源。**

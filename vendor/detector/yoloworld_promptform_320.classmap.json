@@ -1,0 +1,21 @@
+{
+  "variant": "yolov8s-worldv2.pt",
+  "imgsz": 320,
+  "note": "index -> project label id, in the order the prompts were baked; r2slam/detect.py loads this when it sits beside the .onnx so no COCO mapping is applied",
+  "index_to_label": {
+    "0": 40,
+    "1": 40,
+    "2": 40,
+    "3": 40,
+    "4": 40,
+    "5": 40
+  },
+  "prompts": [
+    "a photo of a robot",
+    "a photo of a humanoid robot",
+    "a humanoid robot standing in a room",
+    "a white robot with a round head",
+    "a photo of a fire extinguisher",
+    "a photo of a person"
+  ]
+}
