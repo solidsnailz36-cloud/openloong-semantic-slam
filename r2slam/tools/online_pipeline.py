@@ -229,6 +229,14 @@ def parse_args():
                          "Measured 3.7 ms/frame at 49,152 points.  It adds "
                          "objects to the map, so it needs an A/B like anything "
                          "else that changes what the run reports.")
+    ap.add_argument("--instance-log", default=None, metavar="FILE",
+                    help="read-only row log of the instance layer: one row per "
+                         "candidate cluster per frame, with its centroid, extent, "
+                         "footprint and outcome.  `summary[\"instance_layer\"]` "
+                         "keeps only the last frame's twelve, which is enough to "
+                         "see WHAT it found and not enough to check WHETHER it "
+                         "was right -- that needs the whole run against ground "
+                         "truth.  Implies --instance-layer.")
     ap.add_argument("--b3-log", default=None, metavar="FILE",
                     help="read-only row log of the B3 fuse in a **live** run: one "
                          "row per (frame, candidate) evaluation with the dreach "
@@ -640,6 +648,18 @@ def main():
         print("heading     : LiDAR does NOT rotate with the base (simulator); "
               "dead-reckoning yaw from the commanded rate")
     t_run = time.time()
+    # The instance log.  Opened here and closed just before the summary is built,
+    # because the rows have to be written as the run goes rather than collected:
+    # a long run produces tens of thousands of them.
+    inst_log = None
+    inst_w = None
+    if a.instance_log:
+        a.instance_layer = True
+        inst_log = open(a.instance_log, "w", newline="", encoding="utf-8")
+        inst_w = csv.writer(inst_log)
+        inst_w.writerow(["frame", "stamp", "label", "named", "x", "y", "z",
+                         "n_points", "n_cells", "z_min", "z_max",
+                         "footprint_m2", "side_min", "side_max"])
     n = 0
     n_rec = 0
     n_skipped = 0
@@ -836,26 +856,40 @@ def main():
             if a.instance_layer:
                 clusters = instance_layer.segment(cloud, plane, obj_label,
                                                   stats=cluster_totals)
-                fresh = [c for c in clusters if not c["named"]]
-                if fresh:
-                    feeds = []
-                    for c in fresh:
-                        pw = (T[:3, :3] @ np.array([c["x"], c["y"], c["z"]])
-                              + T[:3, 3])
-                        c["world"] = [round(float(pw[0]), 2),
-                                      round(float(pw[1]), 2),
-                                      round(float(pw[2]), 2)]
+                # Every cluster gets world coordinates, not just the ones being
+                # fed: the log has to be in ONE frame or a comparison against
+                # ground truth silently mixes the LiDAR frame with the map frame.
+                feeds = []
+                for c in clusters:
+                    pw = (T[:3, :3] @ np.array([c["x"], c["y"], c["z"]])
+                          + T[:3, 3])
+                    c["world"] = [float(pw[0]), float(pw[1]), float(pw[2])]
+                    if not c["named"]:
                         feeds.append((float(pw[0]), float(pw[1]),
                                       float(pw[2]), int(c["label"])))
+                if feeds:
                     # Fed through the SAME registry as the 2D detections, so a
                     # reclustered chair merges with the detected chair instead of
                     # becoming a second one, and so the "seen twice before it is
                     # believed" rule applies to a shape claim as much as to a
                     # class claim.
                     registry.update(feeds, float(fr.stamp))
-                n_fresh_clusters = len(fresh)
+                n_fresh_clusters = len(feeds)
                 n_cluster_objects += n_fresh_clusters
                 clusters_last = clusters
+                if inst_w is not None:
+                    for c in clusters:
+                        w = c["world"]
+                        inst_w.writerow([n, round(float(fr.stamp), 3),
+                                         int(c["label"]), int(c["named"]),
+                                         round(w[0], 3), round(w[1], 3),
+                                         round(w[2], 3), int(c["n_points"]),
+                                         int(c["n_cells"]),
+                                         round(c["z_min"], 3),
+                                         round(c["z_max"], 3),
+                                         round(c["footprint_m2"], 4),
+                                         round(c["side_min"], 3),
+                                         round(c["side_max"], 3)])
             t_inst = time.perf_counter()
 
             # ---------------- traversable (geometric, per frame) ----------------
@@ -1281,6 +1315,9 @@ def main():
         print("  tf: %d poses -> %s + %s (%s, monotonic=%s)"
               % (len(tf_samples), tf_info["csv"], tf_info["bag"],
                  tf_info["topic"], tf_info["monotonic"]))
+
+    if inst_log is not None:
+        inst_log.close()
 
     summary = {
         "config": a.config,

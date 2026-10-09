@@ -115,8 +115,31 @@ OBSTACLE_MIN_VOTES = 2
 # p90 2.83), so it drops 1143 of 4886 promoted cells, 574 of them within 0.20 m
 # of a truth wall.  What it does *not* do is open the walls: ablating exactly the
 # cells it would drop, on the same frame's map, moves the map's own `reach` from
-# 175.75 to 177.74 m2 (+1.99).  Off by default; it exists to be measured.
-OBSTACLE_GROUND_RATIO = 0.0
+# 175.75 to 177.74 m2 (+1.99).
+#
+# ---------------------------------------------------------------------------
+# 2026-10-09: **turned ON (1.0) as the default**, on the strength of the two
+# measurements that were missing when it was written.
+#
+# 1. Real side, same bag -- it removes the wall band and nothing else.  Of the
+#    60.0 m2 it drops: 99.8% is cells that had `ground_ever == True`, i.e. the
+#    contradiction the rule is aimed at, and "never saw floor, votes >= 20" --
+#    the 13.57 m2 of genuinely solid wall -- is not touched at all.  It only ever
+#    subtracts: newly promoted cells 0.
+# 2. Closed loop, simulator, 3 runs per arm at 300 s each: **no metric
+#    separates** (traj / strand / arrivals / plan_failures / wedge / blocked all
+#    p = 1.00), `reach` trends *better* (median 166.9 -> 183.4 m2, p = 0.40), and
+#    the single metric that splits 3/3 is `obstacle` at -15%, which is the
+#    intended effect.  At n=3 vs 3 a permutation test cannot go below p = 0.10,
+#    so that is "no separation", not "equivalent".
+#
+# The reason it can be the default while `GROUND_COVER_INFORMATIVE` cannot: this
+# rule only ever removes obstacle evidence, and the cells it removes are the ones
+# where floor and obstacle evidence disagreed.  It is the narrower instrument.
+#
+# `0.0` restores the old behaviour bit-for-bit, and `--obstacle-ground-ratio`
+# overrides either way, so an A/B against the old value is one flag.
+OBSTACLE_GROUND_RATIO = 1.0
 
 # ... and how long an obstacle survives after the floor is visible again.
 #

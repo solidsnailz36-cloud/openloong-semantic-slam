@@ -48,6 +48,12 @@ import cv2
 import numpy as np
 
 OBSTACLE_LO = 0.35
+
+# A single furniture collision mesh larger than this in any axis is not a
+# furniture hull -- see the gate in `parse_world`.  6 m clears every real
+# object in the house (the largest is the 2.5 m TV cabinet); the house's own
+# collision is built from `<box>`, so it is never subject to this test.
+MESH_MAX_EXTENT_M = 6.0
 OBSTACLE_HI = 2.00
 MODEL_ROOT = "/root/.gazebo/models"
 
@@ -213,6 +219,57 @@ def load_dae(path):
         keep = (T < len(V)).all(1)
         if keep.any():
             tris.append(V[T[keep]])
+    # `<polylist>` is the same idea with a variable arity: `<vcount>` gives how
+    # many VERTEX references each polygon has, `<p>` is the flattened index run.
+    # **Without this branch the whole mesh is dropped silently** -- measured on
+    # `house.world`: 12 models (13 of 69 collisions) use `<polylist>` and
+    # `load_dae` returned empty for every one of them, so the truth grid was
+    # missing them and any "the map invented an obstacle here" conclusion drawn
+    # against it was unsupported.  The affected models are all
+    # `aws_robomaker_residential_*` / `hospital_*`: Wardrobe_01 (+2 clones),
+    # KitchenCabinet_01, Refrigerator_01, SofaC_01, Bed_01, ChairD_01,
+    # FitnessEquipment_01, TV_01, Vase_01, curtain_half_open_01.
+    for pl in root.iter(ns + "polylist"):
+        ins = pl.findall(ns + "input")
+        stride, voff, vsrc = 0, None, None
+        for i in ins:
+            stride = max(stride, int(i.get("offset") or 0) + 1)
+            if i.get("semantic") == "VERTEX":
+                voff, vsrc = int(i.get("offset") or 0), i.get("source")
+        if vsrc is None:
+            continue
+        sid = pos_of.get(vsrc, vsrc)
+        ent = by_id.get(sid)
+        p = pl.find(ns + "p")
+        vc = pl.find(ns + "vcount")
+        if ent is None or p is None or vc is None:
+            continue
+        if not (p.text or "").strip() or not (vc.text or "").strip():
+            continue
+        V = _floats(ent[0]).reshape(-1, 3) * unit
+        flat = _ints(p.text)
+        if flat.size % stride:
+            continue
+        idx = flat.reshape(-1, stride)[:, voff]
+        fans = []
+        off = 0
+        for k in _ints(vc.text):
+            k = int(k)
+            if k < 3:
+                off += k
+                continue
+            if off + k > idx.size:
+                break
+            poly = idx[off:off + k]
+            off += k
+            a = poly[0]                       # fan from the first vertex
+            for j in range(1, k - 1):
+                fans.append((a, poly[j], poly[j + 1]))
+        if fans:
+            T = np.asarray(fans, dtype=np.int64)
+            keep = (T < len(V)).all(1)
+            if keep.any():
+                tris.append(V[T[keep]])
     if not tris:
         _MESH_CACHE[path] = None
         return None
@@ -228,6 +285,27 @@ def load_dae(path):
 
 
 # ---------------------------------------------------------------- world parse
+def item_aabb(it):
+    """World-frame AABB of one collision item, in the item's own frame chain."""
+    R, t = it["T"][:3, :3], it["T"][:3, 3]
+    if it["kind"] == "box":
+        s = np.asarray(it["size"], dtype=np.float64) / 2.0
+        c = np.array([[a, b, d] for a in (-s[0], s[0])
+                      for b in (-s[1], s[1]) for d in (-s[2], s[2])])
+        w = c @ R.T + t
+    elif it["kind"] == "cylinder":
+        ang = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+        c = np.array([[it["r"] * np.cos(a), it["r"] * np.sin(a), z]
+                      for a in ang for z in (-it["l"] / 2.0, it["l"] / 2.0)])
+        w = c @ R.T + t
+    else:
+        v = np.asarray(it["tri"], dtype=np.float64).reshape(-1, 3)
+        if not len(v):
+            return None
+        w = v @ R.T + t
+    return w.min(axis=0), w.max(axis=0)
+
+
 def parse_world(path):
     """-> list of items:
          dict(kind='box',      size=(sx,sy,sz), T=4x4)
@@ -270,6 +348,26 @@ def parse_world(path):
                         else np.ones(3)
                     got = load_mesh(uri)
                     if got is None or not len(got):
+                        continue
+                    # --- sanity gate on the *mesh's own* extent -------------
+                    # Two of the assets that use `<polylist>` are not furniture
+                    # hulls at all: `aws_KitchenCabinet_01_collision.DAE` holds
+                    # four scene-scale slabs (one measures 6.1 x 32.3 x 9.0 m)
+                    # and `aws_SofaC_01` is the same kind of file.  Rasterised at
+                    # the model's 1:1 scale they paint 24 m² of phantom walls over
+                    # the house and drag the truth->map alignment residual from
+                    # p50 0.20 m to p50 0.82 m / p90 10.0 m -- i.e. they make the
+                    # truth *worse* than missing them.  Refuse rather than
+                    # silently accept, and say so: "silently contributing zero"
+                    # and "silently contributing garbage" are both failures the
+                    # next person has to be able to see.
+                    _v = got[0].reshape(-1, 3) * scale
+                    _ext = (_v.max(0) - _v.min(0)) if len(_v) else np.zeros(3)
+                    if float(_ext.max()) > MESH_MAX_EXTENT_M:
+                        print("   !! skip mesh  %-44s local extent %s m > %.1f"
+                              % (mname[:44],
+                                 " x ".join("%.1f" % e for e in _ext),
+                                 MESH_MAX_EXTENT_M))
                         continue
                     tri = _pick_orientation(got, Tc, scale)
                     if tri is None:
@@ -371,6 +469,14 @@ def main():
                     help="comma list of models to drop (the sensor platform)")
     ap.add_argument("--no-mesh", action="store_true",
                     help="walls only -- boxes and cylinders, no COLLADA")
+    ap.add_argument("--dump-models", default=None, metavar="CSV",
+                    help="write one row per model with its world-frame AABB "
+                         "(model,kind,xmin,xmax,ymin,ymax,zmin,zmax,cx,cy), "
+                         "after the same alignment the raster got.  The raster "
+                         "answers \"is this cell solid\"; a per-object "
+                         "comparison needs \"is this CLUSTER one of the things "
+                         "in the world\", and for that the model list has to "
+                         "come out too rather than being re-parsed elsewhere.")
     a = ap.parse_args()
 
     items = parse_world(a.world)
@@ -468,6 +574,35 @@ def main():
                             resolution=np.float64(res),
                             extent=np.float64(ext))
         print("   -> %s" % a.out)
+
+    if a.dump_models:
+        # `shift_items` already applied the spawn transform; `offset` is the
+        # residual grid fit, in cells, applied by np.roll along (row=y, col=x).
+        ox, oy = offset[0] * res, offset[1] * res
+        rows = []
+        for mname in sorted({it["model"] for it in items}):
+            sub = [it for it in items if it["model"] == mname]
+            lo = hi = None
+            for it in sub:
+                ab = item_aabb(it)
+                if ab is None:
+                    continue
+                lo = ab[0] if lo is None else np.minimum(lo, ab[0])
+                hi = ab[1] if hi is None else np.maximum(hi, ab[1])
+            if lo is None:
+                continue
+            kinds = sorted({it["kind"] for it in sub})
+            rows.append((mname, kinds, lo[0] + ox, hi[0] + ox,
+                         lo[1] + oy, hi[1] + oy, lo[2], hi[2]))
+        with open(a.dump_models, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("model,kind,n_items,xmin,xmax,ymin,ymax,zmin,zmax,cx,cy\n")
+            for mname, kinds, x0_, x1_, y0_, y1_, z0_, z1_ in rows:
+                fh.write("%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n"
+                         % (mname, "+".join(kinds), len(
+                             [it for it in items if it["model"] == mname]),
+                            x0_, x1_, y0_, y1_, z0_, z1_,
+                            (x0_ + x1_) / 2.0, (y0_ + y1_) / 2.0))
+        print("   -> %s  (%d models)" % (a.dump_models, len(rows)))
     return 0
 
 

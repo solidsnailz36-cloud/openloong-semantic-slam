@@ -43,6 +43,7 @@ PKG_PATHS=(
   "r2slam/overrides.py"
   "r2slam/nav.py"
   "r2slam/worldmap.py"
+  "r2slam/instances.py"
   "r2slam/traversable.py"
   "r2slam/tf_out.py"
   "r2slam/config.py"
