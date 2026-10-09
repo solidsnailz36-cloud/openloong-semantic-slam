@@ -52,11 +52,19 @@ from r2slam import labels as L                                       # noqa: E40
 
 
 def prompt_list() -> tuple:
-    """One prompt per project object label, in label-id order.
+    """One **or more** prompts per project object label, in label-id order.
 
     Built from `labels.py` rather than typed here so the two cannot drift: adding
     a class to the table is the only edit needed, and `--check` fails if the
     table ever contains a class this file would not have prompted for.
+
+    A label may contribute more than one prompt.  `labels.PROMPT_VARIANTS` holds
+    alternate phrasings for classes whose canonical name the text tower does not
+    respond to (see the note there), and they are appended right after the
+    canonical name, **all mapping back to the same label**.  The class list is
+    therefore no longer 1:1 with the label list -- `labs` may repeat, and the
+    sidecar's `index_to_label` is many-to-one on purpose.  `detect.py` already
+    reads it that way, so a hit under any phrasing arrives as the one label.
 
     The geometric classes (`unclassified object`, `railing`) are excluded on
     purpose.  They are decided from a cluster's shape by `r2slam/instances.py`,
@@ -69,6 +77,9 @@ def prompt_list() -> tuple:
             continue
         labs.append(int(lab))
         prompts.append(L.name(int(lab)))
+        for alias in L.PROMPT_VARIANTS.get(int(lab), ()):   # many -> one
+            labs.append(int(lab))
+            prompts.append(alias)
     return labs, prompts
 
 
@@ -90,9 +101,29 @@ def main() -> int:
     a = ap.parse_args()
 
     labs, prompts = prompt_list()
-    print("prompts: %d classes" % len(prompts))
-    for lab, p in zip(labs, prompts):
-        print("  idx %2d -> label %2d  %s" % (labs.index(lab), lab, p))
+    print("prompts: %d  ->  %d distinct labels%s"
+          % (len(prompts), len(set(labs)),
+             "" if len(labs) == len(set(labs)) else "   (aliases present)"))
+    for i, (lab, p) in enumerate(zip(labs, prompts)):
+        mark = "" if p == L.name(lab) else "   <- alias"
+        print("  idx %2d -> label %2d  %-18s%s" % (i, lab, p, mark))
+
+    # Two ways the 1:1 assumption could rot now that aliases exist, both silent
+    # at run time and both therefore checked here: a label with no prompt at all
+    # can never be produced by the detector, and a label whose canonical name
+    # was replaced by an alias would make two models incomparable while looking
+    # identical in the table.
+    obj = [l for l in sorted(L.LABEL_NAMES)
+           if l > L.TRAVERSABLE and l not in L.GEOMETRIC_OBJECT_LABELS]
+    miss = [l for l in obj if l not in labs]
+    no_canon = sorted(
+        l for l in set(labs)
+        if sum(1 for x, y in zip(labs, prompts)
+               if x == l and y == L.name(l)) != 1)
+    if miss or no_canon:
+        print("*** prompt table is inconsistent: missing %s / non-canonical %s"
+              % (miss, no_canon))
+        return 3
     if a.check:
         return 0
 

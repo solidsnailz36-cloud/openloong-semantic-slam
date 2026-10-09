@@ -169,6 +169,42 @@ _SPECS: List[Tuple[List[int], str, str, str, float]] = [
 # know they are expected to have no `coco_ids`.
 _GEOMETRIC_OBJECT_NAMES = ("unclassified object", "railing")
 
+# ---------------------------------------------------------------------------
+# 2026-10-09 (fourth pass): more than one prompt per label.
+#
+# A baked vocabulary has one class index per *prompt*, and nothing requires the
+# sidecar's `index -> label` map to be one-to-one.  `tools/fetch_yoloworld.py`
+# writes that map itself, so asking the text tower for several phrasings of the
+# same object costs a handful of extra output channels and **zero inference
+# time**, and it is the only way to tell "the class is absent" apart from "the
+# word is wrong".
+#
+# That question is open, and it is the whole of the third pass's loose end:
+# `fire extinguisher` was found in 6 of 6 frames, while `gym equipment` and
+# `humanoid robot` returned **zero even with the confidence floor dropped to
+# 0.12**.  A scenario-level noun ("gym equipment" names a room's worth of
+# equipment, not an object) and a phrase whose embedding is outscored by the
+# scene's own `person` boxes are the two candidate explanations, and both are
+# fixable by phrasing rather than by code.
+#
+# What is deliberately absent is a synonym soup.  Every entry is a noun a person
+# would actually say for the object, so that a hit is still a *correct* label:
+# the map is graded on confident labels, not on label count.  `person` is not
+# aliased to `human`/`citizen` for the same reason -- the canonical name already
+# fires.
+#
+# `floor mat` stays out of the table entirely, variants included: its problem is
+# the 0.20 m LiDAR height floor, not its wording.
+_PROMPT_VARIANTS_BY_NAME: Dict[str, Tuple[str, ...]] = {
+    # scenario-level -> the individual objects that make up the scenario
+    "gym equipment": ("treadmill", "exercise machine", "stationary bicycle",
+                      "rowing machine", "dumbbell", "barbell",
+                      "elliptical trainer", "weight bench"),
+    # "humanoid robot" is the phrase the scene's `person` boxes outscore; the
+    # capture's robot is white with a rounded head, so name it that way too.
+    "humanoid robot": ("robot", "humanoid", "android robot", "service robot"),
+}
+
 # gates per size bucket:
 #   (min_points, min_box_frac of image height,
 #    min vertical extent the LiDAR must see, max vertical extent that still
@@ -508,6 +544,14 @@ PERSON = COCO_TO_LABEL[0]
 _by_name = {v: k for k, v in LABEL_NAMES.items()}
 UNKNOWN_OBJECT: int = _by_name["unclassified object"]
 RAILING: int = _by_name["railing"]
+
+# Resolved by name for the same reason the two above are: a class inserted into
+# `_SPECS` must not be able to silently re-point an alias at another label.
+# `tools/fetch_yoloworld.py::prompt_list` reads this and emits the canonical
+# prompt followed by these, all mapped to the same label id.
+PROMPT_VARIANTS: Dict[int, Tuple[str, ...]] = {
+    _by_name[_n]: tuple(_v)
+    for _n, _v in _PROMPT_VARIANTS_BY_NAME.items() if _n in _by_name}
 
 GEOMETRIC_OBJECT_LABELS: frozenset = frozenset({UNKNOWN_OBJECT, RAILING})
 
