@@ -34,6 +34,8 @@ never has to know about COCO.
 """
 from __future__ import annotations
 
+import json
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -102,6 +104,28 @@ def load_names(path: str) -> List[str]:
     return COCO80
 
 
+def load_class_map(onnx_path: str) -> Optional[Dict[int, int]]:
+    """`index -> project label` sidecar for a baked-vocabulary model.
+
+    Written by `tools/fetch_yoloworld.py`.  Returns None when there is no
+    sidecar, which is the correct answer for a COCO model and also the safe one:
+    `detect_mapped` falls back to `labels.COCO_TO_LABEL`, so a missing file
+    produces the old behaviour rather than a silent relabelling.
+    """
+    if not onnx_path:
+        return None
+    side = os.path.splitext(str(onnx_path))[0] + ".classmap.json"
+    if not os.path.isfile(side):
+        return None
+    try:
+        with open(side, encoding="utf-8") as fh:
+            d = json.load(fh)
+        m = d.get("index_to_label") or {}
+        return {int(k): int(v) for k, v in m.items()} or None
+    except Exception:
+        return None
+
+
 class OnnxYoloDetector:
     """One ONNX COCO detector, two graph dialects.
 
@@ -130,7 +154,8 @@ class OnnxYoloDetector:
     """
 
     def __init__(self, model: str, conf: float = 0.30, size: Optional[int] = None,
-                 backend: str = "auto", num_threads: int = 2):
+                 backend: str = "auto", num_threads: int = 2,
+                 class_map: Optional[Dict[int, int]] = None):
         self.conf = float(conf)
         # Prefilter for the raw anchor tensor.  It must be **no higher than the
         # lowest per-class floor in the label table**, otherwise a box that
@@ -150,6 +175,15 @@ class OnnxYoloDetector:
         # bookkeeping for detect_mapped: how many candidate boxes the network's
         # top-1 class was one we have no name for (see its docstring)
         self.n_unmapped = 0
+        # `class index -> project label`, for detectors whose class list is not
+        # COCO.  A YOLO-World export produced by `tools/fetch_yoloworld.py` has
+        # OUR prompts baked in, in our order, so its index k is the label sidecar
+        # in the .classmap.json next to the .onnx -- and applying
+        # `COCO_TO_LABEL` to it would relabel every box silently.  None means
+        # "this is a COCO model", which is the case for yolo26n.onnx.
+        self.class_map: Optional[Dict[int, int]] = (
+            {int(k): int(v) for k, v in class_map.items()}
+            if class_map else None)
 
         order = ["onnxruntime", "cv2"] if backend == "auto" else [backend]
         errs = []
@@ -433,7 +467,8 @@ class OnnxYoloDetector:
         self.n_unmapped = 0
         for j in range(n):
             coco = int(top[j])
-            lab = L.COCO_TO_LABEL.get(coco)
+            lab = (self.class_map.get(coco) if self.class_map is not None
+                   else L.COCO_TO_LABEL.get(coco))
             if lab is None:
                 # Count only boxes the mapped classes would also have had to
                 # clear: `self.conf` is the lowest floor in the table, so this

@@ -79,7 +79,66 @@ _SPECS: List[Tuple[List[int], str, str, str, float]] = [
     ([39],          "bottle",       "瓶子",      "small",  0.45),
     ([41],          "cup",          "杯子",      "small",  0.45),
     ([45],          "bowl",         "碗",        "small",  0.45),
+    # ---------------------------------------------------------------------
+    # 2026-10-09: the rest of COCO-80 that can plausibly appear indoors.
+    #
+    # These cost **nothing at inference**.  The detector was always producing
+    # all 80 slots; the table above simply dropped the ones the project had not
+    # chosen, so a handbag or a toaster was detected and then thrown away one
+    # line later.  Adding a class here is a one-line change to a lookup table,
+    # not a model change.
+    #
+    # Be honest about the size of this win, though: it is the *small* half of
+    # the vocabulary problem.  The things a viewer actually notices missing in
+    # the run -- extinguisher cabinets, railings, floor mats, gym equipment, a
+    # humanoid robot -- are in **none** of COCO's 80, so no amount of table
+    # editing will surface them.  Those need either the geometric classes below
+    # or an open-vocabulary detector (see `tools/fetch_yoloworld.py`).
+    #
+    # Deliberately excluded despite being in COCO-80: the outdoor/vehicle half
+    # (bicycle, car, truck, ...), the food half (banana, pizza, ...), and
+    # `tie`/`toothbrush`/`hair drier`, which are either absent from a lab or so
+    # small that a 320x180 render cannot resolve them.  A class in this table
+    # that can never fire is worse than a missing one -- it makes the table look
+    # more capable than the system is.
+    ([25],          "umbrella",     "雨伞",      "medium", 0.40),
+    ([26],          "handbag",      "手提包",    "medium", 0.40),
+    ([40],          "wine glass",   "酒杯",      "small",  0.45),
+    ([42],          "fork",         "叉子",      "small",  0.45),
+    ([43],          "knife",        "刀",        "small",  0.45),
+    ([44],          "spoon",        "勺子",      "small",  0.45),
+    ([64],          "mouse",        "鼠标",      "small",  0.45),
+    ([65],          "remote",       "遥控器",    "small",  0.45),
+    ([67],          "cell phone",   "手机",      "small",  0.45),
+    ([70],          "toaster",      "烤面包机",  "medium", 0.45),
+    ([76],          "scissors",     "剪刀",      "small",  0.45),
+    ([77],          "teddy bear",   "玩偶",      "medium", 0.45),
+    ([32],          "sports ball",  "球",        "small",  0.45),
+    # ---------------------------------------------------------------------
+    # Geometric object classes: **no COCO id at all**.  These are decided from
+    # the shape of a cluster found by full-scene segmentation
+    # (`r2slam/instances.py`), not from a 2D detection, so they need no detector
+    # and no training.
+    #
+    # `unclassified object` is the important one.  Until now anything the 23
+    # COCO classes did not name simply did not exist on the map, which is most
+    # of the physical clutter in a room.  A cluster that nothing names is still a
+    # real object occupying real space, and saying so is more useful than
+    # silence: the finals' brief is to map and navigate, and you cannot avoid
+    # what the map pretends is not there.
+    #
+    # `size` maps it onto the ordinary gate table, but the gates that matter for
+    # these are in `instances.py`, which measures a whole cluster rather than a
+    # box.
+    ([],            "unclassified object", "未识别物体", "medium", 0.00),
+    ([],            "railing",      "栏杆",      "large",  0.00),
 ]
+
+# Labels that exist in the delivered table but come from geometry rather than
+# from COCO.  `write_table` writes `kind: geometric-object` for them, and the
+# audit that compares the table against the pcd's label column uses this set to
+# know they are expected to have no `coco_ids`.
+_GEOMETRIC_OBJECT_NAMES = ("unclassified object", "railing")
 
 # gates per size bucket:
 #   (min_points, min_box_frac of image height,
@@ -413,6 +472,24 @@ for _i, (_cocos, _en, _zh, _size, _conf) in enumerate(_SPECS):
 
 PERSON = COCO_TO_LABEL[0]
 
+# ------------------------------------------------- geometric object classes
+# Resolved by name rather than by index so inserting a COCO class above cannot
+# silently renumber them -- the delivered pcd's `label` column and the shipped
+# table have to keep agreeing across a rebuild.
+_by_name = {v: k for k, v in LABEL_NAMES.items()}
+UNKNOWN_OBJECT: int = _by_name["unclassified object"]
+RAILING: int = _by_name["railing"]
+
+GEOMETRIC_OBJECT_LABELS: frozenset = frozenset({UNKNOWN_OBJECT, RAILING})
+
+# `unclassified object` is a *shape* claim, not a semantic one, so it is held to
+# the same "seen twice before it is believed" rule as furniture: a cluster that
+# appears in a single frame is as likely to be a person's leg or a sensor
+# artefact as something standing in the room.  Two is the floor, not a tuned
+# value -- see `ObjectRegistry.confirmed`.
+for _g in GEOMETRIC_OBJECT_LABELS:
+    LABEL_MIN_OBSERVATIONS.setdefault(_g, 2)
+
 # The cross-sensor box-height window (see the table above, near _MIN_HEIGHT_OVERRIDE).
 # `{label: (min_metres, max_metres)}`; a class absent from here is unbounded.
 # Empty on purpose -- see the note above `LABEL_MAX_WIDTH`.  The gate is kept as
@@ -511,7 +588,12 @@ def write_table(path: str) -> str:
     ]
     for lab in sorted(LABEL_NAMES):
         r, g, b = LABEL_RGB[lab]
-        kind = "geometric" if lab <= TRAVERSABLE else "object"
+        if lab <= TRAVERSABLE:
+            kind = "geometric"
+        elif lab in GEOMETRIC_OBJECT_LABELS:
+            kind = "geometric-object"
+        else:
+            kind = "object"
         lines.append("  - id: %d" % lab)
         lines.append("    name: %s" % LABEL_NAMES[lab])
         lines.append("    name_zh: %s" % LABEL_NAMES_ZH[lab])

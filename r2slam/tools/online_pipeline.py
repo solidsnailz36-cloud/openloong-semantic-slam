@@ -52,6 +52,7 @@ from r2slam.explore import FrontierExplorer, VelocitySender           # noqa: E4
 from r2slam.frames import Frame                                      # noqa: E402
 from r2slam.fusion import object_3d, project_person_back              # noqa: E402
 from r2slam.heading import CommandedHeading                          # noqa: E402
+from r2slam import instances as instance_layer                       # noqa: E402
 from r2slam.nav import (ObjectRegistry, SemanticNavigator,           # noqa: E402
                         path_length)
 from r2slam.odometry import apply_thread_limits, make_odometry, register  # noqa: E402
@@ -216,6 +217,18 @@ def parse_args():
                          "a doorway the planner had no obstacle for.  It changes "
                          "`ground` (the planner's input), so it needs the "
                          "closed-loop A/B, not an eyeball.")
+    ap.add_argument("--instance-layer", action="store_true",
+                    help="`r2slam/instances.py`: segment the whole frame into "
+                         "solid clusters and put the ones NO 2D detection named "
+                         "on the map as `unclassified object`.  This is the half "
+                         "of the picture the detector cannot give: the railings, "
+                         "the extinguisher cabinet, the floor mats and the "
+                         "humanoid robot are in none of COCO's 80 classes, so "
+                         "until now they were not merely unnamed -- they were "
+                         "absent, while the LiDAR measured them every frame. "
+                         "Measured 3.7 ms/frame at 49,152 points.  It adds "
+                         "objects to the map, so it needs an A/B like anything "
+                         "else that changes what the run reports.")
     ap.add_argument("--b3-log", default=None, metavar="FILE",
                     help="read-only row log of the B3 fuse in a **live** run: one "
                          "row per (frame, candidate) evaluation with the dreach "
@@ -545,6 +558,10 @@ def main():
           % ("TOTAL -- every informative return is floor or an obstacle "
              "candidate" if _worldmap.GROUND_COVER_INFORMATIVE
              else "|h| < tol (leaves dead bands)"))
+    print("instances   : %s"
+          % ("ON -- full-scene clusters, unnamed ones become 'unclassified "
+             "object'" if a.instance_layer
+             else "off (only 2D-detected objects reach the map)"))
     if a.explore:
         if a.npz:
             raise SystemExit("--explore needs a live source (nothing to drive in --npz mode)")
@@ -593,8 +610,9 @@ def main():
         ctx = open_source(cfg)
         src = ctx.iter_frames(limit=a.frames or None)
 
-    STAGES = ("ingest", "deskew", "odom", "detect", "fuse", "trav_fit",
-              "trav_mask", "map", "explore", "dump", "render", "total")
+    STAGES = ("ingest", "deskew", "odom", "detect", "fuse", "instance",
+              "trav_fit", "trav_mask", "map", "explore", "dump", "render",
+              "total")
     times = {k: [] for k in STAGES}
     rows = []
     # Every frame's full 6-DoF pose, kept apart from `rows` because a TF
@@ -643,6 +661,13 @@ def main():
     n_boxes_fused = 0
     n_boxes_detected = 0
     n_objects_localised = 0
+    # Instance layer counters.  `cluster_totals` accumulates the per-frame
+    # rejection reasons from `r2slam/instances.py` so the run report shows how
+    # many candidate clusters were dropped and for which reason -- a filter whose
+    # cost is invisible is a filter nobody can argue with.
+    n_cluster_objects = 0
+    cluster_totals = {}
+    clusters_last = []
     prev_stamp = None
     # Sensor time of the first frame.  `--sim-duration` measures against this,
     # not against `t_run`, so a run stops after the same amount of *simulated*
@@ -794,6 +819,44 @@ def main():
                 obj_label[p["_idx"]] = int(b[5])
             n_objects_localised += len(objects)
             t_fuse = time.perf_counter()
+
+            # ---------------- instance layer (full-scene, detector-free) -----
+            # Everything above finds the objects the 2D detector NAMED.  This is
+            # the other half of the question: what solid things are in the frame
+            # at all?  A class COCO does not contain is not merely unnamed by the
+            # detector -- without this it does not exist on the map, which is why
+            # the railings, the extinguisher cabinet, the floor mats and the
+            # humanoid robot are absent from the delivered video while the LiDAR
+            # has been measuring every one of them on every frame.
+            #
+            # Switched and off by default, because it changes what the map
+            # contains.  See `r2slam/instances.py` for the measurement behind
+            # every threshold, and `--instance-layer` to turn it on.
+            n_fresh_clusters = 0
+            if a.instance_layer:
+                clusters = instance_layer.segment(cloud, plane, obj_label,
+                                                  stats=cluster_totals)
+                fresh = [c for c in clusters if not c["named"]]
+                if fresh:
+                    feeds = []
+                    for c in fresh:
+                        pw = (T[:3, :3] @ np.array([c["x"], c["y"], c["z"]])
+                              + T[:3, 3])
+                        c["world"] = [round(float(pw[0]), 2),
+                                      round(float(pw[1]), 2),
+                                      round(float(pw[2]), 2)]
+                        feeds.append((float(pw[0]), float(pw[1]),
+                                      float(pw[2]), int(c["label"])))
+                    # Fed through the SAME registry as the 2D detections, so a
+                    # reclustered chair merges with the detected chair instead of
+                    # becoming a second one, and so the "seen twice before it is
+                    # believed" rule applies to a shape claim as much as to a
+                    # class claim.
+                    registry.update(feeds, float(fr.stamp))
+                n_fresh_clusters = len(fresh)
+                n_cluster_objects += n_fresh_clusters
+                clusters_last = clusters
+            t_inst = time.perf_counter()
 
             # ---------------- traversable (geometric, per frame) ----------------
             # The plane was fitted above (the fusion needs it).  Split the timing
@@ -982,8 +1045,9 @@ def main():
             times["odom"].append((t_odom - t_deskew) * 1e3)
             times["detect"].append((t_detect - t_odom) * 1e3)
             times["fuse"].append((t_fuse - t_detect) * 1e3)
+            times["instance"].append((t_inst - t_fuse) * 1e3)
             times["trav_fit"].append((t_fit - t_fuse) * 1e3)
-            times["trav_mask"].append((t_trav - t_fit) * 1e3)
+            times["trav_mask"].append((t_trav - t_inst) * 1e3)
             times["map"].append((t_map - t_trav) * 1e3)
             times["explore"].append((t_explore - t_map) * 1e3)
             times["dump"].append((t_dump - t_explore) * 1e3)
@@ -1464,6 +1528,26 @@ def main():
                       "superseded_note": "same place, different class, fewer "
                                          "sightings -- see CROSS_LABEL_MERGE_M "
                                          "in r2slam/nav.py"},
+        "instance_layer": {
+            "enabled": bool(a.instance_layer),
+            "objects_fed": int(n_cluster_objects),
+            # Per-frame rejection reasons, summed.  Reported rather than
+            # summarised because a filter whose cost is invisible cannot be
+            # argued with: `clust_wall` is the number of linear structures left
+            # to the obstacle layer, `clust_small`/`clust_flat`/`clust_large`
+            # are what the thresholds threw away.
+            "counters": dict(cluster_totals),
+            "last_frame": [
+                {"label": int(c["label"]), "name": L.name(int(c["label"])),
+                 "x": round(c["x"], 2), "y": round(c["y"], 2),
+                 "z": round(c["z"], 2), "n_points": int(c["n_points"]),
+                 "z_min": round(c["z_min"], 2), "z_max": round(c["z_max"], 2),
+                 "footprint_m2": round(c["footprint_m2"], 2)}
+                for c in clusters_last if not c["named"]
+            ][:12],
+            "note": "labels UNKNOWN_OBJECT / RAILING are shape claims from "
+                    "r2slam/instances.py, not detector output; see "
+                    "labels.GEOMETRIC_OBJECT_LABELS"},
         "runtime": {"threads": rt.max_num_threads, "voxel_size": rt.voxel_size,
                     "min_range": rt.min_range, "max_range": rt.max_range,
                     "lidar_rotates_with_base": bool(cfg.lidar.rotates_with_base)},
@@ -1707,6 +1791,24 @@ def main():
         if it.id in registry.superseded:
             print("    (superseded) id=%d %s at (%.2f,%.2f) n=%d"
                   % (it.id, it.name, it.x, it.y, it.n))
+
+    if a.instance_layer:
+        tot = sum(cluster_totals.values()) or 1
+        print("\n=== instance layer (full-scene clusters, detector-free) ===")
+        print("  fed to the registry %d object-sightings over %d frames"
+              % (n_cluster_objects, len(times["instance"])))
+        print("  candidate clusters by outcome:")
+        for k in ("clust_kept", "clust_railing", "clust_named", "clust_wall",
+                  "clust_surface", "clust_small", "clust_tiny", "clust_flat",
+                  "clust_large"):
+            if k in cluster_totals:
+                print("    %-16s %6d  (%4.1f%%)"
+                      % (k, cluster_totals[k], 100.0 * cluster_totals[k] / tot))
+        print("  ms_instance p50 %.2f  p90 %.2f  max %.2f"
+              % (pct(times["instance"], 50), pct(times["instance"], 90),
+                 pct(times["instance"], 100)))
+        print("  NOTE: 'unclassified object' is a SHAPE claim, not a class -- "
+              "the cluster is real, its identity is unknown")
 
     if navigator is not None:
         stm = wmap.stats()
