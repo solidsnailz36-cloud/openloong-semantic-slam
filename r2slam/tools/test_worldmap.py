@@ -409,6 +409,65 @@ def main():
               "+y spur reaches row %d, robot at %d -- the panel is mirrored"
               % (y_spur.max() if len(y_spur) else -1, ry))
 
+    # ------------------------------------------------------------------
+    # 13. a cell the obstacle layer did NOT promote must not be drawn as one
+    #
+    # The panel painted every `seen & ~ground` cell the same grey, which is the
+    # grey of a wall.  So a stray return that was never classified as blocked
+    # read as an obstacle standing in the middle of the walkable floor.
+    # Measured on the real corridor: of the 17.70 m2 of grey specks inside
+    # green, only 1.42 m2 had actually been promoted -- 16.28 m2 had not.
+    # The map was right and the picture was lying.
+    # ------------------------------------------------------------------
+    w = WorldMap()
+    w.traj = [(-29.0, -10.0)]
+    cells = {
+        "blocked (seen+obstacle)": (-27.0, -10.0),
+        "seen, never promoted": (-27.0, -8.0),
+        "obstacle + ground_ever": (-27.0, -12.0),
+        "ground": (-28.0, -13.0),
+    }
+    # NB all four must be inside the grid: `cell_of` returns a *signed* index and
+    # numpy wraps a negative one silently, so a sample placed outside `extent`
+    # quietly marks some other cell and the test then reports a colour that has
+    # nothing to do with the case it meant to build.
+    for nm, (x, y) in cells.items():
+        c = w.cell_of(x, y)
+        rr, cc = int(c[1]), int(c[0])
+        w.seen[rr, cc] = True
+        if nm.startswith("blocked") or nm.startswith("obstacle +"):
+            w.obstacle[rr, cc] = True
+        if nm.startswith("obstacle +") or nm == "ground":
+            w.ground_ever[rr, cc] = True
+    # `ground` is a pure function of `obstacle` by design, so recompute it the
+    # same way `add()` does rather than setting it by hand.
+    np.logical_and(w.ground_ever, ~w.obstacle, out=w.ground)
+    img = w.render(size=540)
+
+    def colour_at(x, y):
+        # Panel pixel from the documented framing -- `pixel_of` is section 11's
+        # helper and both sections centre on the same robot pose, so it applies
+        # here too.  (Calling it with the raw cell index would index the grid,
+        # not the panel; that mistake made this section report "unknown" for
+        # every sample on its first run.)
+        px, py = pixel_of(x, y)
+        return tuple(int(v) for v in img[py, px])
+
+    blocked = tuple(int(v) for v in (95, 95, 105))
+    unseen = tuple(int(v) for v in (48, 48, 56))
+    green = tuple(int(v) for v in LABEL_COLORS[L.TRAVERSABLE])
+    got = {nm: colour_at(*xy) for nm, xy in cells.items()}
+    check("a promoted cell is drawn as blocked", got["blocked (seen+obstacle)"] == blocked,
+          "got %s want %s" % (got["blocked (seen+obstacle)"], blocked))
+    check("a seen-but-never-promoted cell is NOT drawn as blocked",
+          got["seen, never promoted"] == unseen,
+          "got %s -- it is wearing the obstacle colour" % (got["seen, never promoted"],))
+    check("... and it is distinguishable from blocked",
+          got["seen, never promoted"] != got["blocked (seen+obstacle)"])
+    check("an obstacle over former floor is still drawn as blocked",
+          got["obstacle + ground_ever"] == blocked, "got %s" % (got["obstacle + ground_ever"],))
+    check("ground is drawn green", got["ground"] == green, "got %s" % (got["ground"],))
+
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
         for f in FAILS:

@@ -1438,9 +1438,19 @@ class WorldMap:
         the walls stay legible while the robot explores.
         """
         n = self.n
-        # 0 = unknown (dark), 1 = traversable (green), 2 = obstacle (grey)
+        # 0 = unknown (dark), 1 = traversable (green), 2 = blocked (grey),
+        # 3 = "seen, but the obstacle layer never promoted it" (dim).
+        #
+        # Class 3 is not decoration.  The panel used to paint `seen & ~ground`
+        # one grey, which is the SAME grey as a wall -- so any cell that got a
+        # return but was never classified as blocked read as an obstacle
+        # sitting in the middle of the walkable floor.  Measured on the real
+        # corridor (out/_diag_real/grids): of the 17.70 m2 of grey specks inside
+        # green, only 1.42 m2 had actually been promoted; 16.28 m2 had not and
+        # was drawn as if it had.  The map was right; the picture was lying.
         cls = np.zeros((n, n), np.uint8)
-        cls[self.seen] = 2
+        cls[self.seen] = 3
+        cls[self.seen & self.obstacle] = 2
         cls[self.ground] = 1
         if centre is None:
             centre = self.traj[-1] if self.traj else (0.0, 0.0)
@@ -1466,11 +1476,12 @@ class WorldMap:
             span = max(span0, 5.0 * np.ceil(need / 5.0))
         span = min(span, 2.0 * self.extent)
 
-        # colour map for the classified grid (index 0..2)
-        lut = np.zeros((3, 3), np.uint8)
+        # colour map for the classified grid (index 0..3)
+        lut = np.zeros((4, 3), np.uint8)
         lut[0] = (26, 26, 30)          # unknown
         lut[1] = LABEL_COLORS[LABEL_TRAVERSABLE]
-        lut[2] = (95, 95, 105)         # obstacle
+        lut[2] = (95, 95, 105)         # blocked: the obstacle layer owns it
+        lut[3] = (48, 48, 56)          # seen, never promoted -- dim, and clearly
         img_world = lut[cls]           # (n, n, 3) BGR
 
         # crop a window around the robot, then scale to `size`
@@ -1654,8 +1665,8 @@ class WorldMap:
         counts = self.object_histogram()
         items = [(LABEL_NAMES.get(LABEL_TRAVERSABLE, "traversable"),
                   LABEL_COLORS[LABEL_TRAVERSABLE], "cell"),
-                 (LABEL_NAMES.get(LABEL_BACKGROUND, "background"),
-                  LABEL_COLORS[LABEL_BACKGROUND], "cell")]
+                 ("blocked", (95, 95, 105), "cell"),
+                 ("seen, not blocked", (48, 48, 56), "cell")]
         ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:max_items]
         for nm, n in ranked:
             lb = next((k for k, v in LABEL_NAMES.items() if v == nm), None)
