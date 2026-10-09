@@ -133,9 +133,11 @@ OBSTACLE_MIN_VOTES = 2
 #    intended effect.  At n=3 vs 3 a permutation test cannot go below p = 0.10,
 #    so that is "no separation", not "equivalent".
 #
-# The reason it can be the default while `GROUND_COVER_INFORMATIVE` cannot: this
-# rule only ever removes obstacle evidence, and the cells it removes are the ones
-# where floor and obstacle evidence disagreed.  It is the narrower instrument.
+# Both of the two rules above are defaults now.  This one is the narrower
+# instrument: it only ever *removes* obstacle evidence, and only where floor and
+# obstacle evidence disagreed.  `GROUND_COVER_INFORMATIVE` is the broader one --
+# it decides what an unclassified cell *is*, and it is the one that costs map
+# time (see its note).
 #
 # `0.0` restores the old behaviour bit-for-bit, and `--obstacle-ground-ratio`
 # overrides either way, so an A/B against the old value is one flag.
@@ -405,7 +407,22 @@ OBSTACLE_MIN_POINTS = 1
 #
 # A/B switch.  It changes `ground` (the planner's input), so it must be measured
 # in closed loop, not just inspected.
-GROUND_COVER_INFORMATIVE = False
+#
+# 2026-10-09: **on by default** (boss's call).  The argument is the one the
+# paragraph above already makes -- a map that leaves a third class for the panel
+# and the planner to disagree about is a map with two answers, and the grey it
+# produces is not a cosmetic complaint.  What kept it off was cost, not doubt:
+# folding these cells in grows `ground` by about 11% (495 -> 549 m2 on the real
+# capture) and the map layer is superlinear in `ground`, so it is paid for on
+# every frame.  Flipping a default is therefore a deliberate trade of frame
+# budget for a map without a third class, and the closed-loop A/B that justifies
+# it is `out/_cover_ab_sim.sh` (simulator, policy reads the map) plus the real
+# replay, where the only column that moves is `traversable_m2`.
+#
+# `--no-ground-cover-informative` restores the old behaviour, so the A/B is
+# still one flag; `stats(audit=True)` reports the size of the third class either
+# way, so the claim stays checkable after the fact rather than asserted.
+GROUND_COVER_INFORMATIVE = True
 
 # There used to be two display-only switches here (`RENDER_FILL_LONE_SEEN`,
 # `RENDER_TRUST_OBSTACLE_LAYER`) that painted `seen & ~obstacle` green so the

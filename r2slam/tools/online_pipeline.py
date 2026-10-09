@@ -209,15 +209,17 @@ def parse_args():
                          "0 = no cap (the shipping rule).  The excess is held "
                          "over exactly like a deferral, so this changes when a "
                          "promotion is decided, not how it is judged.")
-    ap.add_argument("--ground-cover-informative", action="store_true",
-                    help="`worldmap.GROUND_COVER_INFORMATIVE`: fold "
-                         "`seen & ~obstacle & ~object` into `ground_ever`, so "
-                         "everything we have information about is EITHER floor "
-                         "OR an obstacle candidate and there is no third class. "
-                         "That class is why the panel could paint a wall across "
-                         "a doorway the planner had no obstacle for.  It changes "
-                         "`ground` (the planner's input), so it needs the "
-                         "closed-loop A/B, not an eyeball.")
+    ap.add_argument("--no-ground-cover-informative", action="store_true",
+                    help="A/B switch: turn OFF `worldmap.GROUND_COVER_INFORMATIVE`, "
+                         "which is ON by default since 2026-10-09.  With it off, "
+                         "a cell we have information about but which is neither "
+                         "floor nor an obstacle candidate goes back to being a "
+                         "third class -- the grey the panel draws as a wall and "
+                         "`free_space` refuses, i.e. one cell with two answers. "
+                         "It also buys back map time: folding those cells in "
+                         "grows `ground` ~11%% and the map layer is superlinear "
+                         "in it, so the OFF arm is the cheaper one.  Use it to "
+                         "re-run the closed-loop A/B, not to ship.")
     ap.add_argument("--instance-layer", action="store_true",
                     help="`r2slam/instances.py`: segment the whole frame into "
                          "solid clusters and put the ones NO 2D detection named "
@@ -571,12 +573,15 @@ def main():
     # real-side A/B silently ran the CONTROL configuration on both arms: the
     # first attempt at this experiment produced two byte-identical runs and
     # measured nothing at all.
-    if a.ground_cover_informative:
-        _worldmap.GROUND_COVER_INFORMATIVE = True
+    # `--no-ground-cover-informative` is the A/B arm; the default is ON (see
+    # `worldmap.GROUND_COVER_INFORMATIVE`).  Reported on **both** sides of the
+    # run so a pasted log says which map rule produced the numbers.
+    if a.no_ground_cover_informative:
+        _worldmap.GROUND_COVER_INFORMATIVE = False
     print("ground rule : %s"
           % ("TOTAL -- every informative return is floor or an obstacle "
              "candidate" if _worldmap.GROUND_COVER_INFORMATIVE
-             else "|h| < tol (leaves dead bands)"))
+             else "|h| < tol (leaves dead bands)  [A/B arm, NOT the default]"))
     print("instances   : %s"
           % ("ON -- full-scene clusters, unnamed ones become 'unclassified "
              "object'" if a.instance_layer

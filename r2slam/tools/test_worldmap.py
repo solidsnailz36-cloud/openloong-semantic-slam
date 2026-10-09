@@ -534,6 +534,33 @@ def main():
     finally:
         _wm.GROUND_COVER_INFORMATIVE = old_cover
 
+    # ------------------------------------------------------------------
+    # 15. and the default must be the total classification (2026-10-09)
+    #
+    # Section 14 *forces* the switch on, so it would keep passing if the module
+    # default were flipped back to False -- which is the one regression a default
+    # flip invites, and it is invisible in every downstream number (the map just
+    # grows a third class back and the panel gets greyer).  So assert the default
+    # itself, and assert that the OFF arm really does reintroduce the class --
+    # otherwise "restorable via one flag" would be an untested claim.
+    # ------------------------------------------------------------------
+    check("GROUND_COVER_INFORMATIVE is on by default",
+          _wm.GROUND_COVER_INFORMATIVE is True,
+          "module default is %r" % (_wm.GROUND_COVER_INFORMATIVE,))
+    old_cover = _wm.GROUND_COVER_INFORMATIVE
+    try:
+        _wm.GROUND_COVER_INFORMATIVE = False
+        m4 = _wm.WorldMap()
+        m4.add(np.array([[0.0, 0.0, 0.0]]), np.array([False]),
+               np.array([False]), np.array([False]), pose_xy=(0.0, 0.0),
+               stamp=0.0, seen_mask=np.array([True]))
+        check("... and the OFF arm reintroduces the third class",
+              int((m4.seen & ~m4.ground & ~m4.obstacle).sum()) == 1,
+              "that class is what the panel drew as a wall while free_space "
+              "refused it")
+    finally:
+        _wm.GROUND_COVER_INFORMATIVE = old_cover
+
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:
         for f in FAILS:

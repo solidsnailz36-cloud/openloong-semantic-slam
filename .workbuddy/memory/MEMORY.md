@@ -13,9 +13,11 @@
 ## 结论索引
 1. **漂移**：真实侧不显著（ATE p50 0.276 m/102 m）；仿真侧＝少数帧被打偏且不恢复，根因＝**官方仿真器航向不可观测（LiDAR 不随车体转）**，非 `heading.py` bug。见 `docs/漂移归因_20261008.md`。
 2. **B3 已收线停投**：成本门 PASS（`ms_map` p90 OFF ≤31.4 / ON ≥94.9 ms，**只看 p90**）；**效果门 FAIL 撤回**（里程 128.90→82.43 m p=0.0047；`plan_failures` ×12.7 ⇒ 规划器在走不通的地图上反复失败）。归因＝成本上界 `max-eval` 语义缺陷；无上界消融跑不完。`OBSTACLE_TOPO_FUSE_M2` 默认 0.0。
-3. **渲染↔规划一致性**（`b0bd756`）：曾有空类（`seen & ~ground & ~obstacle`）被画成障碍 ⇒ 一格两个答案。定论：**`render` 只画 `ground`**（= `free_space` 读的同一数组）。**画面可以有颜色，不能有第二个判据。** 一致性指标＝`summary["map"]["seen_not_classified_cells"]`（**归零即一致**）；`GROUND_COVER_INFORMATIVE` 默认仍 False（见下"灰斑"）。
+3. **渲染↔规划一致性**（`b0bd756`）：曾有空类（`seen & ~ground & ~obstacle`）被画成障碍 ⇒ 一格两个答案。定论：**`render` 只画 `ground`**（= `free_space` 读的同一数组）。**画面可以有颜色，不能有第二个判据。** 一致性指标＝`summary["map"]["seen_not_classified_cells"]`（**归零即一致**）。★ **2026-10-09 晚：`GROUND_COVER_INFORMATIVE` 已设为默认 `True`**（boss 拍），该指标从 6824 掉到 **1464**。
 4. **靠墙灰带**（`fe9e0a3`）：`ground = ground_ever & ~obstacle` 非单调 ⇒ 障碍 178.4 m² 里 120.9 曾为地面；`OBSTACLE_RELEASE` 永不触发。修法 **`OBSTACLE_GROUND_RATIO=1.0`**（ground 489→549、obstacle 178→118.5 m²）；放掉的 60 m² 里 99.8% 是矛盾格，纯墙 votes≥20 一格没碰。闭环 A/B 仿真 n=3v3 过；**默认已改 1.0**。
-   - **★ 灰斑问答（2026-10-09，boss 问"灰斑又变明显了"）**：**不是回归**。面板两种灰＝`blocked`（障碍，今天 11847 格）＋**`seen, not blocked`（空类，今天 6831 格）**。他上次看到的灰少那版 `online_real_def` 是 **ratio Gate−1 的对照臂**、**带着 `--ground-cover-informative`**（日志 `ground rule : TOTAL`）⇒ 只剩 1467 格。更早的交付图 `online_real_v6` 空类 = 6466 格 ⇒ **今天的灰 ≈ 交付图的灰**。要消掉＝开 `GROUND_COVER_INFORMATIVE`（行为零影响、只差 `traversable_m2`，代价是地图层时间）—— **新决定，待拍**。
+   - **★ 灰斑问答（2026-10-09，boss 问"灰斑又变明显了"）**：**不是回归**。面板两种灰＝`blocked`（障碍，11860 格）＋**`seen, not blocked`（空类）**。他上次看到的灰少那版 `online_real_def` 是 **ratio Gate−1 的对照臂**、**带着 cover 开关**（日志 `ground rule : TOTAL`）⇒ 只剩 1467 格；而当时的默认是关的 ⇒ 6824 格。更早的交付图 `online_real_v6` 空类 = 6466 格。
+   - **★ 已按 boss 要求"把灰少的换进默认"**（`GROUND_COVER_INFORMATIVE = True`；flag 反转为 `--no-ground-cover-informative`，旧拼写**直接报错**不静默）。真实侧全量 1427 帧**背靠背** A/B：**决策 md5 逐位相同**、**41 列 0 差异**、`pose_*`/`yaw_deg`/`ground_*`/`cmd_*`/`objects`/`boxes`/`object_names` **全 0 差异**；**障碍格 11860 一格未动**；灰 **6824→1464（−78.5%）**、可通行 495.3→**548.9 m²**；唯一变的列是 `traversable_m2`。
+   - **★ 更正**：旧记录"`ground` +11% ⇒ `ms_map` **+46%**"**不成立** —— 那对历史产物 `cover_off`/`cover_on` 的 deskew/odom/detect 也涨了 48–57%，**整跑被机器负载污染**。今天背靠背重测：**`ms_map` −6.1% / `ms_total` −3.5%**（与同对其他阶段的抖动同量级）⇒ **代价测不出来**（仍只有 1 对）。
 5. **类别表自定，39 类 / 51 条 prompt**：组委会不给列表 ⇒ `labels.py::_SPECS` 是我们的选择。已追加 13 COCO 类（零推理成本）+ 几何类（`unclassified object` / `railing`）+ 3 个**不在 COCO 80** 的类（38 `fire extinguisher` / 39 `gym equipment` / 40 `humanoid robot`）＋ 15 条别名 prompt。旧 id 全稳定。**"没标出来"= ①词表缺类 ②远处点云稀被 LiDAR 门拒 ③无实例层 ④YOLO 漏小目标**；换 3D 检测器只治 ③④。★ **措辞救不了模型看不见的类**（见索引 8 第五轮）。
 6. **边缘算力是规则要求** ⇒ 顺序重排：① 先拿回预算（render 下关键路径 → 地图层平方律，**都要 A/B 门**；算数代价 p50 170–264 ms vs 5 Hz 预算 200 ms）② 零新模型的免费覆盖（实例层 + 扩词表 + 几何类）③ 需任意类别 → 换检测器 ④ 3D 大模型判死、IGLOSS 降级。**先量逐阶段预算，别加模型。**
 7. **实例层**（`r2slam/instances.py`，默认关）——能力有、**判据被真值证伪**：非地面回波 → BEV 栅格 + `connectedComponents` + `reduceat`，3.7 ms/帧（合成）、p50 9.5 ms（全量）。行为中性已证（决策 md5 与只差这一个开关的跑逐位相同）。真值：家具 16.2% / 真人 19.3% / **只落墙 63.4%** / 空地 0.0% ⇒ **精度 35.9%**；召回 12/22=55%。错误单向（on nothing=0%）⇒ 判据目标＝提高"落家具上"占比、保持"落空地"≈0。**在此之前不再改几何阈值。**
@@ -82,7 +84,7 @@
 - B3 停投。不值做（非判死）：`V/(1+d) → V·exp(-λd)`。
 - **登记不落地**：G7 地图形态学清理器 / `fresh_split_m` / 点云层判别器（在线 18 维留一 AUC **0.638 < 0.65** ⇒ 观测层信息不足，**别再堆特征**）。
 - **K=2 已封板**（分的是回波密度不是真实性：墙丢 4.7% / 家具丢 58.6%）。
-- 已装开关（默认关，grep 找）：`GROUND_COVER_INFORMATIVE` / `OBSTACLE_GROUND_RATIO` / `RENDER_*` / `disc_lambda` / `fresh_split_m` / `patch_probe` / `sweep_value_mode` / `island_probe` / `strand_dump` / `--cf-hold-cells`。`_fold` 统一三处折叠。**出厂运行时只有 numpy+cv2+onnxruntime ⇒ 诊断不许 `import scipy`。**
+- 已装开关（默认关，grep 找）：`OBSTACLE_GROUND_RATIO` / `RENDER_*` / `disc_lambda` / `fresh_split_m` / `patch_probe` / `sweep_value_mode` / `island_probe` / `strand_dump` / `--cf-hold-cells`；⚠️ **`GROUND_COVER_INFORMATIVE` 已改为默认开**（反转 flag：`--no-ground-cover-informative`）。`_fold` 统一三处折叠。**出厂运行时只有 numpy+cv2+onnxruntime ⇒ 诊断不许 `import scipy`。**
 
 ## 指标规则
 - 权威口径＝`out/_room_cover2.py`（分母＝单调的 `ground_ever ∩ 框`）。**报百分比必须报分母。**
@@ -91,6 +93,7 @@
 - 算"行为不变"的 md5 **必须剔除 `traversable_m2` 类统计列**。
 - 两源量纲：replay `yaw` **弧度** / online `yaw_deg` **度** ⇒ 跨源先 `repr()` 打原始值。
 - 跨仪器对帧只用 `stamp`。报"掩码变化量"必须同时报格坐标。影子重放测决策不测覆盖。
+- **★★ `ms_*` 只能比"背靠背、同一会话"的一对。** 判据：**同对里与本改动无关的阶段（`deskew`/`odom`/`detect`）也大幅变化 ⇒ 整对被机器负载污染，`ms_map` 之类的数字不能归因给这个开关**（2026-10-09 一条 +46% 的记录就是这样来的，重测是 −6%）。
 
 ## 工程硬规则
 - 会话开头补 PATH：`export PATH="/c/Users/ZhuanZ/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:$PATH"`。
