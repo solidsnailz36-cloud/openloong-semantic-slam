@@ -357,21 +357,41 @@ OBSTACLE_STRONG_VOTES = 20
 OBSTACLE_HOLD = "reset"
 OBSTACLE_MIN_POINTS = 1
 
-# Display only.  A `seen` cell that the obstacle layer did NOT promote, and whose
-# eight neighbours are all traversable, is drawn as traversable rather than as a
-# grey dot in the middle of the floor.  It changes no map array -- see the note
-# in `WorldMap.render`, which carries the measurement behind it.  Set to False to
-# see the raw classification.
-RENDER_FILL_LONE_SEEN = True
+# ★ Should everything we have information about be EITHER floor OR an obstacle
+# candidate, with no third class?
+#
+# The height rule alone leaves two DEAD BANDS -- `tol <= h <= OBSTACLE_LO` above
+# the fitted plane and `-0.60 <= h <= -tol` below it -- where a return marks a
+# cell as `seen` without contributing to either layer.  A cell whose returns land
+# only there is grey forever: `ground_ever` is False, the obstacle layer has no
+# votes for it, and `ground = ground_ever & ~obstacle` therefore excludes it.
+# That is one cell with two answers:
+#
+#   the panel    painted `seen & ~ground` in the obstacle colour  ->  a wall
+#   the planner  `free_space` reads `ground`                      ->  refuse it
+#
+# Measured on the real corridor: 6466 such cells (64.7 m2), and going back to
+# the camera at the five densest of them shows plain corridor floor.  Reported
+# as "the grey all but walls off a doorway that the video shows as open".
+#
+# With this on, `add()` folds `seen & ~obstacle & ~object` into `ground_ever`, so
+# `seen` can no longer contain a cell that is neither floor nor obstacle, and the
+# panel and the planner can read the SAME array.  Object points are excluded: a
+# detection the obstacle layer deliberately does not vote on must not come back
+# in through this door, or every named chair would turn its cell traversable.
+#
+# A/B switch.  It changes `ground` (the planner's input), so it must be measured
+# in closed loop, not just inspected.
+GROUND_COVER_INFORMATIVE = False
 
-# Display only, and the stronger form of the rule above: `obstacle` is the map's
-# only verdict on "something blocks here", so a `seen` cell the obstacle layer
-# did not promote is drawn as traversable EVEN IF it sits in a strip rather than
-# alone.  Measured on the real corridor, those strips (2-3 cells wide, irregular)
-# are what made the panel look as though doorways had been walled off.  Same
-# contract: not one map array changes.  Set to False to fall back to
-# `RENDER_FILL_LONE_SEEN` and see the raw classification.
-RENDER_TRUST_OBSTACLE_LAYER = True
+# There used to be two display-only switches here (`RENDER_FILL_LONE_SEEN`,
+# `RENDER_TRUST_OBSTACLE_LAYER`) that painted `seen & ~obstacle` green so the
+# panel would look clean while `ground` still excluded it.  They are gone, and
+# the reason is worth keeping: a picture rule that disagrees with `ground` gives
+# one cell two answers -- the panel says drivable, `free_space` says no -- and it
+# hides the map defect instead of fixing it.  The defect is fixed where it lives
+# (`GROUND_COVER_INFORMATIVE`), after which the panel needs no rule of its own:
+# it draws `ground`, the same array the planner reads.
 
 # B3 topological fuse: the largest loss of the robot's *current* reachable area
 # (m2) that admitting one cell is allowed to cost before that admission is
@@ -999,10 +1019,19 @@ class WorldMap:
             # the grey cells fully enclosed by green were of that kind -- the
             # speckle in the middle of the walkable floor.
             if seen_mask is None:
+                sm = np.ones(cxo.shape, bool)
                 self.seen[cyo, cxo] = True
             else:
                 sm = np.asarray(seen_mask)[finite][ok]
                 self.seen[cyo[sm], cxo[sm]] = True
+            # `GROUND_COVER_INFORMATIVE` makes the classification total: a cell
+            # we have information about, carrying no obstacle evidence and no
+            # detection, is floor.  Without it, `seen & ~ground_ever & ~obstacle`
+            # is a class the panel draws as a wall and the planner refuses --
+            # see the constant's note for the measurement.
+            if GROUND_COVER_INFORMATIVE:
+                fl = sm & ~o[ok] & ~p[ok]
+                self.ground_ever[cyo[fl], cxo[fl]] = True
             self.ground_ever[cyo, cxo] |= g[ok]
             # **Write only the obstacle points.**  `self.obstacle_now[cyo, cxo]
             # |= o[ok]` looks equivalent and is not: that form lowers to
@@ -1298,10 +1327,17 @@ class WorldMap:
         return self._uniq
 
     # ------------------------------------------------------------------ stats
-    def stats(self) -> dict:
+    def stats(self, audit: bool = False) -> dict:
+        """Counters for the panel, the summary and the run record.
+
+        `audit=True` additionally computes the panel/planner consistency
+        invariant.  That is a pass over three 1200x1200 masks and this method is
+        called every frame, so it is opt-in: the summary asks for it, the
+        on-screen line does not.
+        """
         trav = int(self.ground.sum())
         obs = int(self.seen.sum())
-        return {
+        out = {
             "n_frames": self.n_frames,
             "duration_s": (round(self.t_last - self.t_first, 2)
                            if self.t_first is not None else 0.0),
@@ -1354,6 +1390,22 @@ class WorldMap:
             "n_object_classes": len({lb for _x, _y, lb, _s in self.objects}),
             "trajectory_len_m": self._traj_len(),
         }
+        if audit:
+            # ★ The consistency invariant between the panel and the planner.
+            #
+            # A cell that is `seen` but is neither `ground` nor `obstacle` is one
+            # the panel can paint as a wall while `free_space` refuses it: one
+            # cell, two answers, which is the thing that must not happen.  With
+            # `GROUND_COVER_INFORMATIVE` on this is 0 by construction; with it
+            # off it is the exact size of the class in question -- measured 6466
+            # cells (64.7 m2) on the real corridor, which is what the grey strips
+            # across the doorways were made of.
+            #
+            # Reported rather than asserted, so a run record carries the number
+            # either way and a claim about it can be checked after the fact.
+            out["seen_not_classified_cells"] = int(
+                (self.seen & ~self.ground & ~self.obstacle).sum())
+        return out
 
     def class_counts(self) -> Dict[str, int]:
         """Points per label in the 3D store, by name -- the map's own summary."""
@@ -1455,64 +1507,29 @@ class WorldMap:
         """
         n = self.n
         # 0 = unknown (dark), 1 = traversable (green), 2 = blocked (grey),
-        # 3 = "seen, but the obstacle layer never promoted it" (dim).
+        # 3 = "seen, but neither floor nor obstacle" (dim).
         #
-        # Class 3 is not decoration.  The panel used to paint `seen & ~ground`
-        # one grey, which is the SAME grey as a wall -- so any cell that got a
-        # return but was never classified as blocked read as an obstacle
-        # sitting in the middle of the walkable floor.  Measured on the real
-        # corridor (out/_diag_real/grids): of the 17.70 m2 of grey specks inside
-        # green, only 1.42 m2 had actually been promoted; 16.28 m2 had not and
-        # was drawn as if it had.  The map was right; the picture was lying.
+        # ★ The panel draws `ground` for "you can drive here", and NOTHING ELSE.
+        # That array is the single source of truth: `PathPlanner.free_space`
+        # reads it, `explore` reads it, the coverage figure counts it.
+        #
+        # An earlier revision of this method drew `seen & ~obstacle` instead.
+        # It looked better -- `ground` then excluded a class of cells that were
+        # neither floor nor obstacle -- and that is exactly the failure this
+        # comment exists to prevent: the panel said "drivable", the planner said
+        # no.  One cell, two answers.  A picture that disagrees with the planner
+        # is worse than a picture with grey dots in it.
+        #
+        # The grey dots are a MAP problem and are fixed in the map:
+        # `GROUND_COVER_INFORMATIVE` makes the classification total, so every
+        # cell we have information about is either floor or an obstacle
+        # candidate, and `seen & ~ground & ~obstacle` becomes empty instead of
+        # being painted over.  `stats(audit=True)` reports its size, so the
+        # claim is checkable rather than asserted.
         cls = np.zeros((n, n), np.uint8)
         cls[self.seen] = 3
         cls[self.seen & self.obstacle] = 2
         cls[self.ground] = 1
-
-        # A lone `seen` cell in the middle of the floor is not a thing, and the
-        # map has already said so: class 3 is `~obstacle`, i.e. the obstacle
-        # layer declined to promote it.
-        #
-        # Measured on the real corridor: the grey specks inside green are 1006
-        # components with a MEDIAN SIZE OF ONE CELL (19.6 m2 in total, largest
-        # 0.15 m2), and going back to the camera at those places shows plain
-        # floor -- painted lines, timber, tile -- with nothing 0.35-2 m tall.
-        # Each cell holds 2-3 points, and the same cells also hold points ~1.4 m
-        # BELOW the floor plane, which nothing physical explains.  These are
-        # sparse multi-path returns, and the observation layer cannot separate
-        # them from real structure: the point-cloud discriminator was already
-        # tried and landed at AUC 0.638.
-        #
-        # So this is a DRAWING rule and nothing else.  `self.seen`, `ground`,
-        # `obstacle` and the pcd are untouched, so the planner, the coverage
-        # figure and the replay are all unaffected; only the panel changes.
-        if RENDER_TRUST_OBSTACLE_LAYER:
-            # `obstacle` is the map's ONLY verdict on "does something block
-            # here" -- `blocked()` is `obstacle | obstacle_now`, and the
-            # planner's `ground` is already `ground_ever & ~obstacle`.  A cell
-            # that received a return but was never promoted is, as far as the
-            # map is concerned, not an obstacle; drawing it in the obstacle
-            # colour invents a wall.  Measured on the real corridor over the
-            # 64.7 m2 of `seen & ~ground & ~obstacle`: 41.8 m2 had
-            # obstacle_votes == 0 (not one return ever landed in the 0.35-2.00 m
-            # band), 17.0 m2 had exactly one vote, and only 5.8 m2 had two or
-            # more.  At those places the camera shows plain floor.  They arrive
-            # as thin irregular strips 2-3 cells wide -- which is what made the
-            # panel look like doorways had been all but walled off.
-            #
-            # Drawing rule only, as above: no map array changes, so the
-            # planner, the coverage figure and the replay are unaffected.
-            cls[self.seen & ~self.obstacle] = 1
-        elif RENDER_FILL_LONE_SEEN:
-            # The narrower rule kept for comparison: fill only a `seen` cell
-            # whose eight neighbours are ALL traversable.  It cannot touch the
-            # 2-3 cell strips that were actually the problem, which is why the
-            # rule above exists.
-            green = (cls == 1)
-            nb = (cv2.filter2D(green.astype(np.float32), -1,
-                               np.ones((3, 3), np.float32))
-                  - green)                      # green neighbours, centre excluded
-            cls[(cls == 3) & (nb >= 8)] = 1
 
         if centre is None:
             centre = self.traj[-1] if self.traj else (0.0, 0.0)

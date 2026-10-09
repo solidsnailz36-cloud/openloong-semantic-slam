@@ -410,80 +410,28 @@ def main():
               % (y_spur.max() if len(y_spur) else -1, ry))
 
     # ------------------------------------------------------------------
-    # 13. a cell the obstacle layer did NOT promote must not be drawn as one
-    #
-    # The panel painted every `seen & ~ground` cell the same grey, which is the
-    # grey of a wall.  So a stray return that was never classified as blocked
-    # read as an obstacle standing in the middle of the walkable floor.
-    # Measured on the real corridor: of the 17.70 m2 of grey specks inside
-    # green, only 1.42 m2 had actually been promoted -- 16.28 m2 had not.
-    # The map was right and the picture was lying.
     # ------------------------------------------------------------------
-    w = WorldMap()
-    w.traj = [(-29.0, -10.0)]
-    cells = {
-        "blocked (seen+obstacle)": (-27.0, -10.0),
-        "seen, never promoted": (-27.0, -8.0),
-        "obstacle + ground_ever": (-27.0, -12.0),
-        "ground": (-28.0, -13.0),
-    }
-    # NB all four must be inside the grid: `cell_of` returns a *signed* index and
-    # numpy wraps a negative one silently, so a sample placed outside `extent`
-    # quietly marks some other cell and the test then reports a colour that has
-    # nothing to do with the case it meant to build.
-    for nm, (x, y) in cells.items():
-        c = w.cell_of(x, y)
-        rr, cc = int(c[1]), int(c[0])
-        w.seen[rr, cc] = True
-        if nm.startswith("blocked") or nm.startswith("obstacle +"):
-            w.obstacle[rr, cc] = True
-        if nm.startswith("obstacle +") or nm == "ground":
-            w.ground_ever[rr, cc] = True
-    # `ground` is a pure function of `obstacle` by design, so recompute it the
-    # same way `add()` does rather than setting it by hand.
-    np.logical_and(w.ground_ever, ~w.obstacle, out=w.ground)
-    img = w.render(size=540)
-
-    def colour_at(x, y):
-        # Panel pixel from the documented framing -- `pixel_of` is section 11's
-        # helper and both sections centre on the same robot pose, so it applies
-        # here too.  (Calling it with the raw cell index would index the grid,
-        # not the panel; that mistake made this section report "unknown" for
-        # every sample on its first run.)
-        px, py = pixel_of(x, y)
-        return tuple(int(v) for v in img[py, px])
-
-    blocked = tuple(int(v) for v in (95, 95, 105))
-    green = tuple(int(v) for v in LABEL_COLORS[L.TRAVERSABLE])
-    got = {nm: colour_at(*xy) for nm, xy in cells.items()}
-    check("a promoted cell is drawn as blocked", got["blocked (seen+obstacle)"] == blocked,
-          "got %s want %s" % (got["blocked (seen+obstacle)"], blocked))
-    check("a seen-but-never-promoted cell is drawn as TRAVERSABLE",
-          got["seen, never promoted"] == green,
-          "got %s -- it wears the obstacle colour although the map never called it one"
-          % (got["seen, never promoted"],))
-    check("... i.e. it does not wear the obstacle colour",
-          got["seen, never promoted"] != got["blocked (seen+obstacle)"])
-    check("an obstacle over former floor is still drawn as blocked",
-          got["obstacle + ground_ever"] == blocked, "got %s" % (got["obstacle + ground_ever"],))
-    check("ground is drawn green", got["ground"] == green, "got %s" % (got["ground"],))
-
-    # ------------------------------------------------------------------
-    # 14. a lone dot in the middle of the floor is drawn as floor
+    # 13. the panel's "drivable" IS `ground` -- and only `ground`
     #
-    # The camera said it is floor: going back to the frames that observed these
-    # cells shows painted lines, timber and tile, with nothing 0.35-2 m tall.
-    # They are sparse returns (2-3 points per cell, plus neighbours 1.4 m below
-    # the floor plane) that the obstacle layer never promoted -- so class 3 by
-    # definition, and 1006 of them, median size ONE cell, is the salt-and-pepper
-    # in the green.  The fill is a drawing rule; the arrays are untouched, so
-    # the planner and every metric are unaffected.  What must NOT happen is a
-    # promoted obstacle being filled, or a genuine cluster being filled.
+    # `free_space` (the planner) reads `ground`; the panel draws green; the
+    # coverage figure counts `ground`.  If the panel ever draws drivable for a
+    # cell that `free_space` refuses, the picture cannot be used to read the
+    # robot's behaviour, which is the only reason the panel exists.
+    #
+    # This is not hypothetical.  An earlier revision drew `seen & ~obstacle`,
+    # because those cells look like floor and made the panel tidier -- and the
+    # tidier picture WAS the bug: 6466 cells (64.7 m2) on the real corridor were
+    # green in the panel and refused by the planner.  A picture that disagrees
+    # with the planner is worse than a picture with grey dots in it.
     # ------------------------------------------------------------------
     import r2slam.worldmap as _wm
 
     def build(patch):
-        """`patch` maps (dcol, drow) -> 'g'|'u'|'b'; the rest of a 5x5 is 'g'."""
+        """`patch` maps (dcol, drow) -> g | u | b | s.
+
+        g = ground, b = blocked, s = seen but neither, u = never seen.
+        Every other cell of the 5x5 is ground.
+        """
         m = _wm.WorldMap()
         m.traj = [(-29.0, -10.0)]
         c0, r0 = 28, 198
@@ -491,24 +439,23 @@ def main():
             for dr in range(5):
                 col, row = c0 + dc, r0 + dr
                 kind = patch.get((dc, dr), "g")
+                if kind == "u":
+                    continue
                 m.seen[row, col] = True
-                if kind == "u":                      # seen, never promoted
-                    pass
-                elif kind == "b":                    # blocked: obstacle owns it
+                if kind == "b":
                     m.obstacle[row, col] = True
-                else:                                # ground
+                elif kind == "g":
                     m.ground_ever[row, col] = True
         np.logical_and(m.ground_ever, ~m.obstacle, out=m.ground)
         return m
 
     def colour(m, dc, dr):
-        # Pixel of the CENTRE of a grid cell, from the indices.  Two traps here,
-        # both hit on the first run of this section: going via world coordinates
+        # Pixel at the CENTRE of a grid cell, from the indices.  Both traps
+        # were hit on the first run of this helper: going via world coordinates
         # round-trips through `floor((x + extent)/res)` and lands a cell short
-        # when the quotient is 27.999999x, and sampling the cell's top-left edge
-        # rounds to the previous cell when the edge is at x.4 px (cell 32 ->
-        # 329.4 -> 329, which is cell 31).  The centre has neither problem.
-        cxr, cyr = w.cell_of(-29.0, -10.0)
+        # when the quotient comes out as 27.999999x, and sampling a cell's
+        # top-left edge rounds to the previous cell when the edge is at x.4 px.
+        cxr, cyr = m.cell_of(-29.0, -10.0)
         x0c, y0c = int(cxr) - half, int(cyr) - half
         k = 540.0 / (2.0 * half)
         col, row = 28 + dc, 198 + dr
@@ -517,24 +464,75 @@ def main():
         return tuple(int(v) for v in m.render(size=540)[py, px])
 
     green = tuple(int(v) for v in LABEL_COLORS[L.TRAVERSABLE])
+    dim = (48, 48, 56)
     wall = (95, 95, 105)
 
     got = colour(build({}), 2, 2)
-    check("plain ground still renders green", got == green, "got %s" % (got,))
-    got = colour(build({(2, 2): "u"}), 2, 2)
-    check("a LONE unpromoted cell inside green is drawn green",
-          got == green, "got %s" % (got,))
-    got = colour(build({(2, 2): "u", (3, 2): "u"}), 2, 2)
-    check("a 2-cell STRIP of unpromoted cells is drawn green too",
-          got == green,
-          "got %s -- a strip is the shape that read as a walled-off doorway" % (got,))
-    got = colour(build({(2, 2): "u", (3, 2): "u", (2, 3): "u", (3, 3): "u"}), 2, 2)
-    check("... and so is a 2x2 block", got == green, "got %s" % (got,))
+    check("a ground cell is drawn drivable", got == green, "got %s" % (got,))
+    for shape, cells in (("cell", [(2, 2)]),
+                         ("2-cell strip", [(2, 2), (3, 2)]),
+                         ("2x3 strip", [(1, 2), (2, 2), (3, 2),
+                                       (1, 3), (2, 3), (3, 3)])):
+        got = colour(build({c: "s" for c in cells}), 2, 2)
+        check("a seen-but-not-ground %s is NOT drawn drivable" % shape,
+              got != green,
+              "got %s -- the panel is improvising floor the planner refuses"
+              % (got,))
+        check("... and it is drawn as the third class, not as a wall",
+              got == dim, "got %s" % (got,))
     got = colour(build({(2, 2): "b"}), 2, 2)
-    check("a BOUNDED cell is still drawn as blocked", got == wall, "got %s" % (got,))
-    got = colour(build({(2, 2): "u", (4, 4): "b"}), 2, 2)
+    check("a blocked cell is still drawn blocked", got == wall, "got %s" % (got,))
+    got = colour(build({(2, 2): "s", (4, 4): "b"}), 2, 2)
     check("... and one cell's class does not disturb its neighbours",
-          got == green and colour(build({(2, 2): "u", (4, 4): "b"}), 4, 4) == wall)
+          got == dim and colour(build({(2, 2): "s", (4, 4): "b"}), 4, 4) == wall)
+
+    # ------------------------------------------------------------------
+    # 14. and the map must not leave a cell in that third class at all
+    #
+    # `GROUND_COVER_INFORMATIVE` makes the classification total: a cell we have
+    # information about, carrying no obstacle evidence and no detection, is
+    # floor.  That is what lets section 13 hold -- the panel draws `ground`, the
+    # planner reads `ground`, and nothing is left in between for the two to
+    # disagree about.  The height rule alone left 6466 such cells on the real
+    # corridor (64.7 m2), which is what the grey strips across the doorways were
+    # made of.
+    #
+    # Object points are the one deliberate exclusion: the obstacle layer does
+    # not vote on a detected object, so letting one through here would turn
+    # every named chair's cell into floor.
+    # ------------------------------------------------------------------
+    old_cover = _wm.GROUND_COVER_INFORMATIVE
+    try:
+        _wm.GROUND_COVER_INFORMATIVE = True
+        pts = np.array([[0.0, 0.0, 0.0]])
+        seen_only = np.array([True])
+        no = np.array([False])
+        m = _wm.WorldMap()
+        m.add(pts, no, no, no, pose_xy=(0.0, 0.0), stamp=0.0,
+              seen_mask=seen_only)
+        idx = m.cell_of(0.0, 0.0)
+        rr, cc = int(idx[1]), int(idx[0])
+        check("a seen cell with no obstacle evidence becomes floor",
+              bool(m.ground[rr, cc]),
+              "ground_ever=%s obstacle=%s"
+              % (m.ground_ever[rr, cc], m.obstacle[rr, cc]))
+        check("... so no cell is left in the third class",
+              int((m.seen & ~m.ground & ~m.obstacle).sum()) == 0)
+        m2 = _wm.WorldMap()
+        m2.add(pts, no, no, np.array([True]), pose_xy=(0.0, 0.0), stamp=0.0,
+               seen_mask=seen_only)
+        idx2 = m2.cell_of(0.0, 0.0)
+        check("an OBJECT point does NOT become floor",
+              not bool(m2.ground[int(idx2[1]), int(idx2[0])]),
+              "a detection the obstacle layer skips must not enter here")
+        m3 = _wm.WorldMap()
+        m3.add(pts, no, np.array([True]), no, pose_xy=(0.0, 0.0), stamp=0.0,
+               seen_mask=seen_only)
+        idx3 = m3.cell_of(0.0, 0.0)
+        check("an OBSTACLE point does NOT become floor",
+              not bool(m3.ground[int(idx3[1]), int(idx3[0])]))
+    finally:
+        _wm.GROUND_COVER_INFORMATIVE = old_cover
 
     print("\n%d checks, %d failed" % (N, len(FAILS)))
     if FAILS:

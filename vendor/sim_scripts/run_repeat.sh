@@ -75,7 +75,26 @@ done
 
 echo "=== $TAG x $N done.  Per-room distribution: ==="
 ARGS=""
+NEWARGS=""
 for i in $(seq 1 "$N"); do
   ARGS="$ARGS out/${TAG}r${i}_sim:out/ab_perception/grids_${TAG}r${i}_sim"
+  NEWARGS="$NEWARGS --run ${TAG}r${i}_sim:${TAG}r${i}"
 done
+
+# ★ The authoritative number comes FIRST, and it is the one to decide on.
+#
+# `_room_cover2.py` divides by `ground_ever` (monotone -- it never shrinks),
+# so the ratio is always defined and monotone in the robot's own behaviour.
+#
+# `_room_cover.py` divides by "the room's cells reachable in the FINAL map".
+# That denominator collapses when the map seals a door after the fact, and the
+# script prints `nan` for a room whose denominator fell under 2 m2 -- which then
+# silently drops out of its "min over three rooms".  Measured 2026-10-08: it
+# reported 90% for a run whose monotone value is 32%, because two of its three
+# rooms had a final denominator of 0.00 m2.  It is printed second, for
+# continuity with the archived table in `docs/探索算法_v2_设计与参考.md` §16
+# and for nothing else.
+cd "$ROOT/r2slam" && ../.venv/Scripts/python.exe out/_room_cover2.py $NEWARGS || true
+echo
+echo "--- legacy denominator (continuity with the archived table only; do NOT decide on this) ---"
 cd "$ROOT/r2slam" && ../.venv/Scripts/python.exe out/_room_cover.py $ARGS || true

@@ -207,6 +207,15 @@ def parse_args():
                          "0 = no cap (the shipping rule).  The excess is held "
                          "over exactly like a deferral, so this changes when a "
                          "promotion is decided, not how it is judged.")
+    ap.add_argument("--ground-cover-informative", action="store_true",
+                    help="`worldmap.GROUND_COVER_INFORMATIVE`: fold "
+                         "`seen & ~obstacle & ~object` into `ground_ever`, so "
+                         "everything we have information about is EITHER floor "
+                         "OR an obstacle candidate and there is no third class. "
+                         "That class is why the panel could paint a wall across "
+                         "a doorway the planner had no obstacle for.  It changes "
+                         "`ground` (the planner's input), so it needs the "
+                         "closed-loop A/B, not an eyeball.")
     ap.add_argument("--b3-log", default=None, metavar="FILE",
                     help="read-only row log of the B3 fuse in a **live** run: one "
                          "row per (frame, candidate) evaluation with the dreach "
@@ -523,6 +532,19 @@ def main():
         else:
             print("goto        : '%s' -> label %d (%s)"
                   % (a.goto, navigator.label, L.name(navigator.label)))
+    # The ground rule is NOT part of the explore branch.  It decides what lands
+    # in `ground`, which the panel draws and the coverage figure counts, and the
+    # real capture exercises both without `--explore` (there the robot is driven
+    # by the bag, not by the policy).  Leaving it inside `if a.explore:` meant a
+    # real-side A/B silently ran the CONTROL configuration on both arms: the
+    # first attempt at this experiment produced two byte-identical runs and
+    # measured nothing at all.
+    if a.ground_cover_informative:
+        _worldmap.GROUND_COVER_INFORMATIVE = True
+    print("ground rule : %s"
+          % ("TOTAL -- every informative return is floor or an obstacle "
+             "candidate" if _worldmap.GROUND_COVER_INFORMATIVE
+             else "|h| < tol (leaves dead bands)"))
     if a.explore:
         if a.npz:
             raise SystemExit("--explore needs a live source (nothing to drive in --npz mode)")
@@ -1450,7 +1472,7 @@ def main():
         "per_stage_ms": {k: {"p50": pct(v, 50), "p90": pct(v, 90),
                              "p99": pct(v, 99), "max": pct(v, 100)}
                          for k, v in times.items() if v},
-        "map": {**wmap.stats(), "reachability": reach_note},
+        "map": {**wmap.stats(audit=True), "reachability": reach_note},
         "tf": tf_info,
         "accuracy_vs_truth": ({"n": len(truth_err_xy),
                                "err_xy_m": {"p50": pct(truth_err_xy, 50),
