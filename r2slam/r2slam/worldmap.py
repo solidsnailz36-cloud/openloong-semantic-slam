@@ -364,6 +364,15 @@ OBSTACLE_MIN_POINTS = 1
 # see the raw classification.
 RENDER_FILL_LONE_SEEN = True
 
+# Display only, and the stronger form of the rule above: `obstacle` is the map's
+# only verdict on "something blocks here", so a `seen` cell the obstacle layer
+# did not promote is drawn as traversable EVEN IF it sits in a strip rather than
+# alone.  Measured on the real corridor, those strips (2-3 cells wide, irregular)
+# are what made the panel look as though doorways had been walled off.  Same
+# contract: not one map array changes.  Set to False to fall back to
+# `RENDER_FILL_LONE_SEEN` and see the raw classification.
+RENDER_TRUST_OBSTACLE_LAYER = True
+
 # B3 topological fuse: the largest loss of the robot's *current* reachable area
 # (m2) that admitting one cell is allowed to cost before that admission is
 # deferred.  `0.0` = off, and with it `WorldMap.add` is bit-identical to the
@@ -1477,7 +1486,28 @@ class WorldMap:
         # So this is a DRAWING rule and nothing else.  `self.seen`, `ground`,
         # `obstacle` and the pcd are untouched, so the planner, the coverage
         # figure and the replay are all unaffected; only the panel changes.
-        if RENDER_FILL_LONE_SEEN:
+        if RENDER_TRUST_OBSTACLE_LAYER:
+            # `obstacle` is the map's ONLY verdict on "does something block
+            # here" -- `blocked()` is `obstacle | obstacle_now`, and the
+            # planner's `ground` is already `ground_ever & ~obstacle`.  A cell
+            # that received a return but was never promoted is, as far as the
+            # map is concerned, not an obstacle; drawing it in the obstacle
+            # colour invents a wall.  Measured on the real corridor over the
+            # 64.7 m2 of `seen & ~ground & ~obstacle`: 41.8 m2 had
+            # obstacle_votes == 0 (not one return ever landed in the 0.35-2.00 m
+            # band), 17.0 m2 had exactly one vote, and only 5.8 m2 had two or
+            # more.  At those places the camera shows plain floor.  They arrive
+            # as thin irregular strips 2-3 cells wide -- which is what made the
+            # panel look like doorways had been all but walled off.
+            #
+            # Drawing rule only, as above: no map array changes, so the
+            # planner, the coverage figure and the replay are unaffected.
+            cls[self.seen & ~self.obstacle] = 1
+        elif RENDER_FILL_LONE_SEEN:
+            # The narrower rule kept for comparison: fill only a `seen` cell
+            # whose eight neighbours are ALL traversable.  It cannot touch the
+            # 2-3 cell strips that were actually the problem, which is why the
+            # rule above exists.
             green = (cls == 1)
             nb = (cv2.filter2D(green.astype(np.float32), -1,
                                np.ones((3, 3), np.float32))

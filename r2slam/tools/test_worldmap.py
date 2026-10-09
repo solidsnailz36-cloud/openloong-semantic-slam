@@ -454,15 +454,15 @@ def main():
         return tuple(int(v) for v in img[py, px])
 
     blocked = tuple(int(v) for v in (95, 95, 105))
-    unseen = tuple(int(v) for v in (48, 48, 56))
     green = tuple(int(v) for v in LABEL_COLORS[L.TRAVERSABLE])
     got = {nm: colour_at(*xy) for nm, xy in cells.items()}
     check("a promoted cell is drawn as blocked", got["blocked (seen+obstacle)"] == blocked,
           "got %s want %s" % (got["blocked (seen+obstacle)"], blocked))
-    check("a seen-but-never-promoted cell is NOT drawn as blocked",
-          got["seen, never promoted"] == unseen,
-          "got %s -- it is wearing the obstacle colour" % (got["seen, never promoted"],))
-    check("... and it is distinguishable from blocked",
+    check("a seen-but-never-promoted cell is drawn as TRAVERSABLE",
+          got["seen, never promoted"] == green,
+          "got %s -- it wears the obstacle colour although the map never called it one"
+          % (got["seen, never promoted"],))
+    check("... i.e. it does not wear the obstacle colour",
           got["seen, never promoted"] != got["blocked (seen+obstacle)"])
     check("an obstacle over former floor is still drawn as blocked",
           got["obstacle + ground_ever"] == blocked, "got %s" % (got["obstacle + ground_ever"],))
@@ -517,21 +517,23 @@ def main():
         return tuple(int(v) for v in m.render(size=540)[py, px])
 
     green = tuple(int(v) for v in LABEL_COLORS[L.TRAVERSABLE])
-    dim = (48, 48, 56)
     wall = (95, 95, 105)
 
     got = colour(build({}), 2, 2)
     check("plain ground still renders green", got == green, "got %s" % (got,))
     got = colour(build({(2, 2): "u"}), 2, 2)
-    check("a LONE unpromoted cell inside green is filled (drawn green)",
-          got == green, "got %s -- still a grey dot" % (got,))
+    check("a LONE unpromoted cell inside green is drawn green",
+          got == green, "got %s" % (got,))
     got = colour(build({(2, 2): "u", (3, 2): "u"}), 2, 2)
-    check("... but a CLUSTER of unpromoted cells is NOT filled",
-          got == dim, "got %s" % (got,))
+    check("a 2-cell STRIP of unpromoted cells is drawn green too",
+          got == green,
+          "got %s -- a strip is the shape that read as a walled-off doorway" % (got,))
+    got = colour(build({(2, 2): "u", (3, 2): "u", (2, 3): "u", (3, 3): "u"}), 2, 2)
+    check("... and so is a 2x2 block", got == green, "got %s" % (got,))
     got = colour(build({(2, 2): "b"}), 2, 2)
-    check("a lone BOUNDED cell is never filled", got == wall, "got %s" % (got,))
+    check("a BOUNDED cell is still drawn as blocked", got == wall, "got %s" % (got,))
     got = colour(build({(2, 2): "u", (4, 4): "b"}), 2, 2)
-    check("... and filling one cell does not disturb its neighbours",
+    check("... and one cell's class does not disturb its neighbours",
           got == green and colour(build({(2, 2): "u", (4, 4): "b"}), 4, 4) == wall)
 
     print("\n%d checks, %d failed" % (N, len(FAILS)))
