@@ -248,12 +248,41 @@ class OnnxYoloDetector:
         else:
             self.kind = "v8"
         if self.size is None:
-            self.size = 640 if self.kind == "v8" else 416
+            # Read the side the graph declares instead of assuming 640.  A
+            # baked-vocabulary export is routinely re-made at a smaller side to
+            # buy back frame budget, and guessing here feeds a 640 blob to a 320
+            # graph -- which onnxruntime rejects loudly, but a laxer runtime
+            # would have accepted with every box mis-scaled.  Same principle as
+            # `kind` above: the graph's own shape is the authority, never the
+            # filename and never a constant.
+            self.size = (self._declared_side()
+                         or (640 if self.kind == "v8" else 416))
         # v3 needs the (h, w) tensor as a second input; v8 has a single input
         self._shape_name = (self.in_names[1]
                             if self.kind == "v3" and len(self.in_names) > 1 else None)
 
     # ------------------------------------------------------------------ input
+    def _declared_side(self) -> Optional[int]:
+        """The square input side the graph declares, or None if it is not a
+        static square tensor.
+
+        Only onnxruntime can be asked; `cv2.dnn` does not expose the input
+        shape before a forward pass, so that backend keeps the previous
+        default.  Returning None rather than raising keeps a dynamic-shape
+        export working exactly as it did before this existed.
+        """
+        if self.backend != "onnxruntime":
+            return None
+        try:
+            shp = self.sess.get_inputs()[0].shape
+        except Exception:                       # noqa: BLE001 - old runtimes
+            return None
+        if (shp and len(shp) == 4
+                and all(isinstance(d, int) and d > 0 for d in shp[1:])
+                and shp[2] == shp[3]):
+            return int(shp[2])
+        return None
+
     @staticmethod
     def letterbox_meta(h: int, w: int, size: int) -> Tuple[float, int, int, int, int]:
         """(ratio, new_w, new_h, pad_x, pad_y) for an aspect-preserving pad.

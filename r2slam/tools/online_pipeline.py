@@ -47,7 +47,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from r2slam import load_config, open_source, viz                     # noqa: E402
 from r2slam import labels as L                                        # noqa: E402
 from r2slam.deskew import Deskewer                                   # noqa: E402
-from r2slam.detect import OnnxYoloDetector, load_names                 # noqa: E402
+from r2slam.detect import (OnnxYoloDetector, load_names,        # noqa: E402
+                           load_class_map)
 from r2slam.explore import FrontierExplorer, VelocitySender           # noqa: E402
 from r2slam.frames import Frame                                      # noqa: E402
 from r2slam.fusion import object_3d, project_person_back              # noqa: E402
@@ -503,7 +504,8 @@ def main():
     det = None
     if not a.no_detect:
         det = OnnxYoloDetector(det_model, conf=rt.person_conf,
-                               num_threads=rt.detector_threads)
+                               num_threads=rt.detector_threads,
+                               class_map=load_class_map(det_model))
         # Print the resolved PATH, not just the backend.  The default is
         # relative to the package, and on 2026-10-03 that meant the dev machine
         # and the container silently used files from different directories --
@@ -513,6 +515,15 @@ def main():
               % (det.backend, det.kind, det.size, rt.person_conf,
                  det.threads_applied))
         print("  model     : %s" % det_model)
+        # Whether the class index -> project label sidecar was found decides
+        # whether a baked-vocabulary model can name anything beyond the class
+        # that happens to share COCO's index 0.  It was silently absent for a
+        # whole round of evaluation -- the boxes looked right, the map just
+        # never grew -- so it is printed and recorded from now on.
+        print("  vocab     : %s" % (
+            "COCO 80 (no sidecar)" if det.class_map is None
+            else "%d baked classes (index->label sidecar loaded)"
+                 % len(det.class_map)))
 
     deskewer = Deskewer(enabled=bool(cfg.lidar.deskew) and not a.no_deskew,
                         sign=cfg.lidar.deskew_sign,
