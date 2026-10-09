@@ -41,9 +41,17 @@
    —— **与 ATE p50 = 0.276 m 吻合**（墙点被横向抹到墙边地面格）。
    **修法 `OBSTACLE_GROUND_RATIO = 1.0`**：ground 489→549 m²、obstacle 178→118.5 m²、面板墙色 −38.8%。
    **★ 安全判据：放掉的 60 m² 里 99.8% 是 `ground_ever=True` 的矛盾格，"纯墙且 votes≥20" 一格没碰、新晋升 0。**
-   ⚠️ **默认仍 0.0**（仿真 A/B `out/_ratio_sim.sh`）。
-5. **★★ 类别表是我们自己定的**（交接 §5.2：**组委会 FAQ 明确「不提供类别列表」**）⇒ 23 类 COCO 子集
-   （`labels.py::_SPECS`）是**我们的选择**；画面里没标的（灭火器箱/栏杆/地毯垫子/健身器材/人形机器人）
+   ★★ **闭环 A/B 已过**（仿真 n=3 vs 3，`out/_ratio_sim.sh 3 1.0`）：**12 个指标无一分离**
+5. **★★ 类别表是我们自己定的，已扩到 39 类**（交接 §5.2：**组委会 FAQ 明确「不提供类别列表」**）
+   ⇒ `labels.py::_SPECS` 是**我们的选择**；画面里没标的（灭火器箱/栏杆/地毯垫子/健身器材/人形机器人）
+   **一个都不在 COCO 80 里，`door` 也不在**（⚠️ 我曾把 `door` 写成"没用的 COCO 类"，**错**，已改）。
+   **已完成**：追加 13 个 COCO 类（umbrella/handbag/wine glass/fork/knife/spoon/mouse/remote/cell phone/
+   toaster/scissors/teddy bear/sports ball，**推理成本为零**——检测器一直输出 80 个槽位，是这张表丢掉的）
+   ＋ **2 个几何类：38 `unclassified object`、39 `railing`**（无 COCO id，由 `instances.py` 形状判定；
+   `write_table` 输出 `kind: geometric-object`）。**`PERSON=2` 等 23 个旧 id 全部稳定未动。**
+   **"很多没标出来"= 四个不同原因**：①**词表缺类** ②**远处点云太稀被 LiDAR 门拒**
+   （⚠️ person `min_conf` 只有 0.30 ⇒ **不是置信度问题**）③**没有实例层** ④YOLO 对小目标本来就漏。
+   **⇒ 换 3D 检测器只治 ③④，治不了 ①②；而扩 COCO 只治 ① 的一小半（缺的类多半根本不在 COCO 里）。**
    **一个都不在 COCO 80 里**。**"很多没标出来"= 四个不同原因**：①**词表缺类** ②**远处点云太稀被 LiDAR 门拒**
    （⚠️ person `min_conf` 只有 0.30 ⇒ **不是置信度问题**）③**没有实例层** ④YOLO 对小目标本来就漏。
    **⇒ 换 3D 检测器只治 ③④，治不了 ①②。**
@@ -51,6 +59,21 @@
    「注意算法的计算效率，**需适配嵌入式计算平台**」＋ FAQ「**模型大小需适合在边缘计算设备上运行**」。
    **现状（真实侧 p50，本机桌面）：算数代价 `total − render − dump` = 170–264 ms，而 5 Hz 预算 200 ms。**
    **★ 地图层是平方律**：真实侧 `n=1200`（1.44 M 格）；`free_space` 缓存键是 `int(ground.sum())`
+7. **★★ 实例层（`r2slam/instances.py`，`--instance-layer`，默认关）—— 能力有、判据缺**
+   全场景聚类：非地面回波 → **BEV 栅格 + `cv2.connectedComponents` + `reduceat`**（全 numpy/OpenCV；
+   **不用 `fusion.voxel_components`** —— 逐点 Python 循环扛不住 49k 点/帧）。
+   **时延**：合成 49152 点 **3.7 ms**；全量 1427 帧 **p50 9.5 ms**（首次 20.7 ms 是 OpenCV 惰性初始化）。
+   ★★ **行为中性已证**：与只差这一个开关的跑**决策列 md5 逐位相同**（`b664e5cfb6f76076`）⇒ 不动任何地图数组。
+   ⚠️⚠️ **但效果不行**：**260 实例里 251 个 `unclassified object` 铺满全图、连地板中央都有**
+   （对照图 `out/_inst_ab.png`）。`clust_kept` 里混着大量**墙面补丁/竖直细条**；
+   收紧三轮（`MAX_HEIGHT_M` 2.60→2.20、`MAX_FOOTPRINT_M2` 8→3、`MIN_POINTS` 12→25、
+   `MIN_FOOTPRINT_M2=0.04`、`_is_vertical_surface` 平面度）**只压掉一部分，没改变性质
+   ⇒ 缺的是判据不是阈值**（47% 候选被判为碎屑）。**⇒ 默认关、不进包。**
+   **下一步＝换判据 + 先有真值评测**（仿真 `_truth_geo.py` 可用）：A 问地图（对物体**循环**）／
+   B 用 2D 当裁判（会漏掉"检测器看不见但真实存在"的）。
+   **⑤ 开放词汇走 2D 的机制已就位**（`tools/fetch_yoloworld.py` + `detect.load_class_map()`；
+   **文本塔推理时不跑 ⇒ 边缘端只需 onnxruntime**），**但 `set_classes` 卡在 CLIP 文本塔下载**
+   （`URLError: SSL UNEXPECTED_EOF`，重试 3 次全败，缓存里没有）—— **不是设计问题，是一次 fetch**。
    ⇒ **命中也要两次全量归约**，每帧调用 4+ 处；`ground` 大 11% ⇒ `ms_map` p50 **+46%**。
    **★ `render` 占 24–35% 帧时间，而它不是算法**（交付视频）⇒ **唯一一块不碰判据就回血的预算**。
    **重排（按"每瓦覆盖率"）**：① **先拿回预算**（render 下关键路径 → 地图层平方律，**都 A/B 门**）
