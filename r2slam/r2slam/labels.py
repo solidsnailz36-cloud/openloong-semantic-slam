@@ -115,6 +115,35 @@ _SPECS: List[Tuple[List[int], str, str, str, float]] = [
     ([77],          "teddy bear",   "玩偶",      "medium", 0.45),
     ([32],          "sports ball",  "球",        "small",  0.45),
     # ---------------------------------------------------------------------
+    # 2026-10-09 (third pass): the classes that are in **none** of COCO's 80.
+    #
+    # `tools/fetch_yoloworld.py` bakes this table's names into the detector's
+    # weights as text prompts.  Until now *every prompt it baked was a COCO
+    # class name* -- and since `yolo26n` is a COCO-80 detector, the swap bought
+    # nothing: it covered the same 36 classes and 44 fewer besides.  That was
+    # measured, not argued (36/36 of the baked prompts appear in `coco.names`),
+    # and it is the reason a whole round of YOLO-World work looked worthless.
+    #
+    # These three are the ones a viewer actually notices missing, and none of
+    # them is in COCO-80.  They exist **only** if an open-vocabulary detector is
+    # doing the detecting, which is now the only thing that justifies keeping
+    # one in the stack.
+    #
+    # `humanoid robot` earns its place twice: the capture already contains a
+    # robot, and the incumbent COCO model reports it as a **person** -- a
+    # confident wrong label, which is the worst kind.
+    #
+    # `floor mat` is deliberately **not** here yet.  A mat is a few centimetres
+    # thick, and every gate in `_GATES` asks the LiDAR for a minimum vertical
+    # extent (0.20 m in the `medium` bucket), so it would be detected and then
+    # rejected one line later.  Giving it a floor needs a per-class override,
+    # and the override tables are keyed by COCO id -- which these classes do not
+    # have.  That is a change to the gate machinery, not a row in this table,
+    # and it should be made on the evidence that the other three work.
+    ([],            "fire extinguisher", "灭火器箱", "medium", 0.30),
+    ([],            "gym equipment", "健身器材", "medium", 0.30),
+    ([],            "humanoid robot", "人形机器人", "medium", 0.30),
+    # ---------------------------------------------------------------------
     # Geometric object classes: **no COCO id at all**.  These are decided from
     # the shape of a cluster found by full-scene segmentation
     # (`r2slam/instances.py`), not from a 2D detection, so they need no detector

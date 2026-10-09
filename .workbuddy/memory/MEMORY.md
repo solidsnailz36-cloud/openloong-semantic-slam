@@ -21,7 +21,28 @@
 5. **★ 类别表我们自己定，已扩到 39 类**（组委会 FAQ 明确「不提供类别列表」）⇒ `labels.py::_SPECS` 是我们的选择；画面里没标的（灭火器箱/栏杆/地毯垫子/健身器材/人形机器人）**一个都不在 COCO 80 里**，`door` 也不在。**已完成**：追加 13 个 COCO 类（umbrella/handbag/wine glass/fork/knife/spoon/mouse/remote/cell phone/toaster/scissors/teddy bear/sports ball，**推理成本为零**——检测器一直输出 80 槽位）＋ 2 个几何类（38 `unclassified object`、39 `railing`，无 COCO id，由 `instances.py` 形状判定，`write_table` 输出 `kind: geometric-object`）。**`PERSON=2` 等 23 个旧 id 全部稳定未动。** **"很多没标出来"= 四个不同原因**：①词表缺类 ②远处点云太稀被 LiDAR 门拒（person `min_conf` 只 0.30 ⇒ **不是置信度问题**）③没有实例层 ④YOLO 对小目标本来就漏。⇒ **换 3D 检测器只治 ③④，治不了 ①②；扩 COCO 只治 ① 的一小半（缺的类多半根本不在 COCO 里）。**
 6. **★ 边缘算力约束 ⇒ 建议顺序全变**（§12，`e2877b1`）。规则要求：「注意计算效率，**需适配嵌入式计算平台**」＋ FAQ「模型大小需适合边缘设备」。**现状（真实侧 p50，本机桌面）：算数代价 `total − render − dump` = 170–264 ms，5 Hz 预算 200 ms。** **地图层是平方律**：真实侧 n=1200（1.44 M 格）；`free_space` 缓存键 `int(ground.sum())` ⇒ 命中也要两次全量归约，每帧调用 4+ 处；`ground` 大 11% ⇒ `ms_map` p50 +46%。**`render` 占 24–35% 帧时间，而它不是算法**（交付视频）⇒ **唯一一块不碰判据就回血的预算**。**重排（按每瓦覆盖率）**：① 先拿回预算（render 下关键路径 → 地图层平方律，**都 A/B 门**）② **免费的覆盖**（零新模型）：全场景聚类出实例 id ＋扩词表＋几何规则类 ③ 需任意类别 → **2D `YOLO-World` 替换 `yolo26n`**（文本编码器重参数化进 1×1 卷积 ⇒ 在线成本为零；已发表边缘实测 115 MB→32 MB / Jetson Orin Nano Super 32.6 FPS；**替换而非叠加**）④ **3D 大模型判死**（MinkowskiEngine CUDA 算子导不出 ONNX）；**IGLOSS 降级**（需 torch+GPU，比整条栈还大）。⇒ **第一件要做的是在指定参考平台上量逐阶段预算，不是加模型。**
 7. **★ 实例层（`r2slam/instances.py`，`--instance-layer`，默认关）—— 能力有、判据已被真值证伪**：全场景聚类（非地面回波 → **BEV 栅格 + `cv2.connectedComponents` + `reduceat`**，全 numpy/OpenCV；**不用 `fusion.voxel_components`**——逐点 Python 循环扛不住 49k 点/帧）。时延：合成 49152 点 **3.7 ms**；全量 1427 帧 **p50 9.5 ms**。**行为中性已证**：与只差这一个开关的跑**决策列 md5 逐位相同**（`b664e5cfb6f76076`）⇒ 不动任何地图数组。**真值评测已做——判据确实错了**：`--instance-log`（每帧每簇落盘）＋ `out/_truth_geo.py --dump-models`（逐模型世界系 AABB）＋ `out/_inst_truth.py`（评测器）。仿真 3136 簇/874 帧：**家具 16.2% / 真人 19.3% / 只落墙 63.4% / 空地 0.0%** ⇒ **精度 35.9%，64.1% 是"把建筑当物体"**。★ `on nothing = 0%` ⇒ **错误是单向的**（好修）。★ **召回也低：22 个家具模型只有 12 个（55%）被认领**。⚠️ 真值对齐 p50 0.200 m（=2 格，该口径精度上限）。**判据目标从此明确**：提高"落在家具上"占比、保持"落在空地上"≈0 ⇒ **在此之前不再改几何阈值**（前三轮调参每次挪一点数字，却答不了"好到什么程度算够"）。
-8. **★ ⑤ 开放词汇 2D 已跑通，但算力账算不过来**（`yoloworld_s.onnx`，50.37 MB）：CLIP/MobileCLIP 文本塔（338 MB）重试下载成功——之前 `URLError: SSL UNEXPECTED_EOF` 是**瞬时失败不是被墙**。链路：36 prompts（来自 `labels.py`）→ `set_classes` 烤进权重 → ONNX `[1,40,8400]`（4 框+36 类）＋ `*.classmap.json` sidecar。⚠️ `.onnx` 是 gitignore 的（模型不入库）。**parity（我们解码 vs ultralytics 解同一张 ONNX）8/8 通过，最大 1.00 px** ✓。⚠️ **代价：体积 5.1×（9.88→50.37 MB）、`detect` 3.8×（99→381 ms）**；`yolov8s-worldv2` = 12.75 M 参数 / 32.3 GFLOPs，**YOLO-World v2 没有 nano** ⇒ 下不去。⇒ **detect 会从 55–72 ms 变成 210–275 ms，光它超 200 ms 预算** ⇒ **量化前不进配置**。⚠️ **收益未验证且预计很小**：新增 13 类全是小物件；boss 报的缺失项（灭火器箱/栏杆/地毯/健身器材/人形机器人）**仍然一个都烤不进去**——**开放词汇解决"词表宽度"，不解决"我们没见过的具体物件"**。★ **两条路的瓶颈其实是同一个**：缺一个能判"这是不是物体"的判据。
+8. **★ ⑤ 开放词汇：接线缺陷已修，但「换 YOLO-World」在当前词表下是白换**（`docs/开放词汇边缘化_第一轮实测_20261009.md`，commit `823b559`）。
+   - **★★★ 词表真相**：烘焙的 **36 条 prompt 全部是 COCO 类**（32 条字面相同 ＋ 4 条写法差异：
+     `pottedplant`/`diningtable`/`tvmonitor`）。`yolo26n` 本就是 **COCO 80** ⇒ **换 YOLO-World 词表 80→36，是负收益**。
+     **q320 多检出 `clock`/`potted plant` 的真因是 backbone 更强**（`yolov8s-worldv2` 12.75 M vs nano ~2.4 M），
+     **不是开放词汇** ⇒ **兑现开放词汇的唯一路**：把**不在 COCO 的类**真的写进 prompt ＋ **先证明 yolo26n 检不到**。
+   - **★★ 接线缺陷**：`online_pipeline.py` 构造检测器**从未传 `class_map`** ⇒ 烘焙索引是 prompt 顺序不是 COCO，
+     idx 0(`person`) 巧合一致、**idx 1–35 全 → `None` 被静默丢弃** ⇒ **换了模型也只有 person 能出来**。
+     **已修**。**Gate −1**：stash 后跑 HEAD vs 改动版同 150 帧 ⇒ **55 列只差 10 个 `ms_*`**。
+   - **★ 顺带修**：`detect.py` 曾硬编码 `640 if kind=="v8"`、从不读图输入形状 ⇒ 接 320 图立刻炸。
+     新增 `_declared_side()`：**图的形状是权威，不是文件名、也不是常量。**
+   - **★ INT8 零检出根因**：**输出端 `Concat` 共用一个量化尺度** —— 框分支（0~680 px）与 `Sigmoid` 类别分支（0~1）
+     拼一起 ⇒ **类别通道被压成精确的 0**（FP32 0.8445 / 全量化 0.0000 / 排除尾部 3 节点 0.8819）。
+     修法 `quantize_onnx.py --exclude-tail 2`。⚠️ **量化只值 1.35–1.42×** ⇒ 分辨率才是主杠杆。
+   - **★ 全量 1427 帧**：q320 **45.3 ms**（快 30%）/ 13.31 MB；拒收率 **22.3% vs yolo26n 23.7%**
+     （**150 帧上的 9.8% vs 1.3% 是抽样噪声**）；**`seen_cells` 两边都 68215**（检测器不影响建图）。
+     取舍：q320 多 3 个 person 实例，**但丢了 `suitcase`（n_obs=27 的静止物体）** ⇒ 320 丢"小且静止"的物体。
+   - **★ A 方案已试（2026-10-09）**：`_SPECS` 加了 **38 `fire extinguisher` / 39 `gym equipment` /
+     40 `humanoid robot`**（无 COCO id）⇒ 重导 `yoloworld_open_320.onnx`（39 类）。
+     **`fire extinguisher` 6/6 帧检出（人眼确认是灭火器箱），而 `yolo26n` 3 帧瞎、1 帧误判成 `person`** ✓
+     **零回归**（person/chair/tv 逐项不变）。⚠️ 另两个 prompt **松门也是 0** ⇒ CLIP 对这两词无响应。
+     ⚠️ `unclassified object`/`railing` 的 id 因此从 38/39 → **41/42**（全库符号引用，安全）。
+   - ⚠️ 全部是 CPU 本机数字；**Orin 逐阶段预算仍未做**。新工具：`dump_camera_frames`/`bench_detector`/`quantize_onnx`。
 9. **§73**：**报覆盖必须同时报 `wall_s` 与 `sim_span`（RTF）**；"进不去房间"曾是 `--duration` 墙钟截断。
 
 ## ★ 渲染（定论）
