@@ -103,7 +103,7 @@ while [ "$(valid_count)" -lt "$TARGET" ]; do
     timeout "$WALLCAP" python3 tools/online_pipeline.py \
         --config config/sim_house.yaml --sim-duration "$SIMDUR" --duration "$WALLCAP" \
         --explore $EXTRA --dump-grids "$G" --out "$D" \
-        > "/work/ab/run_${TAG}.log" 2>&1
+        > "/work/ab/run_${TAG}_a${attempt}.log" 2>&1
     RC=$?
     kill "$MON" 2>/dev/null
     SPAN=$(span_of "$D")
@@ -112,7 +112,7 @@ while [ "$(valid_count)" -lt "$TARGET" ]; do
       echo "  $TAG VALID"; OK=1; break
     fi
     echo "  !! $TAG INVALID"
-    tail -3 "/work/ab/run_${TAG}.log" 2>/dev/null | sed 's/^/    /'
+    tail -3 "/work/ab/run_${TAG}_a${attempt}.log" 2>/dev/null | sed 's/^/    /'
   done
   mkdir -p "/work/beh3/$TAG"
   cp "/work/out_$TAG/summary.json" "/work/beh3/$TAG/" 2>/dev/null

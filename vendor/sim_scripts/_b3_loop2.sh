@@ -1,7 +1,7 @@
 #!/bin/bash
 # ⚠️ MIRROR.  The container runs /work/r2slam_ws/out/_b3_loop2.sh (copied in with
-#   `docker cp`; `out/` is gitignored, so this copy is the one under version
-#   control).  Edit here and re-copy, not the other way round.
+#   `docker cp`; `out/` is gitignored, so this copy is the one under
+#   version control).
 # _b3_loop2.sh -- the closed-loop A/B for the B3 topological fuse.
 #
 #   OFF  --obstacle-topo-fuse 0                                   (baseline)
@@ -127,7 +127,7 @@ while :; do
     timeout "$WALLCAP" python3 tools/online_pipeline.py \
         --config config/sim_house.yaml --sim-duration "$SIMDUR" --duration "$WALLCAP" \
         --explore $EXTRA --dump "$C" --dump-grids "$G" --out "$D" \
-        > "/work/ab/run_${TAG}.log" 2>&1
+        > "/work/ab/run_${TAG}_a${attempt}.log" 2>&1
     RC=$?
     kill "$MON" 2>/dev/null
 
@@ -146,7 +146,7 @@ while :; do
       break
     fi
     echo "  !! $TAG attempt $attempt INVALID"
-    tail -3 "/work/ab/run_${TAG}.log" 2>/dev/null | sed 's/^/    /'
+    tail -3 "/work/ab/run_${TAG}_a${attempt}.log" 2>/dev/null | sed 's/^/    /'
   done
 
   # Copy back per arm, not at the end: a multi-hour loop that only exports on
