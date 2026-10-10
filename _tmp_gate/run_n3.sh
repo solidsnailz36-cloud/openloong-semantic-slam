@@ -107,6 +107,16 @@ PY" | tr -d ' \r')
 ARMS="$*"
 [ -z "$ARMS" ] && ARMS="r19 r25 all"
 for arm in $ARMS; do
+  # `arm:rep` runs exactly that one repeat.  Used to REPLACE a run the validity
+  # gate threw out: a flake is not a data point, so the sample is re-taken with
+  # its original tag rather than appended as a 4th, which would quietly change
+  # the pre-registered design from n=3 to n=4.
+  case "$arm" in
+    *:*)
+      one "${arm%%:*}" "${arm##*:}" || true
+      continue
+      ;;
+  esac
   for rep in $(seq 1 "$ARM_REPS"); do
     one "$arm" "$rep" || true
   done

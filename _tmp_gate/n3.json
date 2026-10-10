@@ -1,0 +1,386 @@
+{
+ "status": {
+  "r19_1": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.0",
+   "ok": "OK"
+  },
+  "r19_2": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  },
+  "r19_3": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  },
+  "r25_1": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  },
+  "r25_2": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  },
+  "r25_3": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  },
+  "all_1": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  },
+  "all_2": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  },
+  "all_3": {
+   "rc": "rc=0",
+   "rows": "rows=1352",
+   "span": "span=270.1",
+   "ok": "OK"
+  }
+ },
+ "runs": [
+  {
+   "tag": "all_1",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 129.9,
+   "xmin": -11.78,
+   "xmax": 6.32,
+   "ymin": -7.28,
+   "ymax": 6.06,
+   "bbox_m2": 241.4,
+   "park_n": 11,
+   "stall_s": 2.6,
+   "stall_at": [
+    -2.74,
+    5.82
+   ],
+   "west_at": 39.4,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 1,
+   "wedge": 1,
+   "arrivals": 15,
+   "targets": 19,
+   "switches": 18,
+   "frozen": 0,
+   "states": {
+    "arc": 115,
+    "backoff": 10,
+    "drive": 1163,
+    "turn": 63
+   },
+   "A": true,
+   "B": true,
+   "fails": [],
+   "valid": true
+  },
+  {
+   "tag": "all_2",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 120.1,
+   "xmin": -8.14,
+   "xmax": 6.68,
+   "ymin": -7.36,
+   "ymax": 6.24,
+   "bbox_m2": 201.6,
+   "park_n": 12,
+   "stall_s": 2.6,
+   "stall_at": [
+    4.49,
+    5.37
+   ],
+   "west_at": null,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 12,
+   "wedge": 23,
+   "arrivals": 18,
+   "targets": 23,
+   "switches": 12,
+   "frozen": 0,
+   "states": {
+    "arc": 130,
+    "backoff": 120,
+    "drive": 1009,
+    "turn": 92
+   },
+   "A": true,
+   "B": false,
+   "fails": [],
+   "valid": true
+  },
+  {
+   "tag": "all_3",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 112.7,
+   "xmin": -12.49,
+   "xmax": 6.16,
+   "ymin": -7.55,
+   "ymax": 6.6,
+   "bbox_m2": 263.9,
+   "park_n": 81,
+   "stall_s": 24.0,
+   "stall_at": [
+    -9.74,
+    6.53
+   ],
+   "west_at": 31.2,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 23,
+   "wedge": 128,
+   "arrivals": 11,
+   "targets": 17,
+   "switches": 12,
+   "frozen": 0,
+   "states": {
+    "arc": 119,
+    "backoff": 222,
+    "drive": 948,
+    "turn": 62
+   },
+   "A": false,
+   "B": true,
+   "fails": [
+    "stall 24.0s@(-9.74, 6.53)"
+   ],
+   "valid": true
+  },
+  {
+   "tag": "r19_1",
+   "rows": 1351,
+   "span": 270.0,
+   "path_m": 120.5,
+   "xmin": -12.31,
+   "xmax": 6.12,
+   "ymin": -7.41,
+   "ymax": 5.96,
+   "bbox_m2": 246.3,
+   "park_n": 11,
+   "stall_s": 2.4,
+   "stall_at": [
+    -11.13,
+    -0.87
+   ],
+   "west_at": 25.4,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 13,
+   "wedge": 49,
+   "arrivals": 12,
+   "targets": 15,
+   "switches": 13,
+   "frozen": 0,
+   "states": {
+    "arc": 131,
+    "backoff": 130,
+    "drive": 1010,
+    "turn": 80
+   },
+   "A": true,
+   "B": true,
+   "fails": [],
+   "valid": true
+  },
+  {
+   "tag": "r19_2",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 122.6,
+   "xmin": -12.18,
+   "xmax": 6.21,
+   "ymin": -7.24,
+   "ymax": 5.39,
+   "bbox_m2": 232.4,
+   "park_n": 13,
+   "stall_s": 2.8,
+   "stall_at": [
+    -11.72,
+    -3.1
+   ],
+   "west_at": 113.2,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 9,
+   "wedge": 32,
+   "arrivals": 12,
+   "targets": 14,
+   "switches": 13,
+   "frozen": 0,
+   "states": {
+    "arc": 113,
+    "backoff": 90,
+    "drive": 1060,
+    "turn": 88
+   },
+   "A": true,
+   "B": true,
+   "fails": [],
+   "valid": true
+  },
+  {
+   "tag": "r19_3",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 121.8,
+   "xmin": -11.64,
+   "xmax": 6.14,
+   "ymin": -7.23,
+   "ymax": 6.17,
+   "bbox_m2": 238.2,
+   "park_n": 11,
+   "stall_s": 2.6,
+   "stall_at": [
+    0.0,
+    0.0
+   ],
+   "west_at": 70.0,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 6,
+   "wedge": 12,
+   "arrivals": 14,
+   "targets": 28,
+   "switches": 17,
+   "frozen": 0,
+   "states": {
+    "arc": 129,
+    "backoff": 60,
+    "drive": 1065,
+    "turn": 97
+   },
+   "A": true,
+   "B": true,
+   "fails": [],
+   "valid": true
+  },
+  {
+   "tag": "r25_1",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 111.1,
+   "xmin": -11.75,
+   "xmax": 6.34,
+   "ymin": -7.5,
+   "ymax": 5.56,
+   "bbox_m2": 236.3,
+   "park_n": 11,
+   "stall_s": 2.4,
+   "stall_at": [
+    -11.72,
+    -3.23
+   ],
+   "west_at": 114.0,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 31,
+   "wedge": 91,
+   "arrivals": 5,
+   "targets": 20,
+   "switches": 11,
+   "frozen": 0,
+   "states": {
+    "arc": 136,
+    "backoff": 310,
+    "drive": 825,
+    "turn": 80
+   },
+   "A": true,
+   "B": true,
+   "fails": [],
+   "valid": true
+  },
+  {
+   "tag": "r25_2",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 121.9,
+   "xmin": -11.8,
+   "xmax": 6.45,
+   "ymin": -7.42,
+   "ymax": 5.31,
+   "bbox_m2": 232.4,
+   "park_n": 15,
+   "stall_s": 3.2,
+   "stall_at": [
+    -11.01,
+    -6.49
+   ],
+   "west_at": 111.2,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 10,
+   "wedge": 34,
+   "arrivals": 8,
+   "targets": 11,
+   "switches": 9,
+   "frozen": 0,
+   "states": {
+    "arc": 136,
+    "backoff": 93,
+    "drive": 1031,
+    "turn": 91
+   },
+   "A": true,
+   "B": true,
+   "fails": [],
+   "valid": true
+  },
+  {
+   "tag": "r25_3",
+   "rows": 1351,
+   "span": 270.1,
+   "path_m": 125.5,
+   "xmin": -12.12,
+   "xmax": 6.22,
+   "ymin": -7.31,
+   "ymax": 5.66,
+   "bbox_m2": 237.9,
+   "park_n": 11,
+   "stall_s": 2.4,
+   "stall_at": [
+    1.78,
+    0.73
+   ],
+   "west_at": 106.2,
+   "jumps": [],
+   "n_jumps": 0,
+   "backoffs": 8,
+   "wedge": 22,
+   "arrivals": 12,
+   "targets": 14,
+   "switches": 13,
+   "frozen": 0,
+   "states": {
+    "arc": 104,
+    "backoff": 80,
+    "drive": 1099,
+    "turn": 68
+   },
+   "A": true,
+   "B": true,
+   "fails": [],
+   "valid": true
+  }
+ ]
+}

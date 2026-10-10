@@ -1,0 +1,9 @@
+r19_1 rc=0 rows=1352 span=270.0 OK --robot-radius 0.19
+r19_2 rc=0 rows=1352 span=270.1 OK --robot-radius 0.19
+r19_3 rc=0 rows=1352 span=270.1 OK --robot-radius 0.19
+r25_1 rc=0 rows=1352 span=270.1 OK <defaults>
+r25_2 rc=0 rows=1352 span=270.1 OK <defaults>
+r25_3 rc=0 rows=1352 span=270.1 OK <defaults>
+all_1 rc=0 rows=1352 span=270.1 OK --explore-set ahead_clear_use_obstacle_now=False --explore-set backoff_realign=True
+all_2 rc=0 rows=1352 span=270.1 OK --explore-set ahead_clear_use_obstacle_now=False --explore-set backoff_realign=True
+all_3 rc=0 rows=1352 span=270.1 OK --explore-set ahead_clear_use_obstacle_now=False --explore-set backoff_realign=True

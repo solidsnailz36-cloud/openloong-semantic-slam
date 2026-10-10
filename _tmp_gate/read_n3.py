@@ -174,6 +174,11 @@ def main():
             if len(p) >= 5:
                 status[p[0]] = dict(rc=p[1], rows=p[2], span=p[3], ok=p[4])
     tags = sorted(status)
+    # The pre-registered validity gate (§5): a run whose recorded span is under
+    # 97% of the sensor-time budget is a statement about a shorter run, not
+    # about the arm.  Such runs are REPORTED but excluded from the arm verdict --
+    # counting them would let a harness flake decide the experiment.
+    valid = set(t for t, v in status.items() if v.get("ok") == "OK")
     print("pre-registered: A park_n<=%d | B xmin<=%.2f | arm: A 3/3, B>=2/3, "
           "median xmin<=%.1f | ref band n=%d median %.2f p75 %.2f"
           % (PARK_OK, XMIN_OK, ARM_XMIN_MED, REF["n"], REF["median"], REF["p75"]))
@@ -190,28 +195,31 @@ def main():
             continue
         A, B, fails = verdict(r)
         r["A"], r["B"], r["fails"] = A, B, fails
+        r["valid"] = tag in valid
         res.append(r)
-        print("%-9s %5.0f %6.2f %6.2f %6.2f %6d %7.1f %7s %6.1f %5s %5s %5s %s"
+        print("%-9s %5.0f %6.2f %6.2f %6.2f %6d %7.1f %7s %6.1f %5s %5s %5s %s%s"
               % (tag, r["span"], r["xmin"], r["xmax"], r["ymin"], r["park_n"],
                  r["stall_s"], r["west_at"] if r["west_at"] is not None else "--",
                  r["path_m"], r["backoffs"], r["wedge"], r["arrivals"],
                  ("A" if A else "a") + ("B" if B else "b")
-                 + ("  FAIL:" + ";".join(fails) if fails else "")))
+                 + ("  FAIL:" + ";".join(fails) if fails else ""),
+                 "" if r["valid"] else "   [无效,不计入臂]"))
     print()
-    print("%-9s %-7s %-8s %s" % ("arm", "n", "A(3/3)", "B(>=2/3)"))
+    print("%-9s %-7s %-8s %s" % ("arm", "n有效", "A", "B"))
     for arm in ("r19", "r25", "all"):
-        rs = [r for r in res if r["tag"].startswith(arm + "_")]
+        rs = [r for r in res if r["tag"].startswith(arm + "_") and r["valid"]]
         if not rs:
             continue
         na = sum(1 for r in rs if r["A"])
         nb = sum(1 for r in rs if r["B"])
         med = statistics.median([r["xmin"] for r in rs])
-        okA = na == len(rs) == 3
-        okB = nb >= 2
+        okA, okB = na == len(rs), nb >= max(2, -(-len(rs) * 2 // 3))
+        okA = okA and len(rs) == 3           # pre-registered: n = 3 per arm
         print("%-9s %-7d %-8s %-8s median xmin=%6.2f  %s"
-              % (arm, len(rs), "%d/3 %s" % (na, "PASS" if okA else "FAIL"),
-                 "%d/3 %s" % (nb, "PASS" if okB else "FAIL"), med,
-                 "ARM PASS" if (okA and okB and med <= ARM_XMIN_MED) else "ARM FAIL"))
+              % (arm, len(rs), "%d/%d %s" % (na, len(rs), "PASS" if okA else "FAIL"),
+                 "%d/%d %s" % (nb, len(rs), "PASS" if okB else "FAIL"), med,
+                 "ARM PASS" if (okA and okB and med <= ARM_XMIN_MED)
+                 else "ARM FAIL"))
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:
             json.dump(dict(status=status, runs=res), fh,

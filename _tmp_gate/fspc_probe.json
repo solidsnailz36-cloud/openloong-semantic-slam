@@ -1,0 +1,163 @@
+[
+ {
+  "tag": "v16",
+  "res": 0.1,
+  "xmin": -12.35,
+  "r0.19": {
+   "free_cells": 18862,
+   "path_free": 0.681,
+   "park_free": 0.0,
+   "park_n": 21
+  },
+  "r0.25": {
+   "free_cells": 18655,
+   "path_free": 0.671,
+   "park_free": 0.0,
+   "park_n": 21
+  },
+  "r0.30": {
+   "free_cells": 16980,
+   "path_free": 0.599,
+   "park_free": 0.0,
+   "park_n": 21
+  }
+ },
+ {
+  "tag": "base",
+  "res": 0.1,
+  "xmin": -11.76,
+  "r0.19": {
+   "free_cells": 18858,
+   "path_free": 0.864,
+   "park_free": 1.0,
+   "park_n": 18
+  },
+  "r0.25": {
+   "free_cells": 18595,
+   "path_free": 0.857,
+   "park_free": 1.0,
+   "park_n": 18
+  },
+  "r0.30": {
+   "free_cells": 16844,
+   "path_free": 0.795,
+   "park_free": 1.0,
+   "park_n": 18
+  }
+ },
+ {
+  "tag": "r25",
+  "res": 0.1,
+  "xmin": -11.29,
+  "r0.19": {
+   "free_cells": 20069,
+   "path_free": 0.868,
+   "park_free": 1.0,
+   "park_n": 9
+  },
+  "r0.25": {
+   "free_cells": 19790,
+   "path_free": 0.853,
+   "park_free": 1.0,
+   "park_n": 9
+  },
+  "r0.30": {
+   "free_cells": 17939,
+   "path_free": 0.781,
+   "park_free": 0.111,
+   "park_n": 9
+  }
+ },
+ {
+  "tag": "a23",
+  "res": 0.1,
+  "xmin": -8.32,
+  "r0.19": {
+   "free_cells": 18968,
+   "path_free": 0.805,
+   "park_free": 0.0,
+   "park_n": 15
+  },
+  "r0.25": {
+   "free_cells": 18717,
+   "path_free": 0.789,
+   "park_free": 0.0,
+   "park_n": 15
+  },
+  "r0.30": {
+   "free_cells": 17043,
+   "path_free": 0.707,
+   "park_free": 0.0,
+   "park_n": 15
+  }
+ },
+ {
+  "tag": "b3l_ON_r4",
+  "res": 0.1,
+  "xmin": -6.66,
+  "r0.19": {
+   "free_cells": 11061,
+   "path_free": 0.17,
+   "park_free": 0.0,
+   "park_n": 538
+  },
+  "r0.25": {
+   "free_cells": 10626,
+   "path_free": 0.163,
+   "park_free": 0.0,
+   "park_n": 538
+  },
+  "r0.30": {
+   "free_cells": 8820,
+   "path_free": 0.136,
+   "park_free": 0.0,
+   "park_n": 538
+  }
+ },
+ {
+  "tag": "b3l_ON_r3",
+  "res": 0.1,
+  "xmin": -5.95,
+  "r0.19": {
+   "free_cells": 11033,
+   "path_free": 0.159,
+   "park_free": 0.0,
+   "park_n": 656
+  },
+  "r0.25": {
+   "free_cells": 10738,
+   "path_free": 0.149,
+   "park_free": 0.0,
+   "park_n": 656
+  },
+  "r0.30": {
+   "free_cells": 8972,
+   "path_free": 0.099,
+   "park_free": 0.0,
+   "park_n": 656
+  }
+ },
+ {
+  "tag": "b3profr1",
+  "res": 0.1,
+  "xmin": -2.37,
+  "r0.19": {
+   "free_cells": 8579,
+   "path_free": 0.117,
+   "park_free": 0.0,
+   "park_n": 497
+  },
+  "r0.25": {
+   "free_cells": 8211,
+   "path_free": 0.113,
+   "park_free": 0.0,
+   "park_n": 497
+  },
+  "r0.30": {
+   "free_cells": 6872,
+   "path_free": 0.106,
+   "park_free": 0.0,
+   "park_n": 497
+  }
+ }
+]

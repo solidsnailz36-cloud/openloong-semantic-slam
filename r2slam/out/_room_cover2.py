@@ -104,18 +104,25 @@ def main():
                     help="extra run to score, e.g. `--run subr2_sim:subr2`. "
                          "Appended after the archived list.")
     ap.add_argument("--grids-root", default=None, metavar="DIR",
-                    help="directory holding `grids_<tag>` snapshots.  Default "
-                         "is the archive `out/ab_perception`, i.e. the same "
-                         "behaviour as before this flag existed.")
+                    help="directory holding `grids_<tag>` snapshots for the runs "
+                         "given with --run.  The ARCHIVED list always reads "
+                         "`out/ab_perception`, so the published table keeps "
+                         "reproducing even while a fresh batch is scored.")
     a = ap.parse_args()
-    runs = list(RUNS) + [(s.partition(":")[0], s.partition(":")[2] or s.partition(":")[0])
-                         for s in a.run]
+    # The archived list keeps its own root; only `--run` goes through the flag.
+    # One root for both was the first version of this, and it silently turned
+    # every archived row into "no snapshots found" the moment a fresh batch was
+    # scored -- the table stopped being a table and nothing said so.
+    runs = ([(t, ar, None) for t, ar in RUNS]
+            + [(s.partition(":")[0],
+                s.partition(":")[2] or s.partition(":")[0], a.grids_root)
+               for s in a.run])
     all_cov = {}
     arms = {}
     print("%-11s %-9s %s" % ("run", "arm", "   ".join(
         "%-8s" % (n + "(%)") for n, *_ in ROOMS) + "   三房最小"))
-    for tag, arm in runs:
-        c = cover_of(tag, a.grids_root)
+    for tag, arm, root in runs:
+        c = cover_of(tag, root)
         if c is None:
             print("%-11s %-9s (无归档栅格)" % (tag, arm))
             continue
