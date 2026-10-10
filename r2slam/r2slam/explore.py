@@ -54,6 +54,20 @@ import numpy as np
 from .nav import PathPlanner, path_length
 from .overrides import as_bool
 
+# Index of the **region rank** inside a `last_sweep_cands` tuple -- 0 means "the
+# region the region layer ranked first".  The field list lives at the tuple's
+# construction in `_pick_sweep_target`; this constant is what every reader must
+# use instead of `c[-1]`.
+#
+# It used to be the last field, and three readers said `c[-1]`.  A 24th field
+# (`r["val"]`, the raw value term) was appended after it on 2026-10-08, so from
+# then on those readers were `int()`-ing a score: `n_head_rank_nonzero`,
+# `n_rfirst_top_used`/`n_rfirst_offrank` and the recorded `n_reg` all sat at
+# their "nothing happened" values while the mechanism ran.  It surfaced only as
+# a fixture failure in `test_explore.py` case 32, which is the whole argument
+# for pinning the layout to a name rather than to a position.
+CAND_REGION = 22
+
 
 class FrontierExplorer:
     def __init__(self, v_max: float = 0.55, w_max: float = 0.9,
@@ -1950,7 +1964,7 @@ class FrontierExplorer:
         # with the constraint applied after (the old order) it was 4 on a list of
         # five places.
         if self.rfirst and cands:
-            head_rank = int(cands[0][-1])
+            head_rank = int(cands[0][CAND_REGION])
             if head_rank != 0:
                 self.n_head_rank_nonzero += 1
                 if self.first_head_rank_t is None:
@@ -4011,7 +4025,7 @@ class FrontierExplorer:
             # and with it on, the point key is only ever reached inside one
             # region.  Both are quantised, so two patches a few percent apart
             # still cannot change places on a floating-point hiccup.
-            out.sort(key=lambda c: (c[22], c[0]))
+            out.sort(key=lambda c: (c[CAND_REGION], c[0]))
             self._note_value_spread(out, cell)
             self.last_sweep_cands = out
             return out
@@ -4322,7 +4336,7 @@ class FrontierExplorer:
                     # counted separately, exactly as the local term's
                     # fall-through is (an unplannable head is not a decision the
                     # term made).
-                    cr = int(c[-1])
+                    cr = int(c[CAND_REGION])
                     self.n_rfirst_picks += 1
                     if cr == 0:
                         self.n_rfirst_top_used += 1
@@ -4346,7 +4360,7 @@ class FrontierExplorer:
                             # count can belong to a different decision -- section
                             # 29 lists a pick with more regions than candidates,
                             # which is how exactly that was noticed.
-                            n_reg=len({int(c[-1]) for c in cands}),
+                            n_reg=len({int(c[CAND_REGION]) for c in cands}),
                             n_cand=len(cands),
                             path=getattr(self, "_last_pick_path", "?"),
                             to=[round(tx, 2), round(ty, 2)]))

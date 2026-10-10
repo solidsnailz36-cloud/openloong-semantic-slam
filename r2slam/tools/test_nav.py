@@ -38,7 +38,34 @@ P = 0.07            # sample pitch, deliberately not the 0.1 m grid step
 WALL_Z = 0.6
 
 
-def corridor(block_x=None, x1=8.0):
+def wall_occludes_floor(fx, fy, block_x, gap_y=None, gap_half=None):
+    """Which floor samples survive a wall standing at `block_x`.
+
+    **A wall is opaque: the LiDAR cannot see the floor it stands on.**  The
+    synthetic world has to reproduce that, because the map can only ever confirm
+    an obstacle from a **wall-only** cell.  Two rules interact here:
+
+      * `WorldMap.add` folds a seen cell that carries *no* obstacle return into
+        `ground_ever` when `GROUND_COVER_INFORMATIVE` is on -- that default is
+        what removed the grey band, and it is deliberate; and
+      * `OBSTACLE_GROUND_RATIO = 1.0` lets floor evidence veto the obstacle
+        promotion of the same cell.
+
+    So lay a floor slab *under* the wall and every wall cell also holds a floor
+    sample: no cell is wall-only, the wall is never promoted, and the planner
+    drives straight through it.  This test used to pass only by accident -- the
+    old `ground_ever[cyo, cxo] |= g[ok]` lost the repeated-index race to the
+    wall return whenever the wall came last in the point list.  The fix is not
+    to change the map: it is to stop the synthetic floor from being sampled
+    where no beam could reach it.
+    """
+    keep = np.abs(fx - block_x) > 0.12              # one 0.1 m cell either side
+    if gap_y is not None:
+        keep = keep | (np.abs(fy - gap_y) <= gap_half)   # floor survives the gap
+    return keep
+
+
+def corridor(block_x=None, x1=8.0, gap_y=None, gap_half=None):
     """Floor x in [-2, x1], walls along y = +-1.5, closed at +x1.
 
     The far wall matters for the navigation tests: a navigator that just drives
@@ -46,8 +73,12 @@ def corridor(block_x=None, x1=8.0):
     detour, and a closed corridor is the smallest world where that shows.
     """
     gx, gy = np.meshgrid(np.arange(-2.0, x1, P), np.arange(-1.5, 1.5, P))
-    parts = [np.column_stack([gx.ravel(), gy.ravel(),
-                              np.full(gx.size, -0.8)])]
+    fx, fy = gx.ravel(), gy.ravel()
+    if block_x is not None:
+        keep = wall_occludes_floor(fx, fy, block_x, gap_y, gap_half)
+        fx, fy = fx[keep], fy[keep]
+    n_floor = len(fx)
+    parts = [np.column_stack([fx, fy, np.full(n_floor, -0.8)])]
     ys = np.arange(-1.5, 1.5, P)
     xs = np.arange(-2.0, x1, P)
     for wy in (1.51, -1.51):
@@ -58,11 +89,12 @@ def corridor(block_x=None, x1=8.0):
     parts.append(np.column_stack([np.full(len(ys), -2.01), ys,
                                   np.full(len(ys), WALL_Z)]))       # near cap
     if block_x is not None:
-        parts.append(np.column_stack([np.full(len(ys), block_x), ys,
-                                      np.full(len(ys), WALL_Z)]))
+        blk_y = ys if gap_y is None else ys[np.abs(ys - gap_y) > gap_half]
+        parts.append(np.column_stack([np.full(len(blk_y), block_x), blk_y,
+                                      np.full(len(blk_y), WALL_Z)]))
     allp = np.vstack(parts)
     ground = np.zeros(len(allp), bool)
-    ground[:gx.size] = True
+    ground[:n_floor] = True
     return allp, ground
 
 
@@ -153,12 +185,7 @@ def main():
         else:
             fails.append("a fully blocked corridor must yield no path")
     # with a gap in the wall the plan must exist and must go through the gap
-    allp, ground = corridor()
-    ys = np.arange(-1.5, 1.5, P)
-    blk = np.column_stack([np.full(len(ys), 4.0), ys, np.full(len(ys), WALL_Z)])
-    keep = np.abs(ys - 1.0) > 0.45                    # leave a 0.9 m gap at y=1
-    allp2 = np.vstack([allp, blk[keep]])
-    g2 = np.concatenate([ground, np.zeros(len(blk[keep]), bool)])
+    allp2, g2 = corridor(block_x=4.0, x1=8.0, gap_y=1.0, gap_half=0.45)
     w2 = WorldMap(resolution=0.1, extent=14.0)
     w2.add(allp2, g2, ~g2, None, (0.0, 0.0), 0.0)
     pp = PathPlanner(robot_radius=0.25)

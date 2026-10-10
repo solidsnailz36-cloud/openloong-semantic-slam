@@ -2030,8 +2030,15 @@ def main():
         fails.append("the Gate 5 instrument reported on an arm with the gate off")
     # (b) where does the score alone send the robot, and which region is that?
     cands = list(e32off.last_sweep_cands)
-    tops = [c for c in cands if int(c[-1]) == 0]
-    rest = [c for c in cands if int(c[-1]) > 0]
+    # `c[22]` is the candidate's **region rank** (0 = the region the region
+    # layer chose) -- see the field list in `_pick_sweep_target`.  This used to
+    # read `c[-1]`, which was the region rank until the tuple grew a 24th field
+    # (`c[23]`, the raw value term) on 2026-10-08; from then on `c[-1]` was a
+    # score, `int()` of it was never 0, and this fixture silently stopped
+    # producing a "tops" list.
+    RID = 22
+    tops = [c for c in cands if int(c[RID]) == 0]
+    rest = [c for c in cands if int(c[RID]) > 0]
     if not tops or not rest:
         fails.append("the fixture produced %d candidates but not two competing "
                      "regions: the gate cannot be tested here"
