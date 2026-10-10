@@ -119,6 +119,15 @@ class FrontierExplorer:
                  shadow_viewpoint_tries: int = 12,
                  lookahead_m: float = 1.20, los_lookahead: bool = True,
                  los_grid: str = "floor",
+                 # --- §1.2 / §1.3: both NOT ADOPTED (2026-10-10) -------------
+                 # Each defaults to the pre-§1 behaviour, so an untuned run is
+                 # byte-for-byte the old behaviour.  They were built to break
+                 # the wedge/backoff oscillation, and closed-loop measurement
+                 # found the compound arm drives into walls -- the entry to the
+                 # belief-freeze chain.  Do not enable without reading
+                 # docs/仿真探索恢复_判据与实跑_20261010.md §7.11 and §7.12.
+                 # Kept as switches (not deleted) so the archived `a23` run
+                 # stays reproducible and the n=1 signal can be re-tested.
                  ahead_clear_use_obstacle_now: bool = True,
                  backoff_realign: bool = False,
                  wedge_frames: int = 20, wedge_deny_m: float = 0.90,
@@ -5057,6 +5066,16 @@ class FrontierExplorer:
         planner grid has no cells near a wall or the rim of the unknown, so
         using it here would make the robot refuse to enter unmapped space and
         kill exploration outright.
+
+        NOT ADOPTED (2026-10-10).  The mismatch above is real, but removing the
+        near-field veto moves the failure rather than fixing it: the robot goes
+        closer before the two-vote layer stops it, hence closer than
+        `min_range = 0.3` -- exactly the entry to the belief freeze where
+        backing into a wall clips the near returns, the cloud goes degenerate
+        along the direction of travel, and the pose estimate collapses.
+        Grouping the archive by arm, only the compound (this + `backoff_realign`)
+        ever dips below 0.80 of its in-range points: 2/4 runs against 0/26 for
+        every other configuration (Fisher one-sided p ~ 0.014).
         """
         steps = max(int(self.front_stop / self.clearance_step), 2)
         d = np.arange(1, steps + 1) * self.clearance_step
@@ -5786,6 +5805,13 @@ class FrontierExplorer:
         caller has no aim: the target-less search branch (`_recovery`) is
         turning to *find* something, so there is no error to sign against and
         alternating stays.
+
+        NOT ADOPTED (2026-10-10).  The alternating sign is what the `all_3`
+        trace shows thrashing, but the compound arm is the only configuration
+        that puts the robot into a wall, and the wall is what breaks the pose
+        estimate -- a much larger effect than the oscillation this switch was
+        meant to remove.  Kept default-off; see `_ahead_clear` and
+        docs/仿真探索恢复_判据与实跑_20261010.md §7.12.
         """
         self._backoff = self.backoff_frames
         if self.backoff_realign and err is not None and abs(err) > 1e-9:

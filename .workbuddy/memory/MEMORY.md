@@ -11,7 +11,7 @@
 - 语义地图：`docs/语义地图朝向与灰斑修复_20261009.md` · IMU：`docs/IMU启用_陀螺仪去斜与航向核对_20261010.md`
 - 开放词汇（§32–37 YOLOE）：`docs/开放词汇边缘化_第一轮实测_20261009.md`
 - 历史：`docs/HANDOFF_项目交接.md`（§9 过时，§5.2/§8 必读）· `docs/复盘_踩坑手册_小白向.md`（09-13 初赛版，10 月后未补）
-- ⚠️ 技能 `robot-policy-replay-ab/SKILL.md` 已 187 KB，该按主题拆（未做）
+- ⚠️ 技能 `robot-policy-replay-ab/SKILL.md` 已 ~200 KB，该按主题拆（未做）
 
 ## 归档结论（早期条目，细节查 docs）
 - **航向**＝仿真退化根因 A：官方 LiDAR 不随车体旋转⇒**航向不可观测**，非 `heading.py` bug；同码两跑跳变次数相同、差在**恢复快慢**；`yaw_odom_deg` 恒 ~−0.8°＝无信息。
@@ -22,23 +22,27 @@
 - **算力**：边缘算力是规则要求，**先量预算**。`ms_render` 60.46→1.04（render 搬 worker，仅多核）；现役 detect 66.42 ms、seg 头 23.96⇒**分割头不是算力问题**。FastInst-AA/UniPercepNet-S 按自报 GPU 延迟判死⇒不装 MMCV。
 - **实例层**判据被真值证伪（35.9%）⇒不再改几何阈值。**IMU 三臂无赢家不采纳**。★真收获：`tools/check_imu_heading.py`＝**真实侧第一条独立航向证据**。
 - **评分（100 分）**：人物 30、G 25、M 40、V 5；G2 要"显式区分可通行/障碍/未知"⇒正对我们三分类。**投入≠分数**。
-- **腐蚀核方→圆**：默认 `disc`；⚠️ `cv2.MORPH_ELLIPSE` 不能用（放行 0.158 m 间隙）；`--footprint square` 复现旧产物；真实侧 md5 不变。
+- **腐蚀核方→圆**：默认 `disc`（r=0.25 时与 `square` 重合，见第 20 条）；⚠️ `cv2.MORPH_ELLIPSE` 不能用（放行 0.158 m 间隙）。
 - **M4 标签**：按点判；`h>2.0`→ceiling、否则 wall；新类 43/44 排物体类之后（`person=2` 不重编号）。
 - **教训**：`diagnose_reachability.py` 曾有 10× 单位错⇒三份文档作废。**引用工具输出前先看它算的是什么。**
 
 ## 落定 / 分割（16–18）
-16. **现役落定＋双跑＋出包**：四项默认本来已是默认（disc/GCV=True/按点标签/render worker）。出包前两红测试：`test_nav` 夹具把地板铺到墙底（加 `wall_occludes_floor()`）；`explore.py` 真 bug——区域秩 `c[22]` 后三处读者仍写 `c[-1]`⇒模块级 `CAND_REGION=22`。⚠️ 自检"264 项绿"是错的＝**258**，三修加 3 例后 **261**。双跑：仿真 1436 帧/287.1 s、真实 1427 帧@10.27 Hz，真实侧地图逐项复现。交付包 md5 `408d97bce998f5b571ee975f04c98f78`/37,059,063 B/0 FAIL 0 WARN。
-17. **分割头并跑**：`r2slam/seg.py`＋`viz.blend_masks`＋`--seg-model/--seg-conf/--seg-alpha/--seg-classes/--seg-fuse`＋`summary["segmentation"]`；**检测器不动**，Gate＝真实 `map.pcd` 与交付包逐位同。320 原型 80×80⇒真实鱼眼一格≈20 px 台阶。闭集代价 `clock 74`⇒`--seg-classes` 默认 `person`。真实 frame31 检测器 `person 0.30` 落图而分割头没看见⇒**它是形状提供者，不是更好的人检测器**。做 2 已接通（`--seg-fuse` 默认关⇒pcd 逐位不变）；**未证明更好；交付包未重建**。⚠️ `w=int(round(x1-x0))≠int(round(x1))-int(round(x0))`⇒真实一帧即崩、仿真不复现⇒先裁整数像素再 resize。
-18. **仿真"探索退化"＝不是代码回归**：同码两跑 `traj_xmin` **−6.60 vs −12.00**，`final` 其余指标全在 44 跑中游⇒唯一离群量是 `xmin`。链：目标选择早期分叉⇒东侧打转 150 s⇒t=248.8 才选西边目标⇒**t=249.6 航向单帧跳变 −104.9°**⇒撞墙⇒21.7 s 摇摆（`backoff` 每次翻转转向符号）⇒墙钟到。三根因：A 航向（见上）B **A\* 擦墙路径**（半径 0.19＝间隙 0.25 m⇒裕度零）C **三套可达判据不一致**。反例 `b3l_OFF_r2` 末段 90 s 净位移 0.02 m 却 `xmin −12.66`⇒**"卡住"与"探得少"无因果**。逐帧见 doc §2。
+16. **现役落定＋双跑＋出包**：出包前两红测试：`test_nav` 夹具把地板铺到墙底（加 `wall_occludes_floor()`）；`explore.py` 真 bug——区域秩 `c[22]` 后三处读者仍写 `c[-1]`⇒模块级 `CAND_REGION=22`。⚠️ 自检“264 项绿”是错的＝**258**，三修加 3 例后 **261**。双跑：仿真 1436 帧/287.1 s、真实 1427 帧@10.27 Hz。交付包 md5 `408d97bce998f5b571ee975f04c98f78`/37,059,063 B/0 FAIL 0 WARN。
+17. **分割头并跑**：`r2slam/seg.py`＋`--seg-model/--seg-conf/--seg-alpha/--seg-classes/--seg-fuse`＋`summary["segmentation"]`；**检测器不动**，Gate＝真实 `map.pcd` 与交付包逐位同。320 原型 80×80⇒真实鱼眼一格≈20 px 台阶。闭集代价 `clock 74`⇒`--seg-classes` 默认 `person`。真实 frame31 检测器 `person 0.30` 落图而分割头没看见⇒**它是形状提供者，不是更好的人检测器**。`--seg-fuse` 默认关⇒pcd 逐位不变；**未证明更好**。⚠️ `w=int(round(x1-x0))≠int(round(x1))-int(round(x0))`⇒真实一帧即崩、仿真不复现⇒先裁整数像素再 resize。
+18. **仿真“探索退化”＝不是代码回归**：同码两跑 `traj_xmin` **−6.60 vs −12.00**，`final` 其余指标全在 44 跑中游⇒唯一离群量是 `xmin`。⚠️ **原记的“t=249.6 航向单帧跳变 −104.9°”在数据里不存在**（复算最大单帧变化 17.8°、零帧 >60°；跳 151.8° 的是**目标方位**，东西换点）——已更正，见 doc §7.5。真形态＝t≈262 起在 x≈−6.5 的**极限环**（`drive`→`backoff`→**yaw 符号翻转两次**→`arc`→…），末 25 s 净西向位移≈0。三根因：A 航向（见上）B **A\* 擦墙路径** C **三套可达判据不一致**。反例 `b3l_OFF_r2` 末段 90 s 净位移 0.02 m 却 `xmin −12.66`⇒**“卡住”与“探得少”无因果**。
 
-## 现役（19–22，2026-10-10 接手回合）
-19. **★★★ 三修已落地（`5cd8bbe`＋`82ed503`）**：① `robot_radius` **默认 0.19→0.25**（boss 定的值，不是文档的 0.30）；单一真相源 `eff_robot_radius`（explorer 与 `summary["reach"]` 同源）；`--robot-radius 0.19` 仍可逐位复现旧规划器。② `ahead_clear_use_obstacle_now`（默认 True＝旧行为）③ `backoff_realign`（默认 False）——后两个用 `--explore-set` 开。**真实侧价格（真实最终地图扫半径）**：可达 401.8 m²@0.19 → **392.7@0.25（−2.3%）** → 355.8@0.30（−11.5%）⇒ 0.25 是保守端。**真实侧全跑两次（0.19/0.25）`map.pcd` md5 都是 `76025d9e519c4995e8a5fb5a5275758b`、`summary["map"]` 全字段复现** ⇒ 真实决策未被动（真实全跑不带 `--explore`）。⚠️ **`summary["map"]["reachability"]` 随半径变⇒交付包需重建才与已验收 summary 一致（pcd/TF/视频不变）。**
-20. **★★ r=0.25 时 `disc` 与 `square` 两核完全重合**（角偏移 `res·hypot(1.5,1.5)`=0.212 < 0.25 ⇒ disc 保留四角 ⇒ 就是 5×5）。实测核大小 r=0.19→21/25、0.22 与 0.25→25/25、0.30→45/49。⇒ **`--footprint` 在新默认下是空操作**，只在 r≤0.22 或 r≥0.28 才移动掩码。不是 bug（离散化表达不出），但会误导记得"方核→圆核"那一仗的人。已写进 `nav.py` 与 help。
-21. **★★ 仿真 5 臂闭环（base/a2/a3/a23/r25）n=1 不可分离**：唯一"看着像变好"的是 §1.3 指向的量（`backoffs` 19→6、`wedge` 55→20），但**同码两次归档跑就是 17 vs 5 / 53 vs 18**⇒离散度大于臂间差。只能说：五跑都有效、计数朝预期方向动、无一处显著变坏。**要效果结论必须 n≥3 复制。** 运行器 `_tmp_gate/run_all.sh`＋`compare_arms.py`。
-22. **★ 更正**：交接 §5.3(a) 的 Gate −1 配方两处错——`r2slam/out/*.npz` 是 `--dump-map` 的**地图栅格**（不是帧；拿去回放 `frames: 0` 且**退出码 0** 静默空跑），且 `replay_explore.py` **不认** `R2SLAM_PKG`（只有 `test_nav`/`test_seg` 认）。正解：`dump_frames.py` 造帧转储＋旧包做**物理目录**；回放侧开关入口是 `--set`。
+## 现役（19–23，2026-10-10 接手回合）
+
+**★ 本轮决策（boss）：§1.2/§1.3 不采纳** —— 两项出厂即默认关 ⇒ 不采纳＝**什么都没变**（零成本零风险）；**§1.1 保留 `robot_radius=0.25`** —— 保守裕度不是修复（杠杆仅 1–2%）。见文档 §7.12。
+
+19. **★★★ 三修已落地（`5cd8bbe`＋`82ed503`）**：① `robot_radius` **默认 0.19→0.25**；单一真相源 `eff_robot_radius`（explorer 与 `summary["reach"]` 同源）；`--robot-radius 0.19` 仍可逐位复现旧规划器。② `ahead_clear_use_obstacle_now`（默认 True）③ `backoff_realign`（默认 False）——后两个用 `--explore-set` 开。**真实侧价格**：可达 401.8 m²@0.19 → **392.7@0.25（−2.3%）** → 355.8@0.30（−11.5%）。**真实侧全跑两次 `map.pcd` md5 都是 `76025d9e519c4995e8a5fb5a5275758b`、`summary["map"]` 全字段复现** ⇒ 真实决策未被动。⚠️ **`summary["map"]["reachability"]` 随半径变 ⇒ 交付包需重建才与已验收 summary 一致（pcd/TF/视频不变）。**
+20. **★★ r=0.25 时 `disc` 与 `square` 两核完全重合**（角偏移 0.212 < 0.25）⇒ **`--footprint` 在新默认下是空操作**，只在 r≤0.22 或 r≥0.28 才移动掩码。不是 bug（离散化表达不出），但会误导记得“方核→圆核”那一仗的人。已写进 `nav.py` 与 help。
+21. **★ n≥3 纪律**：同码两跑 `backoffs` 就 17 vs 5 ⇒ **n=1 的比较是抽签**（`backoffs` 19→6 那类“看着变好”不算数）。
+22. **★ 更正**：交接 §5.3(a) 的 Gate −1 配方两处错——`r2slam/out/*.npz` 是 `--dump-map` 的**地图栅格**（回放 `frames: 0` 且**退出码 0** 静默空跑），且 `replay_explore.py` **不认** `R2SLAM_PKG`（只 `test_nav`/`test_seg` 认）。正解：`dump_frames.py`＋旧包做**物理目录**；开关入口是 `--set`。
+23. **★★★ 探索退化的真病＝贴墙时里程计坍缩（5%，不在 §1 覆盖内）**：脚本把 `all_3` 报成“停 24 s”，但**同窗口里程计净位移 0.032 m / 真值 5.308 m**、真值**穿过北墙到房外** ⇒ ★ **`frames.csv` 同时有估计列 `pose_*` 与真值列 `truth_*`，报“卡住”前先并排打出来**。根因：`registered` 是裁过 `[0.3,40]` 的**在距点数**（不是配准成功数，名字骗人），贴墙回波被裁 ⇒ ICP 沿行进方向退化 ⇒ 位姿冻结 ⇒ 从旧位姿/旧地图重选点 ⇒ 正反馈；**选点全程健康，是执行端瞎了**。★ **新尺子 `min(reg/points)` 40 跑零重叠**：0.53/0.59 两跑必冻结，≥0.90 的 33 跑必不冻结 ⇒ **2/40＝5%**；**归档 `xmin` 中位 −11.26 是正常天气**。⇒ **`park_n`/停滞是症状量不是故障量，报它必须带 `max err_xy` 与 `min reg/points`**。★ 反向：**只有 `a2`+`a3` 复合会贴墙**（2/4 vs 0/26，p≈0.014）⇒ 已决定不采纳。**n=3 判定：`r19`/`r25` 都 PASS ⇒ 对照臂自己健康 ⇒ 本轮“未复现”，不是“修好了”。** 全在 `docs/仿真探索恢复_判据与实跑_20261010.md` §7.7–§7.12。
 
 ## 挂起的问题（boss 说"后面再讨论"）
-- **M5 的 ATE 旋钮**：`runtime.voxel_size` 0.50→0.25，ATE p50 0.276→0.140 m（1 s RPE 0.041→0.027，路径比 1.039→1.018）。代价 `ms_odom` 15.3→53.9、p90 26→131（须同时把 render 移出关键路径）。⚠️ ATE 主要是坏段计数⇒跨序列稳的是 RPE 与路径比。**默认仍 0.50。** 三候选：①0.25+render 出路径 ②0.30 ③保持。数字见 `docs/呈现层修复与M3复核_20261010.md` §3。
+- **M5 ATE 旋钮**：`runtime.voxel_size` 0.50→0.25 ⇒ ATE p50 0.276→0.140 m，代价 `ms_odom` 15.3→53.9、p90 26→131（须把 render 移出关键路径）。⚠️ ATE 主要是坏段计数⇒跨序列稳的是 RPE 与路径比。**默认仍 0.50**，三候选①0.25+render 出路径 ②0.30 ③保持。见 `docs/呈现层修复与M3复核_20261010.md` §3。
 
 ## 家底/硬约束
 - 唯一不可再得：`D://E-Downd//data.bag`（初赛 2532 MB，81 分）。
@@ -52,7 +56,7 @@
 - 只读复算：`export MSYS_NO_PATHCONV=1 && docker exec -i r2sim python3 - <<'EOF'`（漏 `-i` 静默无输出）；需 cwd 用 `-w /work/r2slam_ws`。
 - 真实侧本机 `.venv`（py3.13.14/ORT 1.30.0/torch 2.14.1+cpu/ultralytics 8.4.172/onnx 1.23.1）；`wsl.exe`/`wmic.exe` 被拦（用 `tasklist //FO CSV`）。
 - `Xvfb :99` 被 kill 不清 `/tmp/.X99-lock`⇒相机不发、LiDAR 照常⇒**就绪门必须查两个话题**。
-- 短跑机理：ROS master 一断 `sim_ros1.py` 就 return（退出码 0、summary 完整）。**有效性门：`exit==0 && frames.csv 跨度 ≥0.97×目标`**（`--duration` 是墙钟）。
+- 短跑机理：ROS master 一断 `sim_ros1.py` 就 return（退出码 0、summary 完整）。**有效性门：`exit==0 && frames.csv 跨度 ≥0.97×目标`**（`--duration` 墙钟；**A/B 配平用 `--sim-duration`（传感器时间）**）。
 - Python 的 `/tmp/x` 落到**当前盘根**⇒跨工具传文件用项目内路径。
 
 ## 官方仿真器三坑
@@ -87,7 +91,7 @@ A\*（8 连通、半径腐蚀+障碍膨胀、**圆核**）；跟随＝三档油�
 - B3 停投。不值做：`V/(1+d)→V·exp(-λd)`。
 - **登记不落地**：G7 形态学清理器/`fresh_split_m`/点云层判别器（在线 18 维留一 AUC 0.638<0.65⇒别再堆特征）。
 - **K=2 已封板**。
-- 已装开关（默认关，grep 找）：`OBSTACLE_GROUND_RATIO`/`RENDER_*`/`disc_lambda`/`fresh_split_m`/`probe`/`sweep_value_mode`/`island_probe`/`strand_dump`/`--cf-hold-cells`/`--footprint`/`--sync-render`/`--seg-fuse`/`--seg-classes`/`--robot-radius`/`--explore-set ahead_clear_use_obstacle_now=False`/`--explore-set backoff_realign=True`。**出厂只有 numpy+cv2+onnxruntime⇒诊断不许 `import scipy`。**
+- 已装开关（默认关，grep 找）：`OBSTACLE_GROUND_RATIO`/`RENDER_*`/`disc_lambda`/`fresh_split_m`/`probe`/`sweep_value_mode`/`island_probe`/`strand_dump`/`--cf-hold-cells`/`--footprint`/`--sync-render`/`--seg-fuse`/`--seg-classes`/`--robot-radius`/`--explore-set ahead_clear_use_obstacle_now=False`/`--explore-set backoff_realign=True`（**后两个已判不采纳**，见第 23 条）。**出厂只有 numpy+cv2+onnxruntime⇒诊断不许 `import scipy`。**
 
 ## 指标规则
 - 权威口径＝`out/_room_cover2.py`（分母＝单调的 `ground_ever ∩ 框`）。**报百分比必须报分母。**
@@ -96,7 +100,7 @@ A\*（8 连通、半径腐蚀+障碍膨胀、**圆核**）；跟随＝三档油�
 - 算"行为不变"的 md5 **必须剔除 `traversable_m2` 类统计列**。跨源先 `repr()` 打原始值。
 - **★ `ms_*` 只能比背靠背同一会话的一对**；同对里无关阶段也大幅变化⇒整对被污染。
 - **★ 量之前先问"这是不是同一路输入"**。
-- **★ 归档跑 `frames.csv` 有真值列**（`truth_x/y`、`truth_yaw_deg`、`err_xy_m`、`heading_err_deg`）⇒无逐帧点云也能归因。
+- **★ 归档跑 `frames.csv` 有真值列**（`truth_x/y`、`truth_yaw_deg`、`err_xy_m`）⇒无逐帧点云也能归因。
 
 ## 工程硬规则
 - 会话开头补 PATH：`export PATH="/c/Users/ZhuanZ/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:$PATH"`。
