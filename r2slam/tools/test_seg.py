@@ -138,6 +138,32 @@ ok(viz.blend_masks(img, [], L.bgr) is not img
    or np.array_equal(viz.blend_masks(img, [], L.bgr), img),
    "an empty instance list leaves the image identical")
 
+# The off-by-one that crashed the real run: an odd panel width and fractional
+# crop ends.  `w = round(x1 - x0)` is NOT `round(x1) - round(x0)`, so the
+# resized mask came out one column short of the ROI and the boolean index
+# raised `IndexError: ... size of axis is 259 but ... is 258`.  Both cases
+# below are that shape of arithmetic, and both must simply work.
+print("   (the clip-then-size arithmetic, on an odd panel and off-frame crops)")
+odd = np.zeros((211, 259, 3), np.uint8)          # odd width, like the fisheye panel
+frac = {"mask": np.ones((7, 7), bool), "mask_box": (10.4, 20.4, 20.6, 30.6),
+        "box": (10.4, 20.4, 20.6, 30.6), "score": 1.0, "coco": 0,
+        "label": int(L.PERSON)}
+try:
+    o1 = viz.blend_masks(odd, [frac], L.bgr, scale=1.0, alpha=0.5)
+    ok(np.any(o1 != odd), "fractional crop ends on an odd-width panel paint")
+except Exception as exc:                                        # noqa: BLE001
+    ok(False, "fractional crop ends on an odd-width panel paint",
+       "%s: %s" % (type(exc).__name__, exc))
+over = {"mask": np.ones((5, 5), bool), "mask_box": (-30.0, -20.0, 400.0, 240.0),
+        "box": (-30.0, -20.0, 400.0, 240.0), "score": 1.0, "coco": 0,
+        "label": int(L.PERSON)}
+try:
+    o2 = viz.blend_masks(odd, [over], L.bgr, scale=1.0, alpha=0.5)
+    ok(np.all(o2 != odd), "a crop hanging off every edge paints the whole panel")
+except Exception as exc:                                        # noqa: BLE001
+    ok(False, "a crop hanging off every edge paints the whole panel",
+       "%s: %s" % (type(exc).__name__, exc))
+
 
 # --------------------------------------------------------- 4. the real weights
 print("\n4) the exported weights, when present")

@@ -218,26 +218,28 @@ def blend_masks(img: np.ndarray, insts: Sequence, colour_of,
         if crop is None or crop.size == 0:
             continue
         x0, y0, x1, y1 = (float(v) * scale for v in it["mask_box"])
-        w, h = int(round(x1 - x0)), int(round(y1 - y0))
-        if w <= 0 or h <= 0:
-            continue
-        m = cv2.resize(crop.astype(np.uint8) * 255, (w, h),
-                       interpolation=cv2.INTER_NEAREST)
-        cx0, cy0 = max(0, int(round(x0))), max(0, int(round(y0)))
-        cx1, cy1 = min(W, int(round(x1))), min(H, int(round(y1)))
+        # **Clip to integer pixels first, then size the resized crop to that
+        # exact rectangle.**  The obvious `w = round(x1 - x0)` is wrong: it is
+        # not equal to `round(x1) - round(x0)`, because the two ends round
+        # independently.  At `x0 = 10.4, x1 = 20.6` the width comes out 10 while
+        # the clipped span is 11, and the boolean mask then does not match the
+        # ROI it is indexed into -- `IndexError: ... size of axis is 259 but
+        # size of corresponding boolean axis is 258`, which is how this was
+        # found (on the real fisheye, whose panel width is odd).
+        cx0, cy0 = max(0, int(np.floor(x0))), max(0, int(np.floor(y0)))
+        cx1, cy1 = min(W, int(np.ceil(x1))), min(H, int(np.ceil(y1)))
         if cx1 <= cx0 or cy1 <= cy0:
             continue
-        # the part of the resized crop that survives the frame clip
-        sx0, sy0 = cx0 - int(round(x0)), cy0 - int(round(y0))
-        sub = m[sy0:sy0 + (cy1 - cy0), sx0:sx0 + (cx1 - cx0)]
+        m = cv2.resize(crop.astype(np.uint8) * 255, (cx1 - cx0, cy1 - cy0),
+                       interpolation=cv2.INTER_NEAREST)
         col = np.asarray(colour_of(it["label"]), np.float32)
         roi = out[cy0:cy1, cx0:cx1]
-        sel = sub > 127
+        sel = m > 127
         if sel.any():
             roi[sel] = (roi[sel].astype(np.float32) * (1.0 - alpha)
                         + col * alpha).astype(np.uint8)
         if outline:
-            cs, _ = cv2.findContours(sub, cv2.RETR_EXTERNAL,
+            cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL,
                                      cv2.CHAIN_APPROX_SIMPLE)
             if cs:
                 cv2.drawContours(roi, cs, -1,
