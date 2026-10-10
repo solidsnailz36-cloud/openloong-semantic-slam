@@ -50,7 +50,7 @@
 - 边缘算力是规则要求；类别表组委会不给；**真实侧无真值⇒任何 mIoU/识别率都是编的（要敢说"不知道"）**。
 
 ## 环境
-- 仿真＝容器 `r2sim`；`/work`=`D:/E-Downd/sim_official`；代码 `/work/r2slam_ws`。改完必须 `sync_to_container.sh`（手工白名单，已含 `frames.py`/`sources/*`/`viz.py`/`seg.py`/`replay_explore.py`/`yolo26n-seg_320.onnx`）。**漏文件的后果是静默的。**
+- 仿真＝容器 `r2sim`；`/work`=`D:/E-Downd/sim_official`；代码 `/work/r2slam_ws`。改完必须 `sync_to_container.sh`（手工白名单，已含 `frames.py`/`sources/*`/`viz.py`/`seg.py`/`replay_explore.py`/`yolo26n-seg_320.onnx`）。**漏文件的后果是静默的。** ⚠️ **跑 `sync_to_container.sh` 不要加 `MSYS_NO_PATHCONV=1`**（会 `CreateFile E:\e:` 失败）——与只读复算的用法正好相反。
 - 容器：py3.8.10 / **ORT 1.16.3（只到 opset 19）** / cv2 5.0.0 / 无 `onnx` ⇒ **导出一律 `--opset 19`**。
 - **杀仿真**：`docker exec r2sim bash /work/killbot.sh`。⚠️ 宿主跑 `kill_sim.sh`＝没跑。
 - 只读复算：`export MSYS_NO_PATHCONV=1 && docker exec -i r2sim python3 - <<'EOF'`（漏 `-i` 静默无输出）；需 cwd 用 `-w /work/r2slam_ws`。
