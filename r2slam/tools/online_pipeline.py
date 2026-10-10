@@ -143,6 +143,21 @@ def parse_args():
                          "vendor/detector that exists next to this package")
     ap.add_argument("--names", default="",
                     help="path to coco.names; resolved like --model")
+    ap.add_argument("--seg-model", default="",
+                    help="optional ONNX **instance-segmentation** export to run "
+                         "ALONGSIDE the detector (`r2slam/seg.py`).  Not instead "
+                         "of it: the detector is the open-vocabulary one (51 "
+                         "baked prompts, 39 classes) while every plain seg "
+                         "export is closed COCO-80, so a swap would trade M4's "
+                         "coverage for the masks.  Its instances are drawn on "
+                         "the camera panel and counted in the HUD/`summary`; "
+                         "empty (the default) changes nothing.")
+    ap.add_argument("--seg-conf", type=float, default=0.30,
+                    help="prefilter for the seg head; the per-class floors in "
+                         "`labels.py` still apply on top of it, the same way "
+                         "they do for the detector")
+    ap.add_argument("--seg-alpha", type=float, default=0.45,
+                    help="mask tint opacity on the camera panel")
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=0, help="0 = until --duration")
     ap.add_argument("--duration", type=float, default=60.0, help="wall seconds to run")
@@ -475,7 +490,22 @@ HUD_ORIGIN = (8, 8)
 HUD_SCALE = 0.5
 
 
-def annotate(img, boxes, names, target_h, note=None, top_margin=0):
+def _seg_frame_counts(insts):
+    """`{class name: n}` for one frame's segmentation instances.
+
+    By name rather than by id so the HUD and the run report say the same words
+    the label table does -- the class ids are an implementation detail and the
+    judge reads names.
+    """
+    out = {}
+    for it in insts:
+        k = L.name(it["label"])
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def annotate(img, boxes, names, target_h, note=None, top_margin=0, masks=None,
+             mask_alpha=0.45):
     """Resize the camera view to `target_h` and draw the detections.
 
     Not `detect.draw`: that one takes an *integer* `scale` because it was
@@ -488,6 +518,12 @@ def annotate(img, boxes, names, target_h, note=None, top_margin=0):
     carry **our** label ids: that is what makes a chair the same colour in the
     camera panel, in the map panel and in the pcd.  `names` is kept only so the
     signature stays stable for callers that still pass a COCO name list.
+
+    `masks` is the **segmentation** head's instance list (`r2slam/seg.py`), drawn
+    first, under the boxes: the mask is the shape claim and the box is the
+    extent claim, and a box drawn over its own mask hides exactly the boundary
+    the picture is supposed to be evidence about.  Empty/None is the shipping
+    state and costs nothing.
 
     `note` is printed in a dimmed strip along the **bottom** of the panel.  It
     carries the **detected -> fused** counts, which is the one number that
@@ -514,6 +550,11 @@ def annotate(img, boxes, names, target_h, note=None, top_margin=0):
     out = camera_panel(img, target_h)
     sc = out.shape[1] / float(img.shape[1])
     H, W = out.shape[:2]
+    if masks:
+        # Before the boxes: same colours as everything else in the frame, from
+        # `labels.bgr`, so a person is the same colour in the mask, the box, the
+        # map panel and the pcd.
+        out = viz.blend_masks(out, masks, L.bgr, scale=sc, alpha=mask_alpha)
     th = max(1, min(int(round(1.4 * sc)), 2))
     fs = min(max(0.45, 0.42 * sc), 0.70)
 
@@ -554,13 +595,18 @@ def annotate(img, boxes, names, target_h, note=None, top_margin=0):
 
 
 def compose_sheet(image, cloud, boxes, names, view, lines, panel_h, note,
-                  zoom=1.0, panel_w=None):
+                  zoom=1.0, panel_w=None, masks=None, mask_alpha=0.45):
     """One frame of the delivered video: `camera | map`, with the HUD block.
 
     `view` is whatever `WorldMap.render` should be called on -- the live map, or
     a frozen `WorldMap.render_view()`.  Returns `(sheet, panel_w)`; `panel_w` is
     carried across frames because the first panel fixes the sheet's width and
     every later one is matched to it.
+
+    `masks` rides through to `annotate` (see there for why it is drawn under the
+    boxes).  It has to be part of this signature rather than read off the frame:
+    the render worker draws on a thread that owns a *frozen* snapshot, so
+    anything the picture shows must be carried in the payload.
 
     Split out of the control loop so the same code can run on the render
     worker (see `_RenderWorker`) and so a test can assert on the real thing
@@ -575,7 +621,7 @@ def compose_sheet(image, cloud, boxes, names, view, lines, panel_h, note,
     hud_h = HUD_ORIGIN[1] + viz.banner_size(lines, scale=HUD_SCALE)[1]
     if image is not None:
         left = annotate(image, boxes, names, panel_h, note=note,
-                        top_margin=hud_h)
+                        top_margin=hud_h, masks=masks, mask_alpha=mask_alpha)
     else:
         left = viz.topdown(cloud, size=panel_h)
     if panel_w is None:
@@ -649,7 +695,8 @@ class _RenderWorker:
             try:
                 sheet, self.panel_w = compose_sheet(
                     p["image"], p["cloud"], p["boxes"], p["names"], p["view"],
-                    p["lines"], self.panel_h, p["note"], self.zoom, self.panel_w)
+                    p["lines"], self.panel_h, p["note"], self.zoom, self.panel_w,
+                    masks=p.get("masks"), mask_alpha=p.get("mask_alpha", 0.45))
                 viz.imwrite(os.path.join(self.frames_dir,
                                          "%06d.png" % p["n"]), sheet)
                 self.n_written += 1
@@ -719,6 +766,24 @@ def main():
     det_model = _resolve_vendor(a.model, DEFAULT_MODEL_FILE)
     det_names = _resolve_vendor(a.names, "coco.names")
     names = load_names(det_names) if os.path.exists(det_names) else None
+    # ---- the optional segmentation head, run ALONGSIDE the detector ---------
+    # Built here, next to the detector, so the log prints both paths in one
+    # place -- the failure this guards against is `--seg-model` silently
+    # resolving to a different file than the operator thinks (the same
+    # dev-machine-vs-container trap `det_model` is printed for).
+    seg = None
+    seg_model = None
+    if a.seg_model and not a.no_detect:
+        from r2slam.seg import OnnxSegDetector
+        # A path is used as given; a bare filename is looked up in the same
+        # `vendor/detector` locations the detector uses, so the same argument
+        # works on the dev machine and in the container.
+        seg_model = (a.seg_model if os.path.exists(a.seg_model)
+                     else _resolve_vendor("", a.seg_model))
+        seg = OnnxSegDetector(seg_model, conf=a.seg_conf,
+                              num_threads=rt.detector_threads)
+        print("seg head    : %s  size %d  nc %d  prototypes %dx%d  conf %.2f"
+              % (seg_model, seg.size, seg.nc, seg.mh, seg.mw, a.seg_conf))
     det = None
     if not a.no_detect:
         det = OnnxYoloDetector(det_model, conf=rt.person_conf,
@@ -938,6 +1003,15 @@ def main():
     n_boxes_fused = 0
     n_boxes_detected = 0
     n_objects_localised = 0
+    # Segmentation-head counters, reported separately from the detector's on
+    # purpose: "the seg head saw fewer objects" and "the seg head was fed fewer
+    # frames" are different findings, and one blended count cannot tell them
+    # apart.  `seg_class_counts` is by project label, so the run report can say
+    # which classes the masks actually appeared on.
+    n_seg_total = 0
+    n_seg_unmapped_total = 0
+    n_seg_frames = 0
+    seg_class_counts = {}
     # Instance layer counters.  `cluster_totals` accumulates the per-frame
     # rejection reasons from `r2slam/instances.py` so the run report shows how
     # many candidate clusters were dropped and for which reason -- a filter whose
@@ -1063,6 +1137,22 @@ def main():
                 n_unmapped_total += det.n_unmapped
                 if a.person_only:
                     boxes = [b for b in boxes if b[5] == L.PERSON]
+            # The seg head sees the **same** frame and answers the same
+            # question with shapes instead of boxes.  It is deliberately not
+            # folded into `boxes`: those carry the open-vocabulary labels and
+            # feed the 3D fusion, while these are COCO-80 and are drawn for the
+            # picture.  Kept separate so "the mask changed the map" and "the
+            # mask changed the picture" stay distinguishable.
+            seg_inst = []
+            if seg is not None and fr.image is not None:
+                seg_inst = seg.detect(fr.image)
+                n_seg_total += len(seg_inst)
+                if seg_inst:
+                    n_seg_frames += 1
+                n_seg_unmapped_total += seg.n_unmapped
+                for it in seg_inst:
+                    seg_class_counts[L.name(it["label"])] = (
+                        seg_class_counts.get(L.name(it["label"]), 0) + 1)
             t_detect = time.perf_counter()
 
             # ---------------- fuse (box -> 3D, in the LiDAR frame) ----------------
@@ -1310,6 +1400,18 @@ def main():
                                     cmd["v"], cmd["w"],
                                     "" if cmd.get("target") is None
                                     else "  target %.1f m" % cmd["dist"]))
+                if seg is not None:
+                    # Named classes only: the count of unnameable ones is in the
+                    # summary, not on the picture.  A HUD line that reads
+                    # "person 2 + 1 unknown" invites the question "unknown
+                    # what?", and the frame has no room to answer it.
+                    named = {k: v for k, v in
+                             _seg_frame_counts(seg_inst).items()}
+                    lines.append("seg masks %d/%d visible%s"
+                                 % (len(seg_inst), len(boxes),
+                                    "" if not named else "  " + " ".join(
+                                        "%s %d" % (k, v)
+                                        for k, v in sorted(named.items()))))
                 # `view` is the live map when rendering synchronously and a
                 # frozen `render_view()` otherwise -- either way it is *this*
                 # frame's map state, which is what keeps the deferred video
@@ -1325,12 +1427,18 @@ def main():
                     "lines": lines,
                     "note": "detected %d -> localised %d"
                             % (len(boxes), len(objects)),
+                    # Only present when `--seg-model` was given; the worker
+                    # reads it with `.get()` so the default path carries no key
+                    # at all and the picture cannot change.
+                    "masks": seg_inst,
+                    "mask_alpha": a.seg_alpha,
                 }
                 if render_worker is None:
                     sheet, panel_w = compose_sheet(
                         payload["image"], payload["cloud"], payload["boxes"],
                         names, payload["view"], lines, a.panel_h,
-                        payload["note"], a.zoom, panel_w)
+                        payload["note"], a.zoom, panel_w,
+                        masks=payload["masks"], mask_alpha=payload["mask_alpha"])
                     viz.imwrite(os.path.join(frames_dir, "%06d.png" % n_rec),
                                 sheet)
                 else:
@@ -1616,6 +1724,26 @@ def main():
                       "prefilter": det.prefilter,
                       "unmapped_boxes": int(n_unmapped_total)}
                      if det is not None else None),
+        # The segmentation head, when one was run.  `None` is the shipping
+        # state, so a package built without `--seg-model` says so in its own
+        # report rather than looking like a run whose masks happened to be
+        # empty.  `instances` is a total over the run and `by_class` is by
+        # project label, i.e. the same names the HUD and the label table use.
+        "segmentation": ({"model": seg_model, "input_px": int(seg.size),
+                          "nc": int(seg.nc), "conf": float(a.seg_conf),
+                          "alpha": float(a.seg_alpha),
+                          "instances": int(n_seg_total),
+                          "frames_with_any": int(n_seg_frames),
+                          "by_class": dict(sorted(seg_class_counts.items())),
+                          "unmapped_boxes": int(n_seg_unmapped_total),
+                          "draws_on": "camera panel only",
+                          "note": "drawn alongside the detector, not instead of "
+                                  "it: the detector is the open-vocabulary head "
+                                  "(51 baked prompts / 39 classes) and every "
+                                  "plain seg export is closed COCO-80, so the "
+                                  "masks are shown on the picture and are NOT "
+                                  "fed into the 3D fusion or the map."}
+                         if seg is not None else None),
         "machine": {"before": t0_snap, "after": t1_snap,
                     "throttling_during_run": throttled},
         "thread_caps": apply_thread_limits(rt, verbose=False),

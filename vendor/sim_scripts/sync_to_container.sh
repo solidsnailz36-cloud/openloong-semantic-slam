@@ -69,6 +69,11 @@ PKG_PATHS=(
   # a container run would have died with `AttributeError` on the first rendered
   # frame while the copy step printed nothing wrong.
   "r2slam/viz.py"
+  # The optional segmentation head.  A new module: not listing it does not
+  # degrade, it `ImportError`s inside `online_pipeline`'s `from r2slam.seg
+  # import ...` -- but only when `--seg-model` is passed, i.e. exactly the run
+  # that would then look like "the flag does nothing".
+  "r2slam/seg.py"
   "tools/online_pipeline.py"
   "tools/eval_semantic_truth.py"
   "tools/package_submission.py"
@@ -87,6 +92,11 @@ ROOT_PATHS=(
   # the graph's indices are our prompt order and not COCO's.
   "vendor/detector/yoloworld_alias_320.onnx"
   "vendor/detector/yoloworld_alias_320.classmap.json"
+  # The segmentation export used by `--seg-model yolo26n-seg_320.onnx`.  A
+  # COCO-80 closed-vocabulary model, run alongside the detector (`r2slam/seg.py`).
+  # Absent locally = `skip`, and then `--seg-model` resolves to nothing and the
+  # run dies at construction with the path in the message -- not silently.
+  "vendor/detector/yolo26n-seg_320.onnx"
   "vendor/sim_scripts/sim_truth_model_states.json"
 )
 

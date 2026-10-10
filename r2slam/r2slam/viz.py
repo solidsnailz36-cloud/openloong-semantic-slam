@@ -191,6 +191,60 @@ def place_labels(xs: Sequence[int], ys: Sequence[int],
     return out
 
 
+def blend_masks(img: np.ndarray, insts: Sequence, colour_of,
+                scale: float = 1.0, alpha: float = 0.45,
+                outline: bool = True) -> np.ndarray:
+    """Tint each instance's segmentation mask onto `img`.  Returns a new image.
+
+    `insts` are the dicts `r2slam/seg.py` returns, i.e. each carries a **cropped**
+    mask at prototype resolution plus the crop's rectangle in ORIGINAL image
+    pixels; `scale` maps those pixels onto whatever `img` is (the camera panel
+    is the fisheye scaled down, so it is not 1.0 on the real side).
+
+    A translucent fill plus a solid 1 px contour, rather than a hard fill
+    alone.  The fill is what makes the shape readable at a glance; the contour
+    is what keeps two adjacent instances of the same class from merging into
+    one blob, which is exactly the case where a judge would otherwise see
+    "one person" where there are two.
+
+    Nearest-neighbour on purpose: the prototype grid is 1/4 of the input side,
+    so a smooth interpolation would invent mask boundary that the model never
+    produced -- and this picture is evidence about the model.
+    """
+    out = img.copy()
+    H, W = out.shape[:2]
+    for it in insts:
+        crop = it.get("mask")
+        if crop is None or crop.size == 0:
+            continue
+        x0, y0, x1, y1 = (float(v) * scale for v in it["mask_box"])
+        w, h = int(round(x1 - x0)), int(round(y1 - y0))
+        if w <= 0 or h <= 0:
+            continue
+        m = cv2.resize(crop.astype(np.uint8) * 255, (w, h),
+                       interpolation=cv2.INTER_NEAREST)
+        cx0, cy0 = max(0, int(round(x0))), max(0, int(round(y0)))
+        cx1, cy1 = min(W, int(round(x1))), min(H, int(round(y1)))
+        if cx1 <= cx0 or cy1 <= cy0:
+            continue
+        # the part of the resized crop that survives the frame clip
+        sx0, sy0 = cx0 - int(round(x0)), cy0 - int(round(y0))
+        sub = m[sy0:sy0 + (cy1 - cy0), sx0:sx0 + (cx1 - cx0)]
+        col = np.asarray(colour_of(it["label"]), np.float32)
+        roi = out[cy0:cy1, cx0:cx1]
+        sel = sub > 127
+        if sel.any():
+            roi[sel] = (roi[sel].astype(np.float32) * (1.0 - alpha)
+                        + col * alpha).astype(np.uint8)
+        if outline:
+            cs, _ = cv2.findContours(sub, cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_SIMPLE)
+            if cs:
+                cv2.drawContours(roi, cs, -1,
+                                 tuple(int(c) for c in col), 1, cv2.LINE_AA)
+    return out
+
+
 def _depth_colors(depth: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     t = np.clip((depth - vmin) / max(vmax - vmin, 1e-6), 0, 1)
     idx = (t * 255).astype(np.uint8).reshape(-1, 1)
