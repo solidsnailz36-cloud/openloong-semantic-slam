@@ -53,22 +53,141 @@ def upscale(img: np.ndarray, factor: int) -> np.ndarray:
     return cv2.resize(img, (w * factor, h * factor), interpolation=cv2.INTER_LINEAR)
 
 
+def text_gap(height: int) -> int:
+    """Vertical breathing room between caption lines.
+
+    Tied to the glyph height rather than being a constant: `HERSHEY_SIMPLEX`
+    at scale 0.5 is 14 px tall and at 0.36 is 10, so a fixed 4 px gap is a
+    third of the line at one size and nearly half at the other.
+    """
+    return max(4, int(round(0.42 * height)))
+
+
+def banner_size(lines: Sequence[str], scale: float = 0.42, pad: int = 6,
+                gap: Optional[int] = None) -> Tuple[int, int]:
+    """Pixel size of the block `banner` would draw for `lines`.
+
+    Exists so a caller that has to *keep clear* of the block -- the camera
+    panel pushing its detection labels down out of the HUD's way -- asks for
+    the height instead of recomputing it.  Two formulas for one rectangle is
+    how the last line of a caption ends up on the bare image.
+    """
+    if not lines:
+        return 0, 0
+    sizes = [cv2.getTextSize(t, FONT, scale, 1)[0] for t in lines]
+    h = max(s[1] for s in sizes)
+    if gap is None:
+        gap = text_gap(h)
+    w = max(s[0] for s in sizes) + 2 * pad
+    return int(w), int(sum(s[1] for s in sizes) + gap * (len(lines) - 1) + 2 * pad)
+
+
 def banner(img: np.ndarray, lines: Sequence[str], origin=(8, 8),
            scale: float = 0.42, fg=(255, 255, 255), bg=(0, 0, 0),
-           alpha: float = 0.55) -> np.ndarray:
-    """Draw a translucent caption block.  Returns a new image."""
+           alpha: float = 0.55, pad: int = 6, gap: Optional[int] = None,
+           border: Optional[Tuple[int, int, int]] = None) -> np.ndarray:
+    """Draw a translucent caption block.  Returns a new image.
+
+    Sized by `banner_size`, i.e. the block and the answer to "how tall will
+    the block be" come from one formula.
+    """
     out = img.copy()
+    if not lines:
+        return out
     x0, y0 = origin
     sizes = [cv2.getTextSize(t, FONT, scale, 1)[0] for t in lines]
-    w = max((s[0] for s in sizes), default=0) + 12
-    h = sum(s[1] for s in sizes) + 8 * len(lines) + 6
+    w, h = banner_size(lines, scale, pad, gap)
+    if gap is None:
+        gap = text_gap(max(s[1] for s in sizes))
     roi = out[y0:y0 + h, x0:x0 + w]
     if roi.size:
         cv2.addWeighted(np.zeros_like(roi), alpha, roi, 1 - alpha, 0, roi)
-    y = y0 + 6
+    if border is not None:
+        cv2.rectangle(out, (x0, y0), (x0 + w - 1, y0 + h - 1), border, 1)
+    y = y0 + pad                       # top of the current line
     for t, s in zip(lines, sizes):
-        y += s[1] + 4
-        cv2.putText(out, t, (x0 + 6, y), FONT, scale, fg, 1, cv2.LINE_AA)
+        cv2.putText(out, t, (x0 + pad, y + s[1]), FONT, scale, fg, 1, cv2.LINE_AA)
+        y += s[1] + gap
+    return out
+
+
+def ink_on(colour: Sequence[float]) -> Tuple[int, int, int]:
+    """Black or white, whichever is readable on `colour`.
+
+    Half the label colours are dark (chair, clock) and half are bright
+    (person, traversable), so one fixed text colour makes some labels
+    unreadable -- the same failure as overlapping labels, just quieter.
+    """
+    b, g, r = (float(c) for c in colour[:3])
+    return (0, 0, 0) if 0.114 * b + 0.587 * g + 0.299 * r > 140 \
+        else (255, 255, 255)
+
+
+def label_chip(img: np.ndarray, text: str, x: int, baseline: int,
+               scale: float = 0.42, colour=(0, 255, 0), thickness: int = 1,
+               pad: int = 3) -> Tuple[int, int, int, int]:
+    """Draw `text` on a filled chip of `colour`; returns the chip rectangle.
+
+    The rectangle is `x .. x + w + 2*pad` wide and `baseline - (h + 2*pad)
+    .. baseline` tall -- **exactly** what `place_labels` assumes when it is
+    handed `(w + 2*pad, h + 2*pad)`, so the collision test and the thing that
+    gets drawn are the same rectangle.
+
+    A filled chip rather than bare coloured text because the frames are real:
+    a label that lands on a white wall or on a person in a light shirt is
+    invisible, and `place_labels` may legitimately move a label onto either.
+    """
+    (w, h), _ = cv2.getTextSize(text, FONT, scale, thickness)
+    x0 = int(max(0, x))
+    y0 = int(max(0, baseline - h - 2 * pad))
+    x1 = int(min(img.shape[1], x0 + w + 2 * pad))
+    y1 = int(min(img.shape[0], baseline))
+    cv2.rectangle(img, (x0, y0), (x1, y1), tuple(int(c) for c in colour[:3]),
+                  -1)
+    cv2.putText(img, text, (x0 + pad, y1 - pad), FONT, scale, ink_on(colour),
+                thickness, cv2.LINE_AA)
+    return x0, y0, x1, y1
+
+
+def place_labels(xs: Sequence[int], ys: Sequence[int],
+                 sizes: Sequence[Tuple[int, int]],
+                 bounds: Optional[Tuple[int, int, int, int]] = None,
+                 gap: int = 3, max_steps: int = 8) -> List[int]:
+    """Baselines for a batch of labels that must not cover each other.
+
+    `xs` / `ys` are where each label *wants* to go (`putText` convention: the
+    text sits above its baseline), `sizes` the `(w, h)` from `getTextSize`.
+    Greedy and first-come-first-served: a label that would land on one already
+    placed steps aside by its own height plus `gap`.
+
+    The steps alternate `+1, -1, +2, -2, ...` rather than marching downward.
+    Marching down is what a first version did, and on the real fisheye it
+    pushed the lower of two labels into the body of the person it was
+    labelling -- readable only by luck of what was behind it.  Keeping the
+    label as close to its natural place as possible, in either direction, is
+    what the alternation buys.  `bounds` is `(left, top, right, bottom)` and
+    clamps the search.
+    """
+    placed: List[Tuple[int, int, int, int]] = []
+    out: List[int] = []
+    offsets = [0]
+    for k in range(1, max_steps + 1):
+        offsets += [k, -k]
+    for x, y, (w, h) in zip(xs, ys, sizes):
+        pick = None
+        for k in offsets:
+            top = y - h + k * (h + gap)
+            bot = y + k * (h + gap)
+            if bounds is not None and (bot > bounds[3] - 2 or top < bounds[1]):
+                continue
+            if all(bot <= pt or top >= pb or x + w <= px or x >= px + pw
+                   for (px, pt, pw, pb) in placed):
+                pick = (top, bot)
+                break
+        if pick is None:
+            pick = (y - h, y)          # nowhere free: keep the honest position
+        placed.append((x, pick[0], w, pick[1]))
+        out.append(pick[1])
     return out
 
 

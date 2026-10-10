@@ -120,6 +120,10 @@ def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True)
+    ap.add_argument("--voxel", type=float, default=None, metavar="M",
+                    help="override runtime.voxel_size (the KISS-ICP map voxel). "
+                         "Left at None so the default run is bit-for-bit the "
+                         "config's; a run that passes it says so in the log")
     ap.add_argument("--npz", default=None,
                     help="replay frames dumped by dump_frames.py instead of a live source")
     ap.add_argument("--model", default="",
@@ -444,7 +448,14 @@ def camera_panel(img, target_h):
                       interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
 
 
-def annotate(img, boxes, names, target_h, note=None):
+# The HUD block's anchor and text scale.  Named constants because two places
+# need them and they must agree: the call that draws the block, and the
+# `top_margin` that keeps the camera panel's detection labels out from under it.
+HUD_ORIGIN = (8, 8)
+HUD_SCALE = 0.5
+
+
+def annotate(img, boxes, names, target_h, note=None, top_margin=0):
     """Resize the camera view to `target_h` and draw the detections.
 
     Not `detect.draw`: that one takes an *integer* `scale` because it was
@@ -458,29 +469,67 @@ def annotate(img, boxes, names, target_h, note=None):
     camera panel, in the map panel and in the pcd.  `names` is kept only so the
     signature stays stable for callers that still pass a COCO name list.
 
-    `note` is printed over the panel.  It carries the **detected -> fused**
-    counts, which is the one number that explains a box with no marker on the
-    map: a detection whose box contains too few LiDAR returns, or whose returns
-    are too short to be the class they claim, does not become an object, and
-    without saying so the map looks like it ignored a detection it never had.
+    `note` is printed in a dimmed strip along the **bottom** of the panel.  It
+    carries the **detected -> fused** counts, which is the one number that
+    explains a box with no marker on the map: a detection whose box contains
+    too few LiDAR returns, or whose returns are too short to be the class they
+    claim, does not become an object, and without saying so the map looks like
+    it ignored a detection it never had.  It used to be drawn at `(8, 22)`,
+    which is inside the translucent HUD block the caller lays over this
+    panel's top-left corner -- the two texts sat on each other and the note
+    was dimmed on top of it.  Bottom-left is empty floor in both sources.
+
+    `top_margin` is how much of the panel's top the caller is going to cover
+    (the HUD block's height).  Detection labels are pushed at least that far
+    down, so a person near the top of the frame keeps a readable label.
+
+    Both text sizes are **capped**.  Scaling purely with the panel is right up
+    to a point and wrong past it: the simulator's camera is 320x180 and is
+    upscaled x3, which makes `0.42 * sc` = 1.26, i.e. two labels 35 px tall
+    covering the top third of the picture.  A label is a label, not a banner.
+    The cap does not touch the real fisheye, where `sc` is 0.42 and the
+    uncapped value was already 0.45.
     """
     import cv2
     out = camera_panel(img, target_h)
     sc = out.shape[1] / float(img.shape[1])
-    th = max(1, int(round(1.4 * sc)))
-    fs = max(0.45, 0.42 * sc)
+    H, W = out.shape[:2]
+    th = max(1, min(int(round(1.4 * sc)), 2))
+    fs = min(max(0.45, 0.42 * sc), 0.70)
+
+    # Boxes first, labels second, as a batch: what makes the labels unreadable
+    # is each other, so they cannot be placed one at a time.
+    want_x, want_y, texts, cols = [], [], [], []
     for b in boxes:
-        x1, y1, x2, y2 = (int(round(v * sc)) for v in b[:4])
+        x1, y1 = int(round(b[0] * sc)), int(round(b[1] * sc))
+        x2, y2 = int(round(b[2] * sc)), int(round(b[3] * sc))
         lid = b[5] if len(b) > 5 else 0
-        label = L.name(lid)
-        col = L.bgr(lid)
-        cv2.rectangle(out, (x1, y1), (x2, y2), col, th, cv2.LINE_AA)
-        cv2.putText(out, "%s %.2f" % (label, b[4]), (x1, max(12, y1 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs, col, th, cv2.LINE_AA)
+        cv2.rectangle(out, (x1, y1), (x2, y2), L.bgr(lid), th, cv2.LINE_AA)
+        texts.append("%s %.2f" % (L.name(lid), b[4]))
+        cols.append(L.bgr(lid))
+        want_x.append(x1)
+        want_y.append(y1)
+    if texts:
+        # Sized including the chip's padding, because that is the rectangle
+        # that gets drawn -- testing the bare text would under-report the
+        # collision and let two chips overlap by `pad` on each side.
+        sizes = [tuple(int(v) + 6 for v in cv2.getTextSize(
+            t, cv2.FONT_HERSHEY_SIMPLEX, fs, th)[0]) for t in texts]
+        xs = [min(x, max(0, W - s[0] - 2)) for x, s in zip(want_x, sizes)]
+        ys = [max(top_margin + s[1] + 2, y - 5) for y, s in zip(want_y, sizes)]
+        ys = viz.place_labels(xs, ys, sizes, bounds=(0, top_margin, W, H))
+        for t, c, x, y in zip(texts, cols, xs, ys):
+            viz.label_chip(out, t, x, y, scale=fs, colour=c, thickness=th)
     if note:
-        cv2.putText(out, note, (8, 22), cv2.FONT_HERSHEY_SIMPLEX,
-                    max(0.5, 0.55 * sc), (255, 255, 255), max(1, th),
-                    cv2.LINE_AA)
+        fsn = min(max(0.5, 0.55 * sc), 0.80)
+        (tw, thn), _ = cv2.getTextSize(note, cv2.FONT_HERSHEY_SIMPLEX, fsn, th)
+        pad = 5
+        y0 = max(0, H - thn - 2 * pad)
+        strip = out[y0:H, 0:min(W, tw + 2 * pad)]
+        if strip.size:
+            cv2.addWeighted(np.zeros_like(strip), 0.55, strip, 0.45, 0, strip)
+        cv2.putText(out, note, (pad, H - pad), cv2.FONT_HERSHEY_SIMPLEX, fsn,
+                    (255, 255, 255), th, cv2.LINE_AA)
     return out
 
 
@@ -488,6 +537,14 @@ def main():
     a = parse_args()
     cfg = load_config(a.config)
     rt = cfg.runtime
+    if a.voxel is not None:
+        # Applied to `rt` rather than passed down, so every consumer (the
+        # odometry builder, the log line, the summary's `runtime` block) sees
+        # the same number.  A value that decides the trajectory has to be
+        # readable after the fact from the run's own record.
+        print("voxel       : %.3f (--voxel, config says %.3f)"
+              % (a.voxel, rt.voxel_size))
+        rt.voxel_size = float(a.voxel)
     os.makedirs(a.out, exist_ok=True)
     frames_dir = os.path.join(a.out, "frames")
     os.makedirs(frames_dir, exist_ok=True)
@@ -1060,27 +1117,6 @@ def main():
             # ---------------- render ----------------
             if (not a.no_render) and (n - 1) % max(a.every, 1) == 0:
                 import cv2
-                if fr.image is not None:
-                    left = annotate(fr.image, boxes, names, a.panel_h,
-                                    note="detected %d -> localised %d"
-                                         % (len(boxes), len(objects)))
-                else:
-                    left = viz.topdown(cloud, size=a.panel_h)
-                if panel_w is None:
-                    panel_w = left.shape[1]
-                elif left.shape[1] != panel_w:
-                    left = cv2.resize(left, (panel_w, left.shape[0]),
-                                      interpolation=cv2.INTER_AREA)
-                right = wmap.render(size=left.shape[0], zoom=a.zoom)
-                sheet = np.hstack([left, right])
-                # H.264 with yuv420p needs even dimensions, and the fisheye
-                # panel width is `round(1600 * 540/1296)` = 667 -> a 1207-wide
-                # sheet, which libx264 refuses outright.  Trim the odd column
-                # rather than let the encoder fail after a multi-minute run.
-                if sheet.shape[1] % 2:
-                    sheet = sheet[:, :-1]
-                if sheet.shape[0] % 2:
-                    sheet = sheet[:-1, :]
                 stage_ms = {"odom": (t_odom - t_deskew) * 1e3,
                             "detect": (t_detect - t_odom) * 1e3}
                 total_ms = (time.perf_counter() - t_ingest) * 1e3
@@ -1109,7 +1145,38 @@ def main():
                                     cmd["v"], cmd["w"],
                                     "" if cmd.get("target") is None
                                     else "  target %.1f m" % cmd["dist"]))
-                sheet = viz.banner(sheet, lines, scale=0.5)
+                # The HUD block is painted over this panel's top-left corner,
+                # so the panel has to be told how much of its top is spoken
+                # for.  Asked of the same function that draws the block, and
+                # measured from the same origin -- passing the bare height was
+                # a 6 px error, because the block starts at `HUD_ORIGIN[1]` and
+                # a label clamped to "height + 2" still lost its top to it.
+                hud_h = HUD_ORIGIN[1] + viz.banner_size(lines,
+                                                        scale=HUD_SCALE)[1]
+                if fr.image is not None:
+                    left = annotate(fr.image, boxes, names, a.panel_h,
+                                    note="detected %d -> localised %d"
+                                         % (len(boxes), len(objects)),
+                                    top_margin=hud_h)
+                else:
+                    left = viz.topdown(cloud, size=a.panel_h)
+                if panel_w is None:
+                    panel_w = left.shape[1]
+                elif left.shape[1] != panel_w:
+                    left = cv2.resize(left, (panel_w, left.shape[0]),
+                                      interpolation=cv2.INTER_AREA)
+                right = wmap.render(size=left.shape[0], zoom=a.zoom)
+                sheet = np.hstack([left, right])
+                # H.264 with yuv420p needs even dimensions, and the fisheye
+                # panel width is `round(1600 * 540/1296)` = 667 -> a 1207-wide
+                # sheet, which libx264 refuses outright.  Trim the odd column
+                # rather than let the encoder fail after a multi-minute run.
+                if sheet.shape[1] % 2:
+                    sheet = sheet[:, :-1]
+                if sheet.shape[0] % 2:
+                    sheet = sheet[:-1, :]
+                sheet = viz.banner(sheet, lines, origin=HUD_ORIGIN,
+                                   scale=HUD_SCALE)
                 viz.imwrite(os.path.join(frames_dir, "%06d.png" % n_rec), sheet)
                 n_rec += 1
             t_render = time.perf_counter()

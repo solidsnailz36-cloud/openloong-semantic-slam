@@ -42,6 +42,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from r2slam.nav import PathPlanner          # noqa: E402
 from r2slam.worldmap import WorldMap        # noqa: E402
+from r2slam import viz                      # noqa: E402
 
 try:
     import cv2
@@ -101,6 +102,131 @@ def window(free, ground, obstacle, seen, x0, y0, half=12, lab=None):
     return out
 
 
+def _quat_to_R(qx, qy, qz, qw):
+    n = (qx * qx + qy * qy + qz * qz + qw * qw) ** 0.5
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]])
+
+
+def project_on_frame(world_xy, tf_csv, frames_dir, cfg_path, out_png,
+                     panel_h=540):
+    """Put a world point back on the picture, at the moment it was best seen.
+
+    The grid-level verdict above (which cell types lie along the line between
+    the two components) is the stronger test, because it names them.  This is
+    the second opinion a person can read at a glance.
+
+    ★ The frame is chosen by **visibility, not by proximity**.  Picking the
+    nearest approach looked obviously right and was wrong: the robot's closest
+    pass to the one stranded patch here put it at 92.9 deg of azimuth, i.e.
+    straight out to the left, and the fisheye's 132 deg HFOV does not reach
+    that -- the projection is behind the image plane.  The robot walked past
+    the patch without ever pointing the camera at it, and "nearest" drew a
+    picture of nothing.  So the search is over the frames where the point is
+    actually inside the image, scoring by distance.
+
+    A vertical stick is drawn rather than a single dot: a dot says nothing
+    about *which surface* it landed on, and the top and bottom of the stick
+    answering differently is the difference between a threshold and a wall.
+    """
+    from r2slam import load_config
+    from r2slam.camera import in_view, project, to_camera_frame
+
+    cfg = load_config(cfg_path)
+    rows = []
+    with open(tf_csv, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("#") or line.startswith("stamp,"):
+                continue
+            f = line.strip().split(",")
+            if len(f) < 10:
+                continue
+            rows.append(f)
+    P = np.array([[float(v) for v in r[3:10]] for r in rows])
+    st = np.array([float(r[0]) for r in rows])
+    cam = cfg.camera
+
+    def pose(i):
+        q = P[i, 3:7].copy()
+        q /= np.linalg.norm(q)
+        return _quat_to_R(*q), P[i, 0:3]
+
+    best, n_visible, near_d, near_az = None, 0, np.inf, np.nan
+    for i in range(len(P)):
+        R, t = pose(i)
+        p_lidar = R.T @ np.array([world_xy[0], world_xy[1], 0.0]) - R.T @ t
+        uv = to_camera_frame(p_lidar[None, :], cfg.Tcl)
+        u, v = project(uv, cam)
+        vis = bool(in_view(u, v, cam)[0])
+        d = float(np.hypot(P[i, 0] - world_xy[0], P[i, 1] - world_xy[1]))
+        if d < near_d:
+            near_d = d
+            near_az = float(np.degrees(np.arctan2(p_lidar[1], p_lidar[0])))
+        if not vis:
+            continue
+        n_visible += 1
+        if best is None or d < best[0]:
+            best = (d, i, float(u[0]), float(v[0]))
+    print("\n=== 叠回画面：世界点 (%.2f, %.2f) ===" % world_xy)
+    print("  最近一次靠到 %.2f m，那时它在方位角 %+.1f deg ⇒ %s"
+          % (near_d, near_az,
+             "当时不在画面里（车没朝它看）" if abs(near_az) > 70
+             else "当时在画面里"))
+    print("  整个序列里它落在相机视野内的帧：%d / %d (%.1f%%)"
+          % (n_visible, len(P), 100.0 * n_visible / max(len(P), 1)))
+    if best is None:
+        print("  ⇒ 一次也没进过画面，画不出图。这不是失败，是结论：")
+        print("     这块地面只有 LiDAR 看到过，相机从未对准它 —— "
+              "M3 的规范本身写着「不声称真值覆盖率」。")
+        return 0
+    d, i, _u, _v = best
+    print("  取看得最清的一帧：t=%.2f s（tf 第 %d 行，距离 %.2f m）"
+          % (st[i], i, d))
+
+    z = np.load(os.path.join(frames_dir, "%06d.npz" % i), allow_pickle=True)
+    if abs(float(z["stamp"]) - st[i]) > 1e-6:      # keep the pairing honest
+        raise SystemExit("stamp mismatch: tf %.6f vs npz %.6f -- refusing to "
+                         "draw a picture for the wrong moment"
+                         % (st[i], float(z["stamp"])))
+    img = cv2.imdecode(z["image_png"].astype(np.uint8), cv2.IMREAD_COLOR)
+    out = cv2.resize(img, (max(1, int(round(img.shape[1] * panel_h
+                                            / img.shape[0]))), panel_h),
+                     interpolation=cv2.INTER_AREA)
+    sc = out.shape[1] / float(img.shape[1])
+    R, t = pose(i)
+    pts = []
+    for h in np.arange(0.0, 1.61, 0.2):
+        p_lidar = R.T @ np.array([world_xy[0], world_xy[1], h]) - R.T @ t
+        uv = to_camera_frame(p_lidar[None, :], cfg.Tcl)
+        u, v = project(uv, cam)
+        ok = bool(in_view(u, v, cam)[0])
+        pts.append((h, float(u[0]) * sc, float(v[0]) * sc, ok))
+    print("  投影：高度 0.0–1.6 m 的竖线，" +
+          " ".join("%.1f:%s" % (h, "画面内" if ok else "画面外")
+                   for h, _u, _v, ok in pts))
+    for (h, u, v, ok), (h2, u2, v2, ok2) in zip(pts, pts[1:]):
+        if ok and ok2:
+            cv2.line(out, (int(u), int(v)), (int(u2), int(v2)), (0, 0, 255), 2,
+                     cv2.LINE_AA)
+        if ok:
+            cv2.circle(out, (int(u), int(v)), 5, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(out, (int(u), int(v)), 7, (255, 255, 255), 1, cv2.LINE_AA)
+    lo_ok = pts[0][3]
+    txt = ("分界处 (%.2f, %.2f)  距离 %.2f m" % (world_xy[0], world_xy[1], d)
+           if lo_ok else "分界处 (%.2f, %.2f)：地面点在画面外（竖线只画了上半段）"
+           % world_xy)
+    out = viz.banner(out, [txt,
+                           "该处绿带仅 0.10–0.32 m 宽 ⇒ 门缝/地面证据缺口，不是墙"],
+                     scale=0.5)
+    os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
+    cv2.imwrite(out_png, out)
+    print("  wrote %s" % out_png)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grids", required=True)
@@ -109,6 +235,16 @@ def main():
     ap.add_argument("--close-px", type=int, default=5)
     ap.add_argument("--inspect", default="",
                     help="x,y -- explain why this world point is not reachable")
+    ap.add_argument("--project", default="", metavar="X,Y",
+                    help="x,y -- also draw this world point on the camera frame "
+                         "at the robot's nearest approach to it")
+    ap.add_argument("--tf", default="", help="tf.csv, for --project")
+    ap.add_argument("--frames", default="",
+                    help="the npz directory, for --project")
+    ap.add_argument("--config", default="", help="source config, for --project")
+    ap.add_argument("--figure", default="", help="output png, for --project")
+    ap.add_argument("--map-figure", default="",
+                    help="output png: top-down decomposition of the stranded area")
     a = ap.parse_args()
 
     meta = json.load(open(os.path.join(a.grids, "meta.json"), encoding="utf-8"))
@@ -191,6 +327,43 @@ def main():
               % (r["id"], r["m2"], r["cx"], r["cy"], r["x"][0], r["x"][1],
                  r["y"][0], r["y"][1], r["free_cells"]))
 
+    # `reach` is a component of the ERODED grid, so the two-cell lining that the
+    # safety radius takes off every obstacle is "ground outside reach" too.  A
+    # headline number like `stranded_green_m2 = 159.6` therefore mixes a real
+    # separated room with dust, and the two need different answers: the first is
+    # a map fact, the second is a property of our own safety margin.  The bands
+    # below separate them, and the shell test says how much of the total lies
+    # within 2 cells of an obstacle.
+    stranded = (lab != seed) & ground
+    tot = float(stranded.sum()) * cell
+    if stranded.any():
+        _n_all, lab_all = cv2.connectedComponents(
+            stranded.astype(np.uint8), connectivity=4)
+        sizes = np.bincount(lab_all.reshape(-1))
+        sizes = sizes[1:] * cell
+        print()
+        print("=== 够不着的地面：按块大小分带（全部 %d 块，共 %.1f m2）==="
+              % (len(sizes), tot))
+        bands = [(0.0, 0.1), (0.1, 0.5), (0.5, 2.0), (2.0, 10.0),
+                 (10.0, 1e9)]
+        for lo_b, hi_b in bands:
+            sel = sizes[(sizes >= lo_b) & (sizes < hi_b)]
+            print("  %5.1f–%-7s m2 : %4d 块   %7.2f m2  (%.1f%%)"
+                  % (lo_b, "%.1f" % hi_b if hi_b < 1e8 else "∞", len(sel),
+                     float(sel.sum()), 100.0 * sel.sum() / max(tot, 1e-9)))
+        k_shell = max(1, int(round(2.0 / res)))          # 2 cells == 0.20 m
+        near_obs = cv2.dilate(obstacle.astype(np.uint8),
+                              np.ones((2 * k_shell + 1,) * 2,
+                                      np.uint8)) > 0
+        shell = stranded & near_obs
+        print("  距障碍 <= %.2f m 的（= 安全半径外壳）: %.1f m2  (%.1f%%)"
+              % (2 * res, float(shell.sum()) * cell,
+                 100.0 * shell.sum() / max(stranded.sum(), 1)))
+        far = stranded & ~near_obs
+        print("  离障碍更远的（才是「另一个区域」）      : %.1f m2  (%.1f%%)"
+              % (float(far.sum()) * cell,
+                 100.0 * far.sum() / max(stranded.sum(), 1)))
+
     # For each stranded patch: is it connected in the RAW grid?  That separates
     # "our erosion sealed a real doorway" from "there is a wall / no door seen".
     # The first is our parameter and we can fix it; the second is a fact about
@@ -247,6 +420,70 @@ def main():
             print("  门口 25x25（+ 房内分量, . 机器人分量, # 障碍, W 绿但被侵蚀, o 看过空, ? 没看过）:")
             for line in window(free, ground, obstacle, seen, mx, my, half=12, lab=lab):
                 print(line)
+
+    if a.project:
+        if not (a.tf and a.frames and a.config and a.figure):
+            raise SystemExit("--project needs --tf, --frames, --config and "
+                             "--figure as well")
+        px, py = (float(v) for v in a.project.split(","))
+        project_on_frame((px, py), a.tf, a.frames, a.config, a.figure)
+    if a.map_figure:
+        biggest = rows[0] if rows else None
+        map_figure(free, lab, seed, ground, obstacle, seen, w.traj, res, ext,
+                   a.map_figure,
+                   stranded_xy=(biggest["cx"], biggest["cy"]) if biggest
+                   else None)
+    return 0
+
+
+def map_figure(free, lab, seed, ground, obstacle, seen, traj, res, ext, out_png,
+               stranded_xy=None, scale=2):
+    """Top-down picture of the decomposition, so the numbers have a shape.
+
+    Four classes, and the point of drawing them apart is that the headline
+    number mixes two of them:
+      green   the robot's own component (what it can drive on)
+      orange  ground within 0.20 m of an obstacle -- the safety-margin lining
+      red     ground outside the component and away from obstacles: the only
+              cells that are honestly "another region"
+      grey    obstacle, dark = never seen
+    """
+    h, w = free.shape
+    wm = WorldMap(resolution=res, extent=ext)
+    img = np.full((h, w, 3), (28, 28, 32), np.uint8)
+    img[seen] = (60, 60, 66)
+    img[obstacle] = (110, 110, 118)
+    k = max(1, int(round(2.0 / res)))
+    shell = cv2.dilate(obstacle.astype(np.uint8),
+                       np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
+    img[ground & shell & (lab != seed)] = (0, 165, 255)          # BGR orange
+    img[ground & ~shell & (lab != seed)] = (0, 0, 255)           # red
+    img[lab == seed] = (0, 200, 0)
+    for p in traj:
+        c = wm.cell_of(p[0], p[1])
+        cv2.circle(img, (int(c[0]), int(c[1])), 2, (255, 255, 0), -1)
+    if stranded_xy is not None:
+        c = wm.cell_of(stranded_xy[0], stranded_xy[1])
+        cv2.circle(img, (int(c[0]), int(c[1])), 26, (255, 255, 255), 2,
+                   cv2.LINE_AA)
+    # crop to the trajectory's bounding box plus a margin, then enlarge
+    ys, xs = np.nonzero((lab == seed) | (ground & (lab != seed)) | obstacle)
+    pad = 20
+    y0, y1 = max(0, ys.min() - pad), min(h, ys.max() + pad)
+    x0, x1 = max(0, xs.min() - pad), min(w, xs.max() + pad)
+    crop = img[y0:y1, x0:x1]
+    big = cv2.resize(crop, None, fx=scale, fy=scale,
+                     interpolation=cv2.INTER_NEAREST)
+    big = cv2.flip(big, 0)                      # +y up, matching the panel
+    big = viz.banner(big, ["绿 = 机器人可达   橙 = 安全半径外壳(<=0.20 m)   "
+                           "红 = 真正的「另一个区域」",
+                           "白圈 = 唯一一块>=0.5 m2 的孤立地面  "
+                           "(%.2f, %.2f)" % stranded_xy
+                           if stranded_xy else "白圈 = 无"],
+                     scale=0.5)
+    os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
+    cv2.imwrite(out_png, big)
+    print("  wrote %s  (绿=可达 橙=外壳 红=真区域 灰=障碍/未知)" % out_png)
     return 0
 
 
