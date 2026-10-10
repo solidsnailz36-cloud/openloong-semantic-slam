@@ -181,6 +181,20 @@ class ImuSpec:
         default_factory=lambda: [1.0, 0.0, 0.0,
                                  0.0, 1.0, 0.0,
                                  0.0, 0.0, 1.0])
+    # Rotational bias of the gyro, rad/s, in the IMU frame.  Measured once by
+    # `tools/estimate_imu_bias.py` and carried here, because a calibration is a
+    # property of the hardware and not of the run.  It is NOT a detail: a bias
+    # enters the deskew as `b x tau`, i.e. shaped exactly like the rotation
+    # being corrected, so it is not averaged away.  On this rig
+    # (-0.004880, -0.010416, +0.004291) rad/s costs 0.026 / 0.056 / 0.023 deg
+    # per sweep against a total correction of ~0.23 deg.
+    #   x/y from an attitude-closure argument (the robot drives on a floor, so
+    #   its net roll/pitch over 139 s is bounded; the run mean gives -39 deg /
+    #   -83 deg of implied tilt, which is impossible, so it is bias).
+    #   z from 3493 quasi-static samples, where the run mean is useless because
+    #   it is dominated by the 354 deg the robot really turns.
+    #   The two routes are independent and agree to 0.048 / 0.008 deg/s on x/y.
+    gyro_bias: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     # How much IMU history to attach to each frame.  The real sweep is 94 ms;
     # 0.20 s leaves room for a jittery stamp without reaching back into the
     # interval of the frame before last.
@@ -284,11 +298,12 @@ class SourceConfig:
             "lidar       : %s  %s pts @ %.1f Hz  deskew=%s"
             % (self.lidar.topic, self.lidar.expected_points,
                self.lidar.nominal_hz, self.lidar.deskew),
-            ("imu         : %s @ %.0f Hz  window %.2f s  %s"
+            ("imu         : %s @ %.0f Hz  window %.2f s  %s  bias %.4f/%.4f/%.4f rad/s"
              % (self.imu.topic, self.imu.rate_hz, self.imu.window_s,
                 "identity rotation (shares the LiDAR attitude)"
                 if np.allclose(self.imu.R, np.eye(3))
-                else "rotated into the LiDAR frame")
+                else "rotated into the LiDAR frame",
+                *self.imu.gyro_bias)
              if self.imu else
              "imu         : none (deskew falls back to constant velocity)"),
             "extrinsics  : |t| = %.4f m  -> Tcl" % np.linalg.norm(self.Tcl[:3, 3]),

@@ -382,7 +382,8 @@ def main():
                         period=(1.0 / cfg.lidar.nominal_hz
                                 if cfg.lidar.nominal_hz else None),
                         use_imu=bool(a.imu_deskew),
-                        R_imu_to_lidar=(cfg.imu.R if cfg.imu else None))
+                        R_imu_to_lidar=(cfg.imu.R if cfg.imu else None),
+                        gyro_bias=(cfg.imu.gyro_bias if cfg.imu else None))
     if a.imu_deskew:
         if cfg.imu is None:
             raise SystemExit("--imu-deskew needs an `imu:` block in %s" % a.config)

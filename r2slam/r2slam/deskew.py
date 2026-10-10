@@ -125,7 +125,8 @@ def deskew_offsets(t_offset: np.ndarray, max_dt: float = 0.25) -> np.ndarray:
 
 def imu_rotation_vectors(offsets: np.ndarray, imu: np.ndarray, stamp: float,
                          sign: float,
-                         R_imu_to_lidar: Optional[np.ndarray] = None
+                         R_imu_to_lidar: Optional[np.ndarray] = None,
+                         gyro_bias: Optional[np.ndarray] = None
                          ) -> Optional[np.ndarray]:
     """Per-point rotation vector taken from the gyro, or None if unavailable.
 
@@ -160,6 +161,17 @@ def imu_rotation_vectors(offsets: np.ndarray, imu: np.ndarray, stamp: float,
     if R_imu_to_lidar is not None:
         w = w @ np.asarray(R_imu_to_lidar, dtype=np.float64).reshape(3, 3).T
 
+    # Bias, removed before anything else integrates it.  A bias is NOT a small
+    # offset that averages out: it enters as `b x tau`, which is the same
+    # functional form as the rotation being corrected, so it survives the
+    # window difference intact and grows with the offset.  On this rig it is
+    # worth 0.026 / 0.056 / 0.023 deg per sweep -- about a quarter of the
+    # 0.205 deg the whole exercise is trying to remove.  Calibrated by
+    # `tools/estimate_imu_bias.py` and carried in the config, because a
+    # calibration is a property of the hardware, not of the run.
+    if gyro_bias is not None:
+        w = w - np.asarray(gyro_bias, dtype=np.float64).reshape(3)
+
     s = float(stamp) + float(sign) * np.asarray(offsets, dtype=np.float64)
     if min(float(s.min()), float(stamp)) < ts[0]:
         return None
@@ -179,7 +191,8 @@ def deskew(cloud: np.ndarray, t_offset: Optional[np.ndarray],
            T_prev: np.ndarray, T_curr: np.ndarray, dt_frame: float,
            max_dt: float = 0.25, sign: float = 1.0,
            imu: Optional[np.ndarray] = None, stamp: Optional[float] = None,
-           R_imu_to_lidar: Optional[np.ndarray] = None):
+           R_imu_to_lidar: Optional[np.ndarray] = None,
+           gyro_bias: Optional[np.ndarray] = None):
     """Undo the in-frame motion of a sweeping LiDAR.
 
     `T_prev` / `T_curr` are the two most recent sensor-to-world poses; their
@@ -237,7 +250,7 @@ def deskew(cloud: np.ndarray, t_offset: Optional[np.ndarray],
     rv = None
     if imu is not None and stamp is not None:
         rv = imu_rotation_vectors(t, imu, float(stamp), float(sign),
-                                  R_imu_to_lidar)
+                                  R_imu_to_lidar, gyro_bias=gyro_bias)
     if rv is None:
         rv_u = xi_w[None, :] * uniq[:, None]
     else:
@@ -265,7 +278,8 @@ class Deskewer:
 
     def __init__(self, enabled: bool = True, sign: Optional[float] = None,
                  period: Optional[float] = None, use_imu: bool = False,
-                 R_imu_to_lidar: Optional[np.ndarray] = None):
+                 R_imu_to_lidar: Optional[np.ndarray] = None,
+                 gyro_bias: Optional[np.ndarray] = None):
         # The direction is a property of the sensor and comes from the config
         # (`lidar.time_offsets_from`).  The env var is only an escape hatch for
         # A/B experiments; it must not be the place a real setting lives.
@@ -285,6 +299,8 @@ class Deskewer:
         self.use_imu = bool(use_imu)
         self.R_imu_to_lidar = (None if R_imu_to_lidar is None
                                else np.asarray(R_imu_to_lidar, dtype=np.float64))
+        self.gyro_bias = (None if gyro_bias is None
+                          else np.asarray(gyro_bias, dtype=np.float64))
         self.n_skipped_dt = 0
         self.n_imu_used = 0
         self.n_imu_fallback = 0
@@ -316,7 +332,8 @@ class Deskewer:
                                self._dt, sign=self.sign,
                                imu=(imu if self.use_imu else None),
                                stamp=stamp,
-                               R_imu_to_lidar=self.R_imu_to_lidar)
+                               R_imu_to_lidar=self.R_imu_to_lidar,
+                               gyro_bias=self.gyro_bias)
         if self.use_imu:
             if used_imu:
                 self.n_imu_used += 1

@@ -82,6 +82,47 @@ def _header_stamp(msg) -> Optional[float]:
     return v if v > 0 else None
 
 
+def read_imu_topic(bag_dir: str, topic: str) -> np.ndarray:
+    """`(N, 7)` = `t, gx, gy, gz, ax, ay, az` for a whole IMU topic, time-ordered.
+
+    Standalone (no `Frame`) because the things that want the *entire* stream --
+    gyro bias calibration, the heading cross-check -- are offline analyses, not
+    per-frame consumers.  Reading it through the frame source would tie them to
+    a windowing decision they do not share.
+
+    `sensor_msgs/msg/Imu`; the bag's write time is never used, only
+    `header.stamp`, for the same reason the frame loop prefers it.
+    """
+    import os
+    import sqlite3
+
+    from rosbags.typesys import Stores, get_typestore
+    ts = get_typestore(Stores.ROS2_HUMBLE)
+    rows = []
+    for db in sorted(f for f in os.listdir(bag_dir) if f.endswith(".db3")):
+        con = sqlite3.connect("file:%s?mode=ro" % os.path.join(bag_dir, db),
+                              uri=True)
+        cur = con.cursor()
+        cur.execute("SELECT id FROM topics WHERE name=?", (topic,))
+        hit = cur.fetchone()
+        if hit:
+            cur.execute("SELECT data FROM messages WHERE topic_id=?"
+                        " ORDER BY timestamp", (hit[0],))
+            for (blob,) in cur.fetchall():
+                m = ts.deserialize_cdr(bytes(blob), "sensor_msgs/msg/Imu")
+                hs = m.header.stamp
+                g, acc = m.angular_velocity, m.linear_acceleration
+                rows.append((float(hs.sec) + float(hs.nanosec) * 1e-9,
+                             g.x, g.y, g.z, acc.x, acc.y, acc.z))
+        con.close()
+    out = np.array(rows)
+    if len(out):
+        out = out[np.argsort(out[:, 0])]
+        keep = np.concatenate(([True], np.diff(out[:, 0]) > 0))
+        out = out[keep]
+    return out
+
+
 class BagRos2Source(FrameSource):
     def __init__(self, cfg: SourceConfig):
         super().__init__(cfg)

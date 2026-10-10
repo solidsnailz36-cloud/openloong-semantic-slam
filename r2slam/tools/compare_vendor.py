@@ -117,6 +117,12 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bag", required=True, help="r2 bag directory")
     ap.add_argument("--tf", required=True, help="our tf.csv")
+    ap.add_argument("--horizons", default="1,5",
+                    help="comma-separated RPE horizons in seconds.  1 s is the "
+                         "one the round-2 scoring sheet asks for (M5: ATE, "
+                         "1-second RPE, and time coverage); 5 s is kept because "
+                         "it is what every previous round reported and the two "
+                         "are not comparable.")
     ap.add_argument("--out", default=None, help="write a json report here")
     a = ap.parse_args()
 
@@ -154,20 +160,59 @@ def main():
           (pct(err, 50), pct(err, 90), pct(err, 100)))
 
     # --- RPE: drift over a fixed horizon, no alignment needed -------------
-    horizon = 5.0
-    res = []
+    # Reported at every horizon asked for, because they answer different
+    # questions and a single number invites the wrong one.  1 s is what the
+    # scoring sheet names; 5 s was what every earlier round of this project
+    # measured, and the two differ by ~2x on the same trajectory.
+    horizons = [float(x) for x in str(a.horizons).split(",") if x.strip()]
     vi_i = interp_to(v, ot[:, 0])
-    for i in range(len(ot)):
-        j = np.searchsorted(ot[:, 0], ot[i, 0] + horizon)
-        if j >= len(ot):
-            break
-        d_ours = ot[j, 1:3] - ot[i, 1:3]
-        d_vend = vi_i[j, :2] - vi_i[i, :2]
-        res.append(np.linalg.norm(d_ours - d_vend))
-    res = np.array(res) if res else np.zeros(1)
-    print("\n=== RPE over %.0f s (no alignment required) ===" % horizon)
-    print("  drift p50 %.3f  p90 %.3f  max %.3f m" %
-          (pct(res, 50), pct(res, 90), pct(res, 100)))
+    rpe = {}
+    for horizon in horizons:
+        res = []
+        for i in range(len(ot)):
+            j = np.searchsorted(ot[:, 0], ot[i, 0] + horizon)
+            if j >= len(ot):
+                break
+            d_ours = ot[j, 1:3] - ot[i, 1:3]
+            d_vend = vi_i[j, :2] - vi_i[i, :2]
+            res.append(np.linalg.norm(d_ours - d_vend))
+        res = np.array(res) if res else np.zeros(1)
+        rpe[horizon] = res
+        print("\n=== RPE over %.1f s (no alignment required) ===" % horizon)
+        print("  drift p50 %.3f  p90 %.3f  max %.3f m  (%d pairs)"
+              % (pct(res, 50), pct(res, 90), pct(res, 100), len(res)))
+
+    # --- time coverage: the third term of the scoring sheet's M5 -----------
+    # "how much of the sequence do you actually answer for".  A trajectory can
+    # be accurate and still lose here by emitting TFs for part of the run, so
+    # the span, the gap tail and the fraction of expected samples all matter.
+    span_o = float(ot[-1, 0] - ot[0, 0])
+    dts = np.diff(ot[:, 0])
+    print("\n=== time coverage ===")
+    print("  our samples      %d over %.2f s  (%.2f Hz)"
+          % (len(o), float(o[-1, 0] - o[0, 0]), len(o) / max(o[-1, 0] - o[0, 0], 1e-9)))
+    if len(dts):
+        print("  inter-sample dt  p50 %.4f s  p99 %.4f s  max %.4f s"
+              % (np.percentile(dts, 50), np.percentile(dts, 99), dts.max()))
+    if len(v) > 1:
+        span_v = float(v[-1, 0] - v[0, 0])
+        print("  vendor span      %.2f s   ours covers %.1f%% of it"
+              % (span_v, 100.0 * span_o / max(span_v, 1e-9)))
+        # How many of the vendor's sample instants fall inside our span AND have
+        # a TF within one nominal period?  That is the honest coverage number:
+        # a span can cover everything while a hole sits in the middle.
+        nominal = float(np.median(dts)) if len(dts) else 0.1
+        inn = (v[:, 0] >= ot[0, 0]) & (v[:, 0] <= ot[-1, 0])
+        idx = np.searchsorted(ot[:, 0], v[inn, 0])
+        idx = np.clip(idx, 0, len(ot) - 1)
+        near = np.abs(ot[idx, 0] - v[inn, 0]) <= 1.5 * nominal
+        print("  of the %d vendor instants inside our span, %d (%.2f%%) have a "
+              "TF within 1.5 x the nominal period"
+              % (int(inn.sum()), int(near.sum()),
+                 100.0 * near.mean() if inn.any() else float("nan")))
+        cov = float(near.mean()) if inn.any() else float("nan")
+    else:
+        span_v, cov = float("nan"), float("nan")
 
     def pathlen(x):
         return float(np.linalg.norm(np.diff(x[:, 1:3], axis=0), axis=1).sum())
@@ -195,10 +240,22 @@ def main():
                 "ate_xy_m": {"p50": round(pct(err, 50), 3),
                              "p90": round(pct(err, 90), 3),
                              "max": round(pct(err, 100), 3)},
-                "rpe_xy_m_%ds" % int(horizon): {
-                    "p50": round(pct(res, 50), 3),
-                    "p90": round(pct(res, 90), 3),
-                    "max": round(pct(res, 100), 3)},
+                "rpe_xy_m": {("%gs" % h): {"p50": round(pct(rpe[h], 50), 3),
+                                           "p90": round(pct(rpe[h], 90), 3),
+                                           "max": round(pct(rpe[h], 100), 3),
+                                           "pairs": int(len(rpe[h]))}
+                             for h in horizons},
+                "time_coverage": {
+                    "our_samples": int(len(o)),
+                    "our_span_s": round(float(o[-1, 0] - o[0, 0]), 3),
+                    "our_hz": round(len(o) / max(o[-1, 0] - o[0, 0], 1e-9), 3),
+                    "vendor_span_s": (round(span_v, 3) if span_v == span_v else None),
+                    "coverage_vs_vendor_instants": (round(cov, 4)
+                                                    if cov == cov else None),
+                    "dt_p99_s": (round(float(np.percentile(dts, 99)), 4)
+                                 if len(dts) else None),
+                    "dt_max_s": (round(float(dts.max()), 4) if len(dts) else None),
+                },
                 "path_len_m": {"ours": round(pathlen(ot), 2),
                                "vendor": round(pathlen(v), 2)},
             }, fh, indent=2, ensure_ascii=False)

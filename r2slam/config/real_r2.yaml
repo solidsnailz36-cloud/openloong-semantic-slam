@@ -105,6 +105,17 @@ imu:
   R_imu_to_lidar: [1, 0, 0,
                    0, 1, 0,
                    0, 0, 1]
+  # Gyro bias, rad/s, from `tools/estimate_imu_bias.py` (2026-10-10).
+  #   x/y = -0.0048800 / -0.0104163  <- attitude closure: integrating the run
+  #        mean gives -38.9 deg / -83.0 deg of implied tilt, impossible on a
+  #        floor, so it is bias rather than motion.
+  #   z   = +0.0042909                <- 3493 quasi-static samples (s.e.
+  #        0.0043 / 0.0034 / 0.0103 deg/s).  The run mean cannot be used for z
+  #        because it is dominated by the 354 deg the robot really turns.
+  #   The two routes are independent and agree to 0.048 / 0.008 deg/s on x/y.
+  # Cost of NOT removing it: 0.026 / 0.056 / 0.023 deg of spurious rotation per
+  # 94 ms sweep, against a total in-frame rotation of ~0.23 deg.
+  gyro_bias: [-0.0048796444, -0.0104162928, 0.0042909425]
   window_s: 0.20
 
 runtime:

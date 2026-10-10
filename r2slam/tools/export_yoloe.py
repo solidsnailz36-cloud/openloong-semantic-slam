@@ -34,9 +34,21 @@ def main():
     ap.add_argument("--out", default=os.path.join(here, "..", "vendor", "detector", "yoloe"))
     ap.add_argument("--classes", default="humanoid robot",
                     help="text classes to bake; use --emb to bake a visual one")
+    ap.add_argument("--probe-frame", default=os.path.join(
+        here, "..", "out", "calib_real", "img_000196.png"),
+        help="a frame known to CONTAIN the class.  The class-channel check is "
+             "meaningless without one: a blank frame cannot tell 'the head is "
+             "dead' from 'there is nothing there'.")
     ap.add_argument("--emb", default=None,
                     help=".npz from tools/yoloe_visual_bake.py, to bake the "
                          "visual prompt embedding instead of text")
+    ap.add_argument("--fuse-vocab", action="store_true",
+                    help="reparameterise the class head before exporting "
+                         "(`head.fuse(pe)`), which is what `get_vocab` does.  "
+                         "WITHOUT this the exported graph's class channel is "
+                         "dead: the promptable head multiplies by `pe` at "
+                         "runtime, and an exported graph has no runtime "
+                         "multiplication.  Verified by the [4] check below.")
     a = ap.parse_args()
 
     from ultralytics import YOLOE
@@ -55,6 +67,25 @@ def main():
         names = [s.strip() for s in a.classes.split(",") if s.strip()]
         model.set_classes(names)
         print("baked text classes: %s" % names)
+
+    if a.fuse_vocab:
+        # `get_vocab` -- the path that exports correctly -- does exactly this
+        # and nothing else that matters: `tpe = get_text_pe(names)`,
+        # `set_classes(names, tpe)`, then `head.fuse(self.pe)`.  The only
+        # text-specific step is the first one, and `pe` is whatever
+        # `set_classes` was handed.  So fusing here is the difference between
+        # "the head knows the class" and "the head multiplies by pe at run
+        # time", and an exported graph is precisely the place where that
+        # runtime multiplication cannot happen.
+        inner = model.model
+        head = inner.model[-1]
+        if getattr(head, "is_fused", False):
+            print("head already fused; nothing to do")
+        else:
+            dev = next(inner.parameters()).device
+            head.fuse(inner.pe.to(dev))
+            print("fused the prompt embedding into the class head "
+                  "(is_fused=%s, names=%d)" % (head.is_fused, len(names)))
 
     t0 = time.time()
     try:
@@ -90,18 +121,60 @@ def main():
 
     print("[3] size %.1f MB" % (os.path.getsize(path) / 1e6))
 
-    # [4] does the class channel carry anything?  A graph whose class scores are
-    # all zero is the exact INT8 failure mode this project already hit once.
-    img = np.zeros((1, 3, a.imgsz, a.imgsz), np.float32)
-    t0 = time.time()
-    N = 5
-    for _ in range(N):
-        y = sess.run(None, {ins[0][0]: img})[0]
-    dt = (time.time() - t0) / N
-    print("[4] blank-frame latency %.1f ms  output %s" % (dt * 1e3, y.shape))
-    ch = y.shape[1] - 4
-    print("    class channels %d  (names baked: %d)  max class score on a blank "
-          "frame %.4f" % (ch, len(names), float(np.abs(y[0, 4:]).max())))
+    # [4] does the CLASS channel carry anything?  Measured on a real frame and
+    # only over `[4 : 4+nc]`, because the seg head concatenates 32 mask
+    # coefficients after the classes -- an earlier version of this check took
+    # `abs(y[0, 4:]).max()` and reported 2.6, which was a mask coefficient
+    # being read as a class score.  A check that reads the wrong column is
+    # worse than no check.
+    nc = len(names)
+    frame = a.probe_frame
+    if frame and os.path.isfile(frame):
+        import cv2
+        im = cv2.imread(frame)
+        S = a.imgsz
+        h, w = im.shape[:2]
+        g = min(S / h, S / w)
+        nh, nw = round(h * g), round(w * g)
+        canvas = np.full((S, S, 3), 114, np.uint8)
+        canvas[(S - nh) // 2:(S - nh) // 2 + nh, 0:nw] = cv2.resize(im, (nw, nh))
+        x = canvas[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        t0 = time.time()
+        for _ in range(3):
+            y = sess.run(None, {ins[0][0]: x})[0]
+        dt = (time.time() - t0) / 3
+        cls = y[0, 4:4 + nc]
+        k = int(np.argmax(cls))
+        cx, cy, bw, bh = y[0, :4, int(np.argmax(cls.max(0)))]
+        print("[4] real frame %s: class channel%s max %.4f"
+              % (os.path.basename(frame), "" if nc == 1 else "s", float(cls.max())))
+        print("    best box (input px) cx %.0f cy %.0f  %.0fx%.0f   latency %.1f ms"
+              % (cx, cy, bw, bh, dt * 1e3))
+        print("    %s" % ("OK -- the class channel responds"
+                          if cls.max() > 0.25 else
+                          "*** DEAD: below the 0.25 operating threshold ***"))
+        print("    (channel count is 4 + nc + 32 here: 4 box + %d class + 32 "
+              "mask coefficients, so detect.py's 4 + nc assumption does not "
+              "hold for a seg head)" % nc)
+    else:
+        print("[4] no --probe-frame given, skipping the class-channel check "
+              "(this is the check that matters)")
+
+    # [5] the cross-check that settles it: ask the vendor's own predictor.  If
+    # it also finds nothing, the graph is broken rather than my decoder.
+    if frame and os.path.isfile(frame):
+        try:
+            from ultralytics import YOLO as _YOLO
+            r = _YOLO(path).predict(frame, conf=0.05, imgsz=a.imgsz,
+                                    verbose=False)[0]
+            nb = 0 if r.boxes is None else len(r.boxes)
+            best = 0.0 if not nb else float(r.boxes.conf.cpu().numpy().max())
+            print("[5] ultralytics' own ONNX predictor: %d boxes at conf>=0.05 "
+                  "(best %.3f)" % (nb, best))
+            print("    %s" % ("OK" if nb else
+                              "*** 0 boxes -- not my decoder, the export is dead ***"))
+        except Exception as e:                                # noqa: BLE001
+            print("[5] could not run the ultralytics predictor: %s" % e)
     return 0
 
 

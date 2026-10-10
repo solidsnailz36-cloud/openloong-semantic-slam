@@ -548,7 +548,8 @@ def main():
                         period=(1.0 / cfg.lidar.nominal_hz
                                 if cfg.lidar.nominal_hz else None),
                         use_imu=bool(a.imu_deskew),
-                        R_imu_to_lidar=(cfg.imu.R if cfg.imu else None))
+                        R_imu_to_lidar=(cfg.imu.R if cfg.imu else None),
+                        gyro_bias=(cfg.imu.gyro_bias if cfg.imu else None))
     print("deskew      : %s (config asks: %s, offsets from: %s, sign %+g, "
           "period guard %.3f s)"
           % ("on" if deskewer.enabled else "off", cfg.lidar.deskew,

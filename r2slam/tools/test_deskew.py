@@ -132,6 +132,29 @@ def main():
           abs(float(rv3[0][2]) - float(rv3[1][2])) > 1e-3)
 
     # ------------------------------------------------------------------
+    # 2b. Bias handling.  A gyro stream that is a constant rate PLUS a bias must
+    #     reproduce the bias-free result once the bias is declared -- and must
+    #     NOT reproduce it when it is not, because a bias integrates as
+    #     `b x tau`, the same shape as the rotation being corrected, so it does
+    #     not average away.  Without the second half this test would pass on a
+    #     gyro path that ignores the bias entirely.
+    # ------------------------------------------------------------------
+    bias = np.radians(np.array([-0.28, -0.597, 0.246]))      # deg/s -> rad/s
+    imu_biased = imu_stream(stamp, lambda _s: om + bias)
+    cv_ref, _ = deskew(cloud, t, T_prev, T_curr, dt_frame, sign=-1.0)
+    fixed, _ = deskew(cloud, t, T_prev, T_curr, dt_frame, sign=-1.0,
+                      imu=imu_biased, stamp=stamp, gyro_bias=bias)
+    unfixed, _ = deskew(cloud, t, T_prev, T_curr, dt_frame, sign=-1.0,
+                        imu=imu_biased, stamp=stamp)
+    d_fixed = float(np.abs(fixed - cv_ref).max())
+    d_un = float(np.abs(unfixed - cv_ref).max())
+    check("a declared bias restores the bias-free result (<=1e-12 m)",
+          d_fixed <= 1e-12, "max %.3e m" % d_fixed)
+    check("... and leaving it in changes the cloud by more than the tolerance",
+          d_un > 1e-9, "max %.3e m -- if this is ~0 the bias is being dropped "
+                       "somewhere" % d_un)
+
+    # ------------------------------------------------------------------
     # 3. The sign convention.  Flipping `sign` must negate the vectors, since
     #    it says which side of the frame stamp the acquisition sits on.
     #    `sign=+1` looks *forward*, so the stream has to reach past the stamp.
