@@ -1460,10 +1460,29 @@ class WorldMap:
             # A cell that is `seen` but is neither `ground` nor `obstacle` is one
             # the panel can paint as a wall while `free_space` refuses it: one
             # cell, two answers, which is the thing that must not happen.  With
-            # `GROUND_COVER_INFORMATIVE` on this is 0 by construction; with it
-            # off it is the exact size of the class in question -- measured 6466
-            # cells (64.7 m2) on the real corridor, which is what the grey strips
-            # across the doorways were made of.
+            # `GROUND_COVER_INFORMATIVE` off this is the exact size of the class
+            # in question -- measured 6466 cells (64.7 m2) on the real corridor,
+            # which is what the grey strips across the doorways were made of.
+            #
+            # ⚠️ **It is not zero with the flag on, and this comment used to say
+            # it was ("0 by construction").**  Measured on the 2026-10-10 real
+            # run, decomposing the dumped grids (`out/ab_perception/grids_real_final`):
+            #
+            #     1464 cells, of which ground_ever is False for **all** of them
+            #       1332  with `obstacle_votes == 1`
+            #         13  with `obstacle_votes == 0`
+            #        119  with `obstacle_votes >= 2`  (un-promoted afterwards by
+            #             `OBSTACLE_OPEN_PX`, the on-path exemption, or the
+            #             ground-ratio veto)
+            #
+            # The fold only takes a cell that has a seen point with **no**
+            # obstacle return and no detection (`fl = sm & ~o & ~p`).  A cell
+            # whose returns are all inside the obstacle band therefore gets
+            # `seen` without `ground_ever`, and if they never reach
+            # `OBSTACLE_MIN_VOTES` it is neither.  That is not an inconsistency
+            # -- the panel and the planner agree it is not walkable -- it is the
+            # honest answer for "one grazing return in the band and nothing
+            # else, ever", and it is what the residue is made of.
             #
             # Reported rather than asserted, so a run record carries the number
             # either way and a claim about it can be checked after the fact.
