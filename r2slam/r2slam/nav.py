@@ -464,6 +464,17 @@ class PathPlanner:
         # Default `"disc"` since 2026-10-11.  `"square"` is the historical
         # behaviour and stays reachable so a pre-change run reproduces bit for
         # bit, but it is wrong for a round robot: see the note above.
+        #
+        # ⚠️ The two coincide at the explorer's default radius (0.25 since
+        # 2026-10-10): the corner offset is `res*hypot(1.5, 1.5)` = 0.212 m,
+        # which is *under* 0.25, so the disc keeps the corners and **is** the
+        # 5x5 box.  Measured kernel sizes -- r=0.19: disc 21 vs square 25;
+        # r=0.22 and r=0.25: both 25 (identical); r=0.30: 45 vs 49.  So
+        # `--footprint` only moves the mask at radii <= 0.22 or >= 0.28, and the
+        # glass-room cell this whole change was about is, at 0.25, genuinely
+        # inside the robot's disc (0.212 < 0.25) rather than wrongly deleted.
+        # The note above is therefore still the reason `disc` is the default --
+        # it is just inert there.
         self.footprint = "disc" if str(footprint).lower().startswith("d") \
             else "square"
         # Optional morphological closing applied BEFORE the robot-radius

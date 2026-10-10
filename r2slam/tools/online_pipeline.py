@@ -132,18 +132,27 @@ def parse_args():
                          "0.283 m on its diagonal where the radius is 0.19 m "
                          "and therefore deletes corner cells the robot fits in "
                          "(-- `PathPlanner.footprint`).  Passing `square` "
-                         "reproduces every pre-2026-10-11 run bit for bit")
-    ap.add_argument("--robot-radius", type=float, default=0.19, metavar="M",
+                         "reproduces every pre-2026-10-11 run bit for bit.  "
+                         "NOTE the two coincide at the current default radius "
+                         "0.25: there the disc is the full 5x5 (the corner "
+                         "offset is 0.212 m, under 0.25), so this flag only "
+                         "moves the mask at radii <= 0.22 or >= 0.28")
+    ap.add_argument("--robot-radius", type=float, default=0.25, metavar="M",
                     help="the disc the walkable grid is eroded by -- the robot's "
-                         "circumscribed radius, not its half-width.  0.19 is the "
-                         "historical value and is about the KUKA youBot's "
-                         "half-width (0.178); a disc kernel wants the "
-                         "circumscribed 0.29 (base 0.57 x 0.36 m).  This one "
-                         "number feeds BOTH the explorer's planner and the "
+                         "circumscribed radius, not its half-width.  0.25 is the "
+                         "default since 2026-10-10: 0.19, the historical value, "
+                         "is about the KUKA youBot's half-width (0.178) and is "
+                         "wrong for a disc kernel (the circumscribed radius is "
+                         "0.29 on the 0.57 x 0.36 m base).  On the r2 recording "
+                         "0.25 costs 2.3%% of the reachable area (401.8 -> 392.7 "
+                         "m2) where 0.30 costs 11.5%% (355.8 m2), so 0.25 is the "
+                         "conservative end of the correction.  This one number "
+                         "feeds BOTH the explorer's planner and the "
                          "`summary['reach']` note, so the two cannot describe "
-                         "different robots.  Default 0.19 keeps the shipped run "
-                         "bit-for-bit; `--explore-set robot_radius=...` still "
-                         "wins over it, exactly as with `--footprint`")
+                         "different robots.  `--robot-radius 0.19` reproduces "
+                         "every pre-2026-10-10 run's planner, and "
+                         "`--explore-set robot_radius=...` still wins over the "
+                         "flag, exactly as with `--footprint`")
     ap.add_argument("--voxel", type=float, default=None, metavar="M",
                     help="override runtime.voxel_size (the KISS-ICP map voxel). "
                          "Left at None so the default run is bit-for-bit the "

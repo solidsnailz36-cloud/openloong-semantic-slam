@@ -83,7 +83,7 @@ class FrontierExplorer:
                  stagnate_frames: int = 300, stagnate_eps: float = 0.5,
                  barren_targets: int = 8, barren_blacklist_m: float = 0.60,
                  fb_relax: int = 0,
-                 robot_radius: float = 0.19, replan_every: int = 12,
+                 robot_radius: float = 0.25, replan_every: int = 12,
                  footprint: str = "disc",
                  arc_scale: float = 0.40, arc_max_deg: float = 90.0,
                  arc_probe_deg: float = 40.0,
