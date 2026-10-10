@@ -119,6 +119,8 @@ class FrontierExplorer:
                  shadow_viewpoint_tries: int = 12,
                  lookahead_m: float = 1.20, los_lookahead: bool = True,
                  los_grid: str = "floor",
+                 ahead_clear_use_obstacle_now: bool = True,
+                 backoff_realign: bool = False,
                  wedge_frames: int = 20, wedge_deny_m: float = 0.90,
                  goal_blocked_frames: int = 30,
                  score_quantum_m2: float = 0.25, rank_quantum_m: float = 0.25,
@@ -517,6 +519,45 @@ class FrontierExplorer:
         self.los_grid = str(los_grid)
         self.n_los_shortened = 0        # times the lookahead had to be pulled in
         self.n_frozen_frames = 0        # emitted commands of exactly (0, 0)
+
+        # --- which array the near-field guard reads --------------------------
+        #
+        # `_ahead_clear` and the A* `free_space` were asking "is it drivable"
+        # of two different arrays: the guard read `wmap.blocked()` =
+        # `obstacle | obstacle_now`, A* reads `wmap.ground` = `ground_ever &
+        # ~obstacle`.  So a cell the map had confirmed walkable could veto the
+        # throttle on the strength of **this frame's raw returns alone**, and
+        # `obstacle_now` is exactly the array the simulator's third trap
+        # pollutes (LiDAR origin inside the wall's collision body when the
+        # robot noses a wall).  The disagreement is the entry to the wedge /
+        # backoff oscillation: the robot drives at a cell the map calls free
+        # and the throttle says "blocked".
+        #
+        # `False` drops `obstacle_now`, so the guard and A* read the same
+        # `obstacle` layer.  "Unknown is drivable" is kept -- it has to be, or
+        # the robot never enters unmapped space to explore it.
+        #
+        # Default `True` = the standing behaviour, bit for bit, so the shipped
+        # run is unchanged until this is A/B'd.
+        self.ahead_clear_use_obstacle_now = as_bool(ahead_clear_use_obstacle_now)
+
+        # --- what a backoff turns towards ------------------------------------
+        #
+        # The standing rule flips the turn sign every time a backoff starts
+        # (`_backoff_sign = -_backoff_sign`).  In corner geometry -- reverse a
+        # little, turn left, forward, blocked, reverse, turn *right*, forward,
+        # blocked -- that is a two-step that never resolves, and it is what
+        # held the `out_sim_final` robot oscillating in (-6.0, -3.5) for 21.7 s
+        # of its 287 s (docs/仿真退化归因_第二轮_...md section 2).
+        #
+        # `True` turns towards the side the heading error already asks for
+        # (`1.0 if err > 0 else -1.0`), so the backoff is spent *re-aiming at
+        # the path* instead of alternating.  It only touches `command()`; the
+        # target-less `_recovery` path has no aim and therefore no error to
+        # sign against (see the note there).
+        #
+        # Default `False` = the standing behaviour.
+        self.backoff_realign = as_bool(backoff_realign)
 
         # --- the wedge: aligned with the aim, and the aim is blocked ---------
         #
@@ -4995,7 +5036,28 @@ class FrontierExplorer:
         return not bool(wmap.blocked()[cy[ok], cx[ok]].any())
 
     def _ahead_clear(self, wmap, x, y, yaw) -> bool:
-        """Is the corridor straight ahead free for `front_stop` metres?"""
+        """Is the corridor straight ahead free for `front_stop` metres?
+
+        Two arrays can answer this, and they are not the same question:
+
+          * `wmap.blocked()` = `obstacle | obstacle_now` -- the map's confirmed
+            layer **plus this frame's raw returns** (the standing default);
+          * `wmap.obstacle` -- the confirmed layer alone.
+
+        `obstacle_now` is single-frame raw data, and on the simulator the LiDAR
+        origin drops inside the wall's collision body when the robot noses a
+        wall (the third official trap), so this array goes dirty in bursts.
+        A* plans on `wmap.ground` = `ground_ever & ~obstacle`, i.e. the
+        *confirmed* layer -- so asking the near-field guard about `blocked()`
+        lets a raw echo veto a cell the planner has already deemed drivable.
+        That mismatch is the entry to the wedge/backoff oscillation.
+        `ahead_clear_use_obstacle_now=False` makes both read `obstacle`.
+
+        Note this deliberately does **not** switch to `free_space`: the eroded
+        planner grid has no cells near a wall or the rim of the unknown, so
+        using it here would make the robot refuse to enter unmapped space and
+        kill exploration outright.
+        """
         steps = max(int(self.front_stop / self.clearance_step), 2)
         d = np.arange(1, steps + 1) * self.clearance_step
         xs = x + np.cos(yaw) * d
@@ -5006,9 +5068,13 @@ class FrontierExplorer:
             # off the edge of the map: treat unobserved as "not yet proven
             # blocked", which is the same convention the frontier search uses
             return True
-        # `blocked()`, not `obstacle`: the map layer needs two frames before it
-        # believes a cell is blocked, and "I can see it right now" must not wait.
-        return not bool(wmap.blocked()[cy[known], cx[known]].any())
+        if self.ahead_clear_use_obstacle_now:
+            # `blocked()`, not `obstacle`: the map layer needs two frames before
+            # it believes a cell is blocked, and "I can see it right now" must
+            # not wait.
+            return not bool(wmap.blocked()[cy[known], cx[known]].any())
+        # the A/B arm: same `obstacle` array the planner plans on
+        return not bool(wmap.obstacle[cy[known], cx[known]].any())
 
     def command(self, wmap, pose_xy: Tuple[float, float],
                 yaw: float,
@@ -5659,14 +5725,10 @@ class FrontierExplorer:
             if mode == "wedge":
                 self.n_wedge_frames += 1
                 if self._backoff <= 0:
-                    self._backoff = self.backoff_frames
-                    self._backoff_sign = -self._backoff_sign
-                    self.n_backoffs += 1
+                    self._start_backoff(err)
             elif self._n_turn > self.max_turn_frames and self._backoff <= 0:
-                self._backoff = self.backoff_frames
-                self._backoff_sign = -self._backoff_sign
+                self._start_backoff(err)
                 self._n_turn = 0
-                self.n_backoffs += 1
 
             d_now = float(np.hypot(tx - x0, ty - y0))
             if d_now < self._block_best - self.progress_eps_m:
@@ -5711,14 +5773,36 @@ class FrontierExplorer:
 
         return v, w, info
 
+    def _start_backoff(self, err: float = None) -> None:
+        """Begin one backoff, and choose which way it turns.
+
+        The standing rule flips the sign on every backoff (`-_backoff_sign`).
+        With `backoff_realign` set and an `err` to speak of, it instead turns
+        towards the side the aim already asks for, so a backoff spends its
+        frames re-aiming at the path rather than alternating left/right --
+        the two-step that cannot resolve in corner geometry.
+
+        `err` is the current heading error in radians, or `None` where the
+        caller has no aim: the target-less search branch (`_recovery`) is
+        turning to *find* something, so there is no error to sign against and
+        alternating stays.
+        """
+        self._backoff = self.backoff_frames
+        if self.backoff_realign and err is not None and abs(err) > 1e-9:
+            self._backoff_sign = 1.0 if err > 0 else -1.0
+        else:
+            self._backoff_sign = -self._backoff_sign
+        self.n_backoffs += 1
+
     def _recovery(self, info):
         """Common stuck handling for the `search` branch; None -> carry on."""
         self._n_turn += 1
         if self._n_turn > self.max_turn_frames and self._backoff <= 0:
-            self._backoff = self.backoff_frames
-            self._backoff_sign = -self._backoff_sign
+            # no aim here -- `_recovery` runs while *looking* for a target, so
+            # it has no heading error to sign the turn against; the sign keeps
+            # alternating (see `_start_backoff`).
+            self._start_backoff(None)
             self._n_turn = 0
-            self.n_backoffs += 1
         if self._backoff > 0:
             self._backoff -= 1
             self.state = "backoff"

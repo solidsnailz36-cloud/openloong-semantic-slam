@@ -133,6 +133,17 @@ def parse_args():
                          "and therefore deletes corner cells the robot fits in "
                          "(-- `PathPlanner.footprint`).  Passing `square` "
                          "reproduces every pre-2026-10-11 run bit for bit")
+    ap.add_argument("--robot-radius", type=float, default=0.19, metavar="M",
+                    help="the disc the walkable grid is eroded by -- the robot's "
+                         "circumscribed radius, not its half-width.  0.19 is the "
+                         "historical value and is about the KUKA youBot's "
+                         "half-width (0.178); a disc kernel wants the "
+                         "circumscribed 0.29 (base 0.57 x 0.36 m).  This one "
+                         "number feeds BOTH the explorer's planner and the "
+                         "`summary['reach']` note, so the two cannot describe "
+                         "different robots.  Default 0.19 keeps the shipped run "
+                         "bit-for-bit; `--explore-set robot_radius=...` still "
+                         "wins over it, exactly as with `--footprint`")
     ap.add_argument("--voxel", type=float, default=None, metavar="M",
                     help="override runtime.voxel_size (the KISS-ICP map voxel). "
                          "Left at None so the default run is bit-for-bit the "
@@ -932,6 +943,11 @@ def main():
           % ("ON -- full-scene clusters, unnamed ones become 'unclassified "
              "object'" if a.instance_layer
              else "off (only 2D-detected objects reach the map)"))
+    # The robot's width, decided once.  `--explore-set robot_radius=...` still
+    # wins over `--robot-radius` (the same collision the footprint flag has),
+    # and whatever wins also feeds the reachability note far below, so the
+    # planner and the report can never describe two different robots.
+    eff_robot_radius = float(a.robot_radius)
     if a.explore:
         if a.npz:
             raise SystemExit("--explore needs a live source (nothing to drive in --npz mode)")
@@ -941,11 +957,15 @@ def main():
         # only when the flag was left at its default.
         if "footprint" not in _ovr:
             _ovr = dict(_ovr, footprint=a.footprint)
+        if "robot_radius" not in _ovr:
+            _ovr = dict(_ovr, robot_radius=a.robot_radius)
+        eff_robot_radius = float(_ovr["robot_radius"])
         explorer = FrontierExplorer(v_max=a.v_max, w_max=a.w_max,
                                     sweep=not a.no_sweep,
                                     **_ovr)
         print("explore     : frontier policy  v_max=%.2f m/s  w_max=%.2f rad/s  "
-              "sweep=%s" % (a.v_max, a.w_max, not a.no_sweep))
+              "sweep=%s  robot_r=%.3f m"
+              % (a.v_max, a.w_max, not a.no_sweep, eff_robot_radius))
         for k, val in _explore_overrides(a.explore_set).items():
             print("  override  : %s = %r" % (k, val))
         if a.obstacle_topo_fuse is not None:
@@ -1692,16 +1712,17 @@ def main():
     # reachable, i.e. quoting the first number as "area covered" overstates the
     # run by a factor of two.  Both are reported so the claim can be checked.
     reach_note = None
-    # 0.19, at boss's direction (2026-10-04).  NOTE: the *radius* is a no-op as
-    # things stand -- `free_space` quantises the erosion kernel with
-    # `round(2*r/res)|1`, so 0.19 and 0.22 both give 5x5, and the only radius
-    # that moves anything is <= 0.15 (3x3, i.e. clearance 0.2 m -> 0.1 m).
-    # What *is* a lever is the kernel's **shape** (`--footprint`): a 5x5 square
-    # reaches 0.283 m on the diagonal where the robot's radius is 0.19 m, so it
-    # deletes corner cells the robot fits in.
-    # Kept in step with the explorer so the reachability note and the planner do
-    # not describe different robots.
-    reach_radius = 0.19            # FrontierExplorer's default robot radius
+    # The radius is a real lever again under the `disc` kernel (the default
+    # since 2026-10-11).  `footprint_kernel` builds the deleted offsets from
+    # `res * hypot(max(|a|-0.5, 0), max(|b|-0.5, 0)) < r` rather than
+    # quantising a `(2k+1)^2` box, so 0.19 / 0.25 / 0.30 give three *different*
+    # masks (measured on the sim's final map: 17868 / 17647 / 16061 free cells).
+    # The note that used to live here -- "the radius is a no-op, only <= 0.15
+    # moves anything" -- described the **square** kernel and is wrong for the
+    # shipped default; it was still sending readers to the wrong lever.
+    # This is not a second copy of the explorer's value: `eff_robot_radius` was
+    # resolved above and is the same number the planner was built with.
+    reach_radius = eff_robot_radius
     try:
         from r2slam.nav import PathPlanner as _PP
         _pl = _PP(robot_radius=reach_radius, close_px=5,

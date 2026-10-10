@@ -2080,13 +2080,111 @@ def main():
         if e32n.n_gate_all_bad == 0:
             fails.append("an arm where nothing was routable did not report it")
 
+    # ---- 33. the near-field guard's array (`ahead_clear_use_obstacle_now`) ---
+    # `_ahead_clear` and A*'s `free_space` must be asking the *same* array.  The
+    # standing guard reads `blocked()` = `obstacle | obstacle_now`, so a cell the
+    # map has NOT believed blocked (one vote behind it) can still veto the
+    # throttle -- and `obstacle_now` is the array the simulator's third trap
+    # pollutes.  This case builds exactly that cell: one flag in `obstacle_now`,
+    # nothing in `obstacle`.
+    w33 = world()
+    e33_def = FrontierExplorer(sweep=False)
+    e33_arm = FrontierExplorer(sweep=False, ahead_clear_use_obstacle_now=False)
+    if e33_def.ahead_clear_use_obstacle_now is not True:
+        fails.append("`ahead_clear_use_obstacle_now` does not default to the "
+                     "standing `blocked()` array")
+    if e33_arm.ahead_clear_use_obstacle_now is not False:
+        fails.append("`ahead_clear_use_obstacle_now=False` did not take")
+    cx33, cy33 = w33.cell_of(np.array([0.5]), np.array([0.0]))
+    w33.obstacle_now = np.zeros_like(w33.obstacle)
+    w33.obstacle_now[cy33[0], cx33[0]] = True
+    a33_def = e33_def._ahead_clear(w33, 0.0, 0.0, 0.0)
+    a33_arm = e33_arm._ahead_clear(w33, 0.0, 0.0, 0.0)
+    print("33) one-vote cell 0.5 m ahead: default clear=%s (blocked()=%s) | "
+          "arm clear=%s (obstacle=%s)"
+          % (a33_def, bool(w33.blocked()[cy33[0], cx33[0]]),
+             a33_arm, bool(w33.obstacle[cy33[0], cx33[0]])))
+    if a33_def is not False:
+        fails.append("the default guard ignored a raw `obstacle_now` return")
+    if a33_arm is not True:
+        fails.append("the arm did not stop reading `obstacle_now`: a raw echo "
+                     "still vetoed a cell the confirmed obstacle layer calls free")
+    # ... and it must not be a blanket "always clear": a *confirmed* obstacle
+    # still blocks in the arm.
+    w33b = world()
+    w33b.obstacle_now = np.zeros_like(w33b.obstacle)
+    w33b.obstacle[cy33[0], cx33[0]] = True
+    if e33_arm._ahead_clear(w33b, 0.0, 0.0, 0.0) is not False:
+        fails.append("the arm drove into a *confirmed* obstacle: it is not just "
+                     "`return True`")
+
+    # ---- 34. the backoff turn sign (`backoff_realign`) ----------------------
+    # Standing rule: flip the sign on every backoff -> left, then right, then
+    # left in a corner, which is the two-step that cannot resolve.  The arm
+    # turns towards the side the heading error already asks for.  The fixture
+    # holds the pose fixed, so `err` has a constant sign and the two arms must
+    # differ *in kind*: alternating vs constant.
+    w34 = world()
+    e34_off = FrontierExplorer(max_turn_frames=10, backoff_frames=5, sweep=False)
+    e34_on = FrontierExplorer(max_turn_frames=10, backoff_frames=5, sweep=False,
+                              backoff_realign=True)
+    if e34_off.backoff_realign is not False or e34_on.backoff_realign is not True:
+        fails.append("`backoff_realign` did not take its default / arm value")
+
+    def _backoff_ws(ex, n=80):
+        out = []
+        for _ in range(n):
+            _v, om, info = ex.command(w34, (0.0, 0.0), np.pi)
+            if info["state"] == "backoff":
+                out.append(round(float(om), 3))
+        return out
+
+    ws_off, ws_on = _backoff_ws(e34_off), _backoff_ws(e34_on)
+    print("34) backoff w values: default %s | realign %s"
+          % (sorted(set(ws_off)), sorted(set(ws_on))))
+    if len(set(ws_off)) != 2:
+        fails.append("the default backoff did not alternate its turn sign "
+                     "(distinct w = %s)" % sorted(set(ws_off)))
+    if not ws_on or len(set(ws_on)) != 1:
+        fails.append("the realign arm did not hold one turn sign (distinct w = "
+                     "%s)" % sorted(set(ws_on)))
+
+    # ---- 35. the radius IS a lever under `disc` (a note said it was not) -----
+    # `online_pipeline.py` used to carry "the radius is a no-op ... 0.19 and 0.22
+    # both give 5x5".  That was true of the **square** kernel; `footprint_kernel`
+    # builds the disc from the metric and the two do differ.  Guard the fix.
+    from r2slam.nav import PathPlanner as _PP35
+
+    def _k(r, fp="disc"):
+        return int(_PP35(robot_radius=r, footprint=fp).footprint_kernel(0.1).sum())
+
+    d19, d22, d25, d30 = _k(0.19), _k(0.22), _k(0.25), _k(0.30)
+    s19, s22 = _k(0.19, "square"), _k(0.22, "square")
+    print("35) kernel cells: disc r=.19/.22/.25/.30 = %d/%d/%d/%d | "
+          "square r=.19/.22 = %d/%d" % (d19, d22, d25, d30, s19, s22))
+    if d19 != 21:
+        fails.append("disc r=0.19 is %d cells, expected 21 (5x5 minus corners)"
+                     % d19)
+    if not (d22 > d19):
+        fails.append("disc r=0.19 and r=0.22 give the same mask (%d/%d): the "
+                     "radius still looks like a no-op" % (d19, d22))
+    if not (d30 > d25 > d19):
+        fails.append("disc kernel does not grow with the radius: %d/%d/%d"
+                     % (d19, d25, d30))
+    if not (s19 == s22 == 25):
+        fails.append("square r=0.19/0.22 are %d/%d, expected 5x5=25 each (the "
+                     "kernel the stale note described)" % (s19, s22))
+    # and the value the CLI would pass reaches the planner
+    if float(_PP35(robot_radius=0.25, footprint="disc").robot_radius) != 0.25:
+        fails.append("PathPlanner did not keep the radius it was built with")
+
     print()
     if fails:
         for f in fails:
             print("  FAIL: %s" % f)
         print("verdict: FAILED (%d)" % len(fails))
         return 1
-    print("verdict: PASS (32 checks)")
+    print("verdict: PASS (35 checks)")
     return 0
 
 
