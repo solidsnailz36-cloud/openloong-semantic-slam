@@ -48,6 +48,17 @@ PKG_PATHS=(
   "r2slam/tf_out.py"
   "r2slam/config.py"
   "r2slam/heading.py"
+  # `frames.py` carries the `imu` field and `sources/bag_ros2.py` is what fills
+  # it.  Neither was on this list before, because neither had changed since the
+  # container was seeded -- and a stale `Frame` without the field does not
+  # degrade quietly, it raises `AttributeError` inside the deskew call on the
+  # first frame.  Listing them costs one line and removes the whole class of
+  # "the container is running last week's dataclass".
+  "r2slam/frames.py"
+  "r2slam/sources/__init__.py"
+  "r2slam/sources/base.py"
+  "r2slam/sources/bag_ros2.py"
+  "r2slam/sources/sim_ros1.py"
   "r2slam/deskew.py"
   "r2slam/camera.py"
   "r2slam/odometry.py"

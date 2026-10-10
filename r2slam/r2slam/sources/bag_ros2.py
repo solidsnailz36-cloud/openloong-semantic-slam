@@ -91,11 +91,19 @@ class BagRos2Source(FrameSource):
         self._ts = None
         self._img_topic = cfg.image_topic
         self._cloud_topic = cfg.lidar.topic
+        self._imu_topic = cfg.imu.topic if cfg.imu else None
         self._root = None
         self.n_header_stamp = 0      # frames stamped from the sensor
         self.n_bag_time = 0          # frames that had to use the write time
         self.n_paired = 0            # frames that got an image
         self.n_unpaired = 0          # frames that did not
+        # IMU, when the config names a topic.  Held in a short ring because only
+        # the samples covering the *current* sweep are ever wanted: at 400 Hz
+        # that is ~38 of them, and the ring is 0.5 s so a frame that arrives
+        # late still finds its own history.
+        self._imu = deque(maxlen=200)
+        self.n_imu = 0               # IMU messages seen
+        self.n_imu_attached = 0      # frames that got a usable IMU window
 
     # ---------------------------------------------------------------- setup
     def _open(self):
@@ -144,6 +152,37 @@ class BagRos2Source(FrameSource):
         f.meta["frame_id"] = msg.header.frame_id
         return f
 
+    def _decode_imu(self, msg, stamp: float) -> np.ndarray:
+        """One IMU sample as `[t, gx, gy, gz, ax, ay, az]`.
+
+        The gyro is what deskew consumes; the accelerometer is carried because a
+        stream one cannot sanity-check is a stream one cannot trust, and `|a|`
+        should sit at 9.81.  `orientation` is not read: this rig publishes it as
+        all-zero with w=1 (see `ImuSpec`).
+        """
+        g = msg.angular_velocity
+        a = msg.linear_acceleration
+        return np.array([stamp, g.x, g.y, g.z, a.x, a.y, a.z], dtype=np.float64)
+
+    def _imu_window(self, stamp: float) -> Optional[np.ndarray]:
+        """The IMU samples covering this frame's sweep, or None.
+
+        `window_s` back from the stamp plus a small look forward, because the
+        recorder writes in bursts and a sample belonging to this sweep can be
+        written a few milliseconds after the cloud it belongs to.  Two samples
+        is the floor: one alone gives no interval to integrate over, and
+        handing back a single row would produce a silent zero correction rather
+        than an honest "no IMU here".
+        """
+        if not self._imu:
+            return None
+        w = self.cfg.imu.window_s
+        rows = [r for r in self._imu if (stamp - w) <= r[0] <= (stamp + 0.05)]
+        if len(rows) < 2:
+            return None
+        rows.sort(key=lambda r: r[0])
+        return np.asarray(rows, dtype=np.float64)
+
     def iter_frames(self, limit: Optional[int] = None,
                     start_at: Optional[float] = None) -> Iterator[Frame]:
         if self._reader is None:
@@ -173,6 +212,10 @@ class BagRos2Source(FrameSource):
             if best > tol:
                 pick, pick_stamp = None, None
             f = self._decode_cloud(pmsg, pstamp)
+            imu = self._imu_window(pstamp)
+            if imu is not None:
+                f.imu = imu
+                self.n_imu_attached += 1
             if pick is not None:
                 f.image = pick
                 f.meta["sync_dt"] = round(pstamp - pick_stamp, 4)
@@ -193,7 +236,14 @@ class BagRos2Source(FrameSource):
 
         for conn, t, raw in self._reader.messages():
             bag_time = t * 1e-9
-            if conn.topic == self._img_topic:
+            if self._imu_topic and conn.topic == self._imu_topic:
+                m = self._ts.deserialize_cdr(raw, conn.msgtype)
+                hs = _header_stamp(m)
+                stamp = bag_time if hs is None else hs
+                if start_at is None or stamp >= start_at:
+                    self._imu.append(self._decode_imu(m, stamp))
+                    self.n_imu += 1
+            elif conn.topic == self._img_topic:
                 m = self._ts.deserialize_cdr(raw, conn.msgtype)
                 stamp = stamp_of(m, bag_time)
                 if start_at is not None and stamp < start_at:

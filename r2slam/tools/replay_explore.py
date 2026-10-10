@@ -135,6 +135,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
     ap.add_argument("--config", default="config/sim_house.yaml")
+    ap.add_argument("--imu-deskew", action="store_true",
+                    help="same switch as `online_pipeline.py`: take the in-frame "
+                         "rotation from the gyro.  Kept here too so the two "
+                         "tools cannot disagree about how a frame was deskewed "
+                         "-- a diagnostic that silently runs the other arm is "
+                         "how a whole round gets mis-attributed.")
     ap.add_argument("--out", default=None, help="write per-frame decisions here")
     ap.add_argument("--dump-patches", default=None,
                     help="per patch, the representative place each candidate "
@@ -374,7 +380,13 @@ def main():
     kiss = make_odometry(rt)
     deskewer = Deskewer(enabled=bool(cfg.lidar.deskew), sign=cfg.lidar.deskew_sign,
                         period=(1.0 / cfg.lidar.nominal_hz
-                                if cfg.lidar.nominal_hz else None))
+                                if cfg.lidar.nominal_hz else None),
+                        use_imu=bool(a.imu_deskew),
+                        R_imu_to_lidar=(cfg.imu.R if cfg.imu else None))
+    if a.imu_deskew:
+        if cfg.imu is None:
+            raise SystemExit("--imu-deskew needs an `imu:` block in %s" % a.config)
+        print("deskew rot  : gyro %s @ %.0f Hz" % (cfg.imu.topic, cfg.imu.rate_hz))
     wmap = WorldMap(resolution=rt.map_resolution, extent=rt.map_extent,
                     voxel=rt.pcd_voxel)
     if a.map_min_points is not None:
@@ -656,7 +668,7 @@ def main():
         prev_stamp = fr.stamp
         n += 1
 
-        cloud = deskewer.apply(fr.cloud, fr.t_offset)
+        cloud = deskewer.apply(fr.cloud, fr.t_offset, fr.imu, fr.stamp)
         rng = np.linalg.norm(cloud, axis=1)
         reg_in = cloud[(rng >= rt.min_range) & (rng <= rt.max_range)]
         T = register(kiss, reg_in)

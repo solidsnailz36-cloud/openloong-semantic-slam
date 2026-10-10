@@ -143,6 +143,55 @@ class LidarSpec:
 
 
 # --------------------------------------------------------------------------
+# imu
+# --------------------------------------------------------------------------
+@dataclass
+class ImuSpec:
+    """The gyro/accelerometer stream, when the recording carries one.
+
+    Used for exactly one thing: **the rotation half of the in-frame motion
+    compensation**.  `deskew.py` otherwise has to guess that rotation by
+    extrapolating the previous frame's pose difference, and on this bag that
+    guess is wrong by about as much as the quantity it is correcting --
+    measured over 1426 frames, the constant-velocity estimate differs from the
+    gyro integral by 0.21 deg at the median and 0.46 deg at p90, against a
+    per-sweep rotation of only 0.23 deg.  At 5 m that is 1.8 cm of point error
+    at the median, at 10 m it is 3.6 cm.
+
+    Rotation only -- translation needs a double integration and drifts, so it
+    keeps coming from the odometry.  That split is what LIO-SAM / R3LIVE /
+    FAST-LIVO2 do as well: the IMU is trusted for what it measures directly
+    (rate) and not for what it would have to infer twice.
+
+    `orientation` is deliberately NOT a field here.  This rig publishes it, and
+    it is all-zero with w=1 -- i.e. present, self-consistent and meaningless.
+    Field presence is not field validity, the same trap as the simulator's
+    all-zero LiDAR `time` column.
+    """
+
+    topic: str = ""
+    rate_hz: float = 0.0
+    # Rotation from the IMU frame into the LiDAR frame, row-major 3x3.  Identity
+    # on this rig: `calib.yaml` publishes `LiDAR2IMU_0` as an identity rotation
+    # plus a 21.7 cm translation, so the gyro already turns with the scanner.
+    # Written out rather than assumed, because a wrong value here silently
+    # rotates every deskew correction and shows up only as a slightly worse
+    # scan -- there is no crash and no obvious symptom.
+    R_imu_to_lidar: List[float] = field(
+        default_factory=lambda: [1.0, 0.0, 0.0,
+                                 0.0, 1.0, 0.0,
+                                 0.0, 0.0, 1.0])
+    # How much IMU history to attach to each frame.  The real sweep is 94 ms;
+    # 0.20 s leaves room for a jittery stamp without reaching back into the
+    # interval of the frame before last.
+    window_s: float = 0.20
+
+    @property
+    def R(self) -> np.ndarray:
+        return np.asarray(self.R_imu_to_lidar, dtype=np.float64).reshape(3, 3)
+
+
+# --------------------------------------------------------------------------
 # runtime -- the per-frame budget knobs
 # --------------------------------------------------------------------------
 @dataclass
@@ -216,6 +265,7 @@ class SourceConfig:
     kind: str                       # "bag_ros2" | "sim_ros1"
     camera: CameraModel
     lidar: LidarSpec
+    imu: Optional[ImuSpec] = None
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     image_topic: Optional[str] = None
     camera_info_topic: Optional[str] = None
@@ -234,6 +284,13 @@ class SourceConfig:
             "lidar       : %s  %s pts @ %.1f Hz  deskew=%s"
             % (self.lidar.topic, self.lidar.expected_points,
                self.lidar.nominal_hz, self.lidar.deskew),
+            ("imu         : %s @ %.0f Hz  window %.2f s  %s"
+             % (self.imu.topic, self.imu.rate_hz, self.imu.window_s,
+                "identity rotation (shares the LiDAR attitude)"
+                if np.allclose(self.imu.R, np.eye(3))
+                else "rotated into the LiDAR frame")
+             if self.imu else
+             "imu         : none (deskew falls back to constant velocity)"),
             "extrinsics  : |t| = %.4f m  -> Tcl" % np.linalg.norm(self.Tcl[:3, 3]),
             self.runtime.describe(),
         ]
@@ -284,11 +341,13 @@ def load_config(path: str) -> SourceConfig:
     # diverging copy of this file.
     bag_path = os.environ.get("R2SLAM_BAG_PATH") or raw.get("path")
 
+    imu_raw = raw.get("imu")
     return SourceConfig(
         name=raw["name"],
         kind=raw["kind"],
         camera=_camera_from_dict(raw["camera"]),
         lidar=LidarSpec(**raw.get("lidar", {})),
+        imu=(ImuSpec(**imu_raw) if imu_raw else None),
         runtime=RuntimeConfig(**raw.get("runtime", {})),
         image_topic=raw.get("image_topic"),
         camera_info_topic=raw.get("camera_info_topic"),

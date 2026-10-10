@@ -143,6 +143,14 @@ def parse_args():
                          "way.  See docs/行为评测_20261007.md section 3.")
     ap.add_argument("--no-deskew", action="store_true",
                     help="A/B switch: skip motion compensation even if the config asks for it")
+    ap.add_argument("--imu-deskew", action="store_true",
+                    help="A/B switch: take the in-frame ROTATION from the "
+                         "gyro (400 Hz, no gaps on r2) instead of extrapolating "
+                         "it from the previous pose pair.  Translation keeps "
+                         "coming from the odometry either way.  Needs the "
+                         "config's `imu:` block, and needs each frame to carry "
+                         "its IMU window -- the bag source attaches it, and so "
+                         "does an .npz dump, so this works in replay too.")
     ap.add_argument("--no-detect", action="store_true",
                     help="geometry only; useful for a fast end-to-end smoke test")
     ap.add_argument("--person-only", action="store_true",
@@ -379,6 +387,12 @@ def dump_frame(fr, out_dir, index, extra=None):
          "cloud": np.asarray(fr.cloud, dtype=np.float32)}
     if fr.t_offset is not None:
         d["t_offset"] = np.asarray(fr.t_offset, dtype=np.float32)
+    if fr.imu is not None and len(fr.imu):
+        # (K, 7) float64.  A whole 130 s recording at 400 Hz is 55k rows, but
+        # this is one frame's 0.2 s window: ~80 rows, a couple of kB.  Stored
+        # with the frame so a replay is the *same* experiment as the live run
+        # rather than a different one that happens to share a detector.
+        d["imu"] = np.asarray(fr.imu, dtype=np.float64)
     if fr.image is not None:
         ok, buf = cv2.imencode(".png", fr.image)
         if ok:
@@ -397,6 +411,8 @@ def frames_from_npz(d, limit=0):
         f = Frame(stamp=float(z["stamp"]), cloud=z["cloud"].astype(np.float32))
         if "t_offset" in z and z["t_offset"].size:
             f.t_offset = z["t_offset"].astype(np.float32)
+        if "imu" in z and z["imu"].size:
+            f.imu = z["imu"].astype(np.float64)
         if "image" in z and z["image"].size:                 # raw array
             f.image = z["image"].astype(np.uint8)
         elif "image_png" in z and z["image_png"].size:        # encoded
@@ -530,12 +546,20 @@ def main():
     deskewer = Deskewer(enabled=bool(cfg.lidar.deskew) and not a.no_deskew,
                         sign=cfg.lidar.deskew_sign,
                         period=(1.0 / cfg.lidar.nominal_hz
-                                if cfg.lidar.nominal_hz else None))
+                                if cfg.lidar.nominal_hz else None),
+                        use_imu=bool(a.imu_deskew),
+                        R_imu_to_lidar=(cfg.imu.R if cfg.imu else None))
     print("deskew      : %s (config asks: %s, offsets from: %s, sign %+g, "
           "period guard %.3f s)"
           % ("on" if deskewer.enabled else "off", cfg.lidar.deskew,
              cfg.lidar.time_offsets_from, deskewer.sign,
              deskewer.period or 0.0))
+    if a.imu_deskew:
+        if cfg.imu is None:
+            raise SystemExit("--imu-deskew needs an `imu:` block in %s"
+                             % a.config)
+        print("deskew rot  : gyro %s @ %.0f Hz (rotation from IMU, translation "
+              "from odometry)" % (cfg.imu.topic, cfg.imu.rate_hz))
 
     if a.obstacle_ground_ratio is not None:
         _worldmap.OBSTACLE_GROUND_RATIO = float(a.obstacle_ground_ratio)
@@ -731,7 +755,7 @@ def main():
             t_ingest = time.perf_counter()
 
             # ---------------- deskew ----------------
-            cloud = deskewer.apply(fr.cloud, fr.t_offset)
+            cloud = deskewer.apply(fr.cloud, fr.t_offset, fr.imu, fr.stamp)
             t_deskew = time.perf_counter()
 
             # ---------------- odometry ----------------
@@ -1380,7 +1404,11 @@ def main():
         "wall_s": round(time.time() - t_run, 1),
         "deskew": {"enabled": bool(deskewer.enabled),
                    "applied": int(deskewer.n_applied),
-                   "skipped_bad_dt": int(deskewer.n_skipped_dt)},
+                   "skipped_bad_dt": int(deskewer.n_skipped_dt),
+                   "rotation_from": ("imu " + (cfg.imu.topic if cfg.imu else "?")
+                                     if deskewer.use_imu else "odometry (constant velocity)"),
+                   "imu_rotation_used": int(deskewer.n_imu_used),
+                   "imu_rotation_fallback": int(deskewer.n_imu_fallback)},
         "explore": ({"enabled": True,
                      # Which build produced these numbers.  Every exploration
                      # behaviour is a constructor default, so without this the

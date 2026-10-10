@@ -77,6 +77,36 @@ lidar:
 
 image_topic: /odin1/image
 
+# ---------------------------------------------------------------------------
+# The IMU this bag finally has.  `three1` published `/odin1/imu` in bursts
+# (559 messages, 12 gaps over a second, ~0.67 s of usable data in total), which
+# is why `deskew.py` was written to extrapolate its rotation from the odometry
+# and why the sensor sat unused.  `r2` replaces that with **55,627 samples at
+# 400 Hz, no gaps** -- the organisers' answer to FAQ #5, and FAQ #4 lists point
+# cloud / image / IMU as the permitted inputs, so this is fair game.
+#
+# Measured on this bag: accel mean (-0.12, 0.07, 9.82) m/s^2, i.e. |g| = 9.825
+# with gravity on +Z, and gyro within +-0.29 rad/s.  `orientation` is all-zero
+# with w=1 -- present, self-consistent and meaningless; not read.
+#
+# What it is used for: the **rotation** half of the in-frame deskew.  Rotation
+# only, because the accelerometer would need a double integration and drifts;
+# translation keeps coming from the odometry.  Sampling before/after on 1426
+# frames, the constant-velocity extrapolation is off by 0.21 deg (p50) / 0.46 deg
+# (p90) against a per-sweep rotation of 0.23 deg, so the guess is wrong by about
+# as much as the thing it is correcting.  Simulator: no IMU topic, nothing to do.
+imu:
+  topic: /odin1/imu
+  rate_hz: 400.0
+  # `calib.yaml`'s `LiDAR2IMU_0` is an identity rotation plus a 21.7 cm
+  # translation, i.e. the gyro shares the scanner's attitude.  Spelled out
+  # rather than assumed: a wrong value here silently rotates every deskew
+  # correction, with no crash and no obvious symptom.
+  R_imu_to_lidar: [1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]
+  window_s: 0.20
+
 runtime:
   max_num_threads: 1
   # 0.5, not 1.0 -- measured, see the header note.  With 1.0 the per-metre

@@ -188,8 +188,14 @@ def replay(npz_dir, out_dir, poses_csv=None, resolution=0.10, extent=30.0,
             yaw, px, py = 0.0, 0.0, 0.0
         traj.append((px, py))
         if deskewer is not None and "t_offset" in z.files:
-            cloud = deskewer.apply(raw.astype(np.float32),
-                                   z["t_offset"]).astype(np.float64)
+            # Hand the frame's IMU window through as well: the Deskewer ignores
+            # it unless `use_imu` is set, so this changes nothing today, but it
+            # means a future `--imu-deskew` here cannot silently run the CV path
+            # and produce a ground fit that disagrees with the pipeline's.
+            cloud = deskewer.apply(
+                raw.astype(np.float32), z["t_offset"],
+                z["imu"].astype(np.float64) if "imu" in z.files else None,
+                float(z["stamp"])).astype(np.float64)
             c0, s0 = np.cos(yaw), np.sin(yaw)
             T = np.eye(4)
             T[:3, :3] = ((c0, -s0, 0.0), (s0, c0, 0.0), (0.0, 0.0, 1.0))

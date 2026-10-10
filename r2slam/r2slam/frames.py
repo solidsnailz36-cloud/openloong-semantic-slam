@@ -22,6 +22,13 @@ class Frame:
     t_offset: Optional[np.ndarray] = None         # (N,) float32, seconds
     ring: Optional[np.ndarray] = None             # (N,) int
     image: Optional[np.ndarray] = None            # (H, W, 3) uint8, BGR
+    # (K, 7) float64, the IMU samples covering this frame's sweep:
+    #   t, gx, gy, gz, ax, ay, az      (rad/s, m/s^2, sensor clock seconds)
+    # Sorted by time.  Carried on the frame rather than read from the source by
+    # whoever wants it, so that a replayed capture (an .npz dump, no bag) has
+    # exactly the same IMU the live run had -- the A/B would otherwise be
+    # measuring the presence of the bag, not the use of the gyro.
+    imu: Optional[np.ndarray] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
     # ---- convenience ----
@@ -36,6 +43,10 @@ class Frame:
     @property
     def has_time_offsets(self) -> bool:
         return self.t_offset is not None and float(np.ptp(self.t_offset)) > 0.0
+
+    @property
+    def has_imu(self) -> bool:
+        return self.imu is not None and len(self.imu) >= 2
 
     def finite_mask(self) -> np.ndarray:
         return np.isfinite(self.cloud).all(axis=1)

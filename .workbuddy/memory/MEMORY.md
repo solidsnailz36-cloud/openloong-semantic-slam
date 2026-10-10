@@ -5,7 +5,8 @@
 ## 文档地图
 - **先读**：`docs/交接_20261008_当前状态与后续计划.md`（当前状态 + P0/P1/P2）。
 - **当前主线**：`docs/语义地图朝向与灰斑修复_20261009.md`（§6 渲染↔规划 / §7 靠墙灰带 / §10 OBSTACLE_GROUND_RATIO A/B / §11 3D 检测调研 / §12 边缘算力重排）。
-- 开放词汇：`docs/开放词汇边缘化_第一轮实测_20261009.md`。
+- 开放词汇：`docs/开放词汇边缘化_第一轮实测_20261009.md`（§32–§37 = YOLOE 一轮）。
+- **IMU**：`docs/IMU启用_陀螺仪去斜与航向核对_20261010.md`（§0 结论 / §2 先量 / §5 全量 A/B）。
 - 收线/归因：`docs/B3成本剖析_20261008.md` §11–§13、`docs/漂移归因_20261008.md`。
 - 历史：`docs/HANDOFF_项目交接.md`（初赛；§9 已过时，§5.2 类别表 / §8 限制必读）、`docs/复盘_踩坑手册_小白向.md`、`docs/探索算法_v2_设计与参考.md` §47–§71。
 - ⚠️ 技能 `robot-policy-replay-ab/SKILL.md` 已 187 KB，该按主题拆（未做）。
@@ -14,36 +15,48 @@
 1. **漂移**：真实侧不显著（ATE p50 0.276 m/102 m）；仿真侧＝少数帧被打偏且不恢复，根因＝**官方仿真器航向不可观测（LiDAR 不随车体转）**，非 `heading.py` bug。见 `docs/漂移归因_20261008.md`。
 2. **B3 已收线停投**：成本门 PASS（`ms_map` p90 OFF ≤31.4 / ON ≥94.9 ms，**只看 p90**）；**效果门 FAIL 撤回**（里程 128.90→82.43 m p=0.0047；`plan_failures` ×12.7 ⇒ 规划器在走不通的地图上反复失败）。归因＝成本上界 `max-eval` 语义缺陷；无上界消融跑不完。`OBSTACLE_TOPO_FUSE_M2` 默认 0.0。
 3. **渲染↔规划一致性**（`b0bd756`）：曾有空类（`seen & ~ground & ~obstacle`）被画成障碍 ⇒ 一格两个答案。定论：**`render` 只画 `ground`**（= `free_space` 读的同一数组）。**画面可以有颜色，不能有第二个判据。** 一致性指标＝`summary["map"]["seen_not_classified_cells"]`（**归零即一致**）。★ **2026-10-09 晚：`GROUND_COVER_INFORMATIVE` 已设为默认 `True`**（boss 拍），该指标从 6824 掉到 **1464**。
-4. **靠墙灰带**（`fe9e0a3`）：`ground = ground_ever & ~obstacle` 非单调 ⇒ 障碍 178.4 m² 里 120.9 曾为地面；`OBSTACLE_RELEASE` 永不触发。修法 **`OBSTACLE_GROUND_RATIO=1.0`**（ground 489→549、obstacle 178→118.5 m²）；放掉的 60 m² 里 99.8% 是矛盾格，纯墙 votes≥20 一格没碰。闭环 A/B 仿真 n=3v3 过；**默认已改 1.0**。
-   - **★ 灰斑问答（2026-10-09，boss 问"灰斑又变明显了"）**：**不是回归**。面板两种灰＝`blocked`（障碍，11860 格）＋**`seen, not blocked`（空类）**。他上次看到的灰少那版 `online_real_def` 是 **ratio Gate−1 的对照臂**、**带着 cover 开关**（日志 `ground rule : TOTAL`）⇒ 只剩 1467 格；而当时的默认是关的 ⇒ 6824 格。更早的交付图 `online_real_v6` 空类 = 6466 格。
-   - **★ 已按 boss 要求"把灰少的换进默认"**（`GROUND_COVER_INFORMATIVE = True`；flag 反转为 `--no-ground-cover-informative`，旧拼写**直接报错**不静默）。真实侧全量 1427 帧**背靠背** A/B：**决策 md5 逐位相同**、**41 列 0 差异**、`pose_*`/`yaw_deg`/`ground_*`/`cmd_*`/`objects`/`boxes`/`object_names` **全 0 差异**；**障碍格 11860 一格未动**；灰 **6824→1464（−78.5%）**、可通行 495.3→**548.9 m²**；唯一变的列是 `traversable_m2`。
-   - **★ 更正**：旧记录"`ground` +11% ⇒ `ms_map` **+46%**"**不成立** —— 那对历史产物 `cover_off`/`cover_on` 的 deskew/odom/detect 也涨了 48–57%，**整跑被机器负载污染**。今天背靠背重测：**`ms_map` −6.1% / `ms_total` −3.5%**（与同对其他阶段的抖动同量级）⇒ **代价测不出来**（仍只有 1 对）。
+4. **靠墙灰带**（`fe9e0a3`）：`ground = ground_ever & ~obstacle` 非单调 ⇒ 障碍 178.4 m² 里 120.9 曾为地面。修法 **`OBSTACLE_GROUND_RATIO=1.0`**（ground 489→549、obstacle 178→118.5 m²）；放掉的 60 m² 里 99.8% 是矛盾格，纯墙 votes≥20 一格没碰。闭环 A/B 仿真 n=3v3 过；**默认已改 1.0**。
+   - **★ 灰斑问答**：面板两种灰＝`blocked`（障碍，11860 格）＋ **`seen, not blocked`（空类）**。boss 上次看到的灰少那版 `online_real_def` 是 **ratio Gate−1 的对照臂**、**带着 cover 开关** ⇒ 只剩 1467 格；当时的默认是关的 ⇒ 6824 格。**不是回归。**
+   - **★ 已按 boss 要求"把灰少的换进默认"**：`GROUND_COVER_INFORMATIVE = True`（flag 反转成 `--no-...`，旧拼写**直接报错**）。全量 1427 帧背靠背：**决策 md5 逐位相同、41 列 0 差异**、**障碍格 11860 一格未动**、灰 **6824→1464（−78.5%）**、可通行 495.3→**548.9 m²**；唯一变的列是 `traversable_m2`。
+   - **★ 更正**：旧记录"`ground` +11% ⇒ `ms_map` **+46%**"**不成立**（那对历史产物整跑被机器负载污染，deskew/odom/detect 也涨了 48–57%）。背靠背重测 **`ms_map` −6.1%** ⇒ **代价测不出来**（仍只有 1 对）。
 5. **类别表自定，39 类 / 51 条 prompt**：组委会不给列表 ⇒ `labels.py::_SPECS` 是我们的选择。已追加 13 COCO 类（零推理成本）+ 几何类（`unclassified object` / `railing`）+ 3 个**不在 COCO 80** 的类（38 `fire extinguisher` / 39 `gym equipment` / 40 `humanoid robot`）＋ 15 条别名 prompt。旧 id 全稳定。**"没标出来"= ①词表缺类 ②远处点云稀被 LiDAR 门拒 ③无实例层 ④YOLO 漏小目标**；换 3D 检测器只治 ③④。★ **措辞救不了模型看不见的类**（见索引 8 第五轮）。
 6. **边缘算力是规则要求** ⇒ 顺序重排：① 先拿回预算（render 下关键路径 → 地图层平方律，**都要 A/B 门**；算数代价 p50 170–264 ms vs 5 Hz 预算 200 ms）② 零新模型的免费覆盖（实例层 + 扩词表 + 几何类）③ 需任意类别 → 换检测器 ④ 3D 大模型判死、IGLOSS 降级。**先量逐阶段预算，别加模型。**
 7. **实例层**（`r2slam/instances.py`，默认关）——能力有、**判据被真值证伪**：非地面回波 → BEV 栅格 + `connectedComponents` + `reduceat`，3.7 ms/帧（合成）、p50 9.5 ms（全量）。行为中性已证（决策 md5 与只差这一个开关的跑逐位相同）。真值：家具 16.2% / 真人 19.3% / **只落墙 63.4%** / 空地 0.0% ⇒ **精度 35.9%**；召回 12/22=55%。错误单向（on nothing=0%）⇒ 判据目标＝提高"落家具上"占比、保持"落空地"≈0。**在此之前不再改几何阈值。**
-8. **⑤ 开放词汇 —— 已落地**（全部推导与逐轮数字在 `docs/开放词汇边缘化_第一轮实测_20261009.md` §1–§31，此处只留结论）：
-   - **现状**：默认检测器 = `detect.py::DEFAULT_MODEL_FILE = yoloworld_alias_320.onnx`（**51 类** fp32@320，**opset 19**）。
-   - **唯一能力增量**：`fire extinguisher`（**不在 COCO 80 里**）第一次进地图 —— 25 观测 / 5 实例 / 112 点；`clock`/`handbag` 也有。代价＝320 丢"小且静止"（`suitcase` 98 点 / `bottle` 43 点归零）。
-   - **判死（不再投）**：`gym equipment` / `humanoid robot` 检不到，且**不是措辞问题** —— 15 条别名 + **单类隔离**（`["robot"]` @320 **和** @640 都是零响应）+ **阳性对照**（`["person"]` max 0.816 / 105 框）三条路全 0 ⇒ 只能换文本塔/骨干/检测器家族。
-   - **量化判死**：INT8 在 36 类上无害（0.68 框/帧），在 **51 类上失效**（0.43 vs fp32 0.62）；`--exclude-tail 4/6` 无效、`--per-channel` 多出 `potted plant` 假框 ⇒ **51 类只能 fp32**（fp32 detect p50 61.7 ms ≤ 现役 64.6，**不需要量化**）。
-   - **仪器教训**：`detect_mapped` 只留 **top-1 类** ⇒ 只看 label 计数会把"有响应但没赢"读成"没响应"；必须报 **`max`/`any≥x`/`top1`/`top1@conf`** 四列（`tools/probe_openvocab.py`）。
-   - **确定性门**：同模型重跑决策 md5 逐位相同（yolo26n `9b2b284631d9acb4fb96a22acad1d851`；51 类 `77627ff49e072a912fe686e6611daf33`）。★ 换检测器**只改检测派生列**，位姿/几何列 1427 帧逐位相同。
+8. **⑤ 开放词汇**（推导与逐轮数字：`docs/开放词汇边缘化_第一轮实测_20261009.md` §1–§37）：
+   - 默认检测器 = `detect.py::DEFAULT_MODEL_FILE = yoloworld_alias_320.onnx`（**51 类** fp32@320，**opset 19**）。唯一能力增量 = `fire extinguisher`（不在 COCO 80）进地图；代价＝320 丢"小且静止"。
+   - **判死**：`gym equipment`/`humanoid robot` 检不到且**不是措辞问题**（15 条别名 + 单类隔离 @320/@640 全零 + 阳性对照 `person` 0.816）⇒ 只能换文本塔/骨干/家族。
+   - **量化判死**：INT8 在 36 类无害、**51 类失效**（0.43 vs 0.62）⇒ **只能 fp32**（61.7 ms ≤ 现役 64.6，**不需要量化**）。
+   - **仪器**：`detect_mapped` 只留 **top-1 类** ⇒ 必须报 `max`/`any≥x`/`top1`/`top1@conf` 四列（`tools/probe_openvocab.py`）。
+   - **确定性门**：同模型重跑决策 md5 逐位相同（`77627ff49e072a912fe686e6611daf33`）；换检测器**只改检测派生列**。
    - 旧轮次（`class_map` 接线缺陷 / `_declared_side` / INT8 零检出根因 / q320 对比 / 36→39 类）见 doc §1–§20。新工具 `out/_alias_ab.py`；新技能 `openvocab-detector-attribution`。
 9. **§73**：报覆盖必须同时报 `wall_s` 与 `sim_span`（RTF）。
-10. **★ 改进空间与外部参考**（完整分档与出处：`docs/改进空间评估_20261009.md`）：
-   - **★★ 我们一直喂 CLIP 光秃秃的名词**：本机核实 `ultralytics/nn/tasks.py:1131 get_text_pe` **直接 tokenize 给的字符串、不加模板**。
-     杠杆是真的大（`a photo of a fire extinguisher` **0.942** vs 裸名 **0.563**），**但整表套模板是净回归**
-     （51 类全套 ⇒ 框 124→**386**，而 **`person` 115→3**、`tv` 1→**241**；越具体的描述越糟，`a white robot with a round head` 完全无响应）。
-     ⇒ **形式是杠杆，但不能整表套；要用它必须逐类标定门槛。**
-   - **★★ 最大的结构性缺口＝没有尺子**：真实侧无真值 ⇒ 所有"检出/改善"都是自证的（上面那条就是"数字大涨、地图变烂"的标本）。
-     最小可行：**人工标注 30–50 帧** ⇒ 逐类 P/R + 定位误差 p50/p90；此后一切词表/模板/检测器改动先过它。
-   - **★★ 下一步最值得做的"换武器"：YOLOE**（清华 THU-MIG，ICCV 2025）。三种提示模式：
-     文本 `get_text_pe` / **视觉 `get_visual_pe`（给参照框，不用词）** / **免提示 `set_vocab`（内置 4585 类）**，
-     后两种正好绕开"文本塔看不见我们的词"。**★ 本机 `ultralytics 8.4.172` 已自带 `YOLOE`，三个 API 都在**；
-     接入成本≈换一次检测器（仍需 `--opset 19`）。
+10. **★ 改进空间与外部参考**（出处：`docs/改进空间评估_20261009.md`）：
+   - **★★ 我们喂 CLIP 的是光秃秃的名词**（`nn/tasks.py:1131 get_text_pe` 不加模板）。杠杆大（`a photo of a fire extinguisher` **0.942** vs 裸名 0.563），**但整表套是净回归**（51 类全套 ⇒ 框 124→**386**，`person` 115→**3**）⇒ **形式是杠杆，必须逐类标定门槛。**
+   - **★★ 结构性缺口＝没有尺子**：真实侧无真值 ⇒ 一切"检出/改善"都是自证的。最小可行：**人工标 30–50 帧**。
+   - **★★ YOLOE —— 已试，结论"能力通过、部署不通过"**（doc §32–§37）。
+     **视觉提示真的绕开了文本塔**：同一模型同 20 帧，文本 `robot`/`humanoid robot`/`humanoid` **全 0**，
+     而 **`yoloe-11l-seg` 视觉提示（参照框 = 那台机器人，人眼复核）10/10 命中**；`11s` 只有 9/17（其余是旁边的人）。
+     ★ **收紧参照框无效**（输出逐项相同）⇒ "框画准点"不是杠杆，**骨干容量才是**。
+     ★ **烘焙成立（PyTorch 侧）**：`set_classes(["humanoid robot"], embeddings=vpe)`，vpe 仅 **2.4 kB**，
+     **不给参照图**跑 20 帧 **12/12 命中**（帧 196 置信度 0.74）。
+     ★★ **但 ONNX 导出把类别头丢了**：opset 19 ✓、320 上 58.7 ms / 40.4 MB（都不贵），
+     输出 `(1, 4+nc+32, 2100)`（**seg 头，偏移恒 36 = 4 框 + 32 mask 系数，类在 `[4:4+nc]`**），
+     **类别通道最大 0.016（视觉烤入）/ 0.109（文本），PyTorch 侧同帧是 0.74**；
+     ⚠️ **ultralytics 自己的 ONNX 预测器也是 0 框** ⇒ 不是解码错，是导出图的类头是死的。
+     ⇒ **`detect.py` 只吃 ONNX ⇒ 今天进不了管线。** 免提示模式（4585 类）对 `robot` 也 **0 命中**
+     （`robot` 在表里 idx 3411 —— **"词表里有"≠"模型会输出"**）。新工具 `probe_yoloe.py` / `yoloe_visual_bake.py` / `export_yoloe.py`。
    - 其他参考：ConceptGraphs / OVO / Octree-Graph / DovSG（开放词汇 3D 场景图，**都假设 RGB-D**）；
-     PointPainting / synesthesiaX（2D 语义画到点云，与我们同源）；LVI-SAM·R3LIVE·FAST-LIVO2（**我们有个 400 Hz IMU 完全没用**）。
+     PointPainting / synesthesiaX（2D 语义画到点云，与我们同源）；LVI-SAM·R3LIVE·FAST-LIVO2
+     （**IMU 的那部分已按它们的分工试过，见索引 11**）。
    - **★ 硬事实**：新默认下全帧 `ms_total` p50 **222 ms ＞ 5 Hz 的 200 ms 预算**；扣掉 `render`(58.6) 才 ~163 ms ⇒ **render 必须在关键路径外（一直没做）**。
+
+11. **★★ IMU：已铺通、已验证、量过 —— 去斜没有改善，不采纳**（doc `docs/IMU启用_陀螺仪去斜与航向核对_20261010.md`）。
+   - **为什么以前没用**：`deskew.py` 那条「No IMU（12 gaps >1 s）」是 **`three1` 的事实**，`r2` 换掉了它而注释没换 —— **同一仓库两段注释矛盾一周**。真身：`/odin1/imu` **55,627 条 @ 399.9 Hz、无 gap**；重力在 +Z；`orientation` 全零无效；`LiDAR2IMU_0` = 纯平移 ⇒ 陀螺读数直接可用。
+   - **动机**（整段 SE(3)）：扫描内旋转 CV p50 0.3327° / 陀螺 **0.2290°**；**\|CV−IMU\| p50 0.2053°**（5 m 处 1.79 cm）⇒ **误差与信号同量级**。真值里 **48% 是 roll/pitch**，只取 yaw 会漏一半。
+   - **实现**：`ImuSpec` + `Frame.imu` + `bag_ros2` + npz 带 IMU（**随帧走** ⇒ 回放与实跑同一实验）+ `--imu-deskew`。★ **偏移量先裁剪+取整 1 µs 再给陀螺求值**（否则两臂差 `ω×1µs`）；**窗口不够返回 `None` 回落 CV，绝不返回部分积分**，`Deskewer` 分计 used/fallback。`test_deskew.py` 21 项。
+   - **★★ A/B**（1427 帧、唯一变量、IMU 用了 **1425/1425 帧 0 回落**）：**ATE p50 0.276→0.300 变差**、RPE max 0.460→**0.762**，只有 RPE p50 0.145→0.122 变好。⇒ **改了行为（12/41 列），方向不是更好；默认仍关。**
+   - **为什么**：① 逐轴相关 **z 0.986** 但 **x 0.45 / y 0.47（比例 0.22）** ⇒ 偏航一致，**roll/pitch 差 4.5 倍且不相关**。② **陀螺零偏没去**（全程均值 x −0.28 / y −0.60 deg/s，积分得 −83° 俯仰 ⇒ 是零偏；单次扫描注入 0.026°/0.056°，约占待修量 1/4）。★ **LIO-SAM/R3LIVE/FAST-LIVO2 都把零偏当状态估计并扣除 —— 这版跳过了。** ⚠️ n=1 对，且在尺子分辨率上读数。
+   - **★ 真收获**：`tools/check_imu_heading.py` = **真实侧第一条独立航向证据**：陀螺 ∫ωz **−354.1°** / 我们 **−363.0°** / 厂商 −361.2°（即我们 +2.5%）。以前只能跟厂商比，那不是独立证据。
 
 ## 渲染（定论）
 - `render()` 只画 `ground`。**画面可以有颜色，不能有第二个真相源。**
@@ -57,7 +70,7 @@
 - 边缘算力是规则要求；类别表组委会不给；**真实侧无真值 ⇒ 任何 mIoU / 识别率都是编的（要敢说"不知道"）。**
 
 ## 环境
-- 仿真＝Docker 容器 `r2sim`；`/work` = `D:/E-Downd/sim_official`；容器内代码 `/work/r2slam_ws`。产物落宿主盘，不必 `docker cp`。**改完必须 `sync_to_container.sh`**。`PKG_PATHS` 是手工白名单，`replay_explore.py` 不在 ⇒ 单独 cp。`out/*.py` 跑法 `cd /work/r2slam_ws && python3 out/xxx.py`。
+- 仿真＝Docker 容器 `r2sim`；`/work` = `D:/E-Downd/sim_official`；容器内代码 `/work/r2slam_ws`。产物落宿主盘，不必 `docker cp`。**改完必须 `sync_to_container.sh`**。`PKG_PATHS` 是手工白名单 —— **2026-10-10 补了 `frames.py` + `sources/*`**（以前不在，改了就是旧 dataclass）；`replay_explore.py` 仍不在 ⇒ 单独 cp。`out/*.py` 跑法 `cd /work/r2slam_ws && python3 out/xxx.py`。
 - **★ 容器运行时**：`python3 3.8.10` / **`onnxruntime 1.16.3`（只保证到 opset 19，20 直接拒收）** / `cv2 5.0.0` / **无 `onnx` 模块**。⇒ **导出模型一律 `--opset 19`**，否则静默回退 cv2。
 - **★ 杀仿真**：容器里跑 **`docker exec r2sim bash /work/killbot.sh`**。⚠️ **`vendor/sim_scripts/kill_sim.sh` 在宿主上跑等于没跑**（它 pkill 的是宿主进程，且照样打印 `[kill_sim] done`）；容器里没有这个文件，`sync_to_container.sh` 也不发它。
 - 只读复算：`export MSYS_NO_PATHCONV=1 && docker exec -i r2sim python3 - <<'EOF'`（漏 `-i` 静默无输出）；**需要 cwd 时用 `docker exec -w /work/r2slam_ws`**（否则 `NoSuchFile` 会被误读成"模型坏了"）。
