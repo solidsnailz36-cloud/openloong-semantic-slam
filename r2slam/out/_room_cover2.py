@@ -57,8 +57,13 @@ RUNS = [("v19_sim", "v19"), ("v19r1_sim", "v19"), ("v19r2_sim", "v19"),
         ("v23r3_sim", "v23 λ=1")]
 
 
-def cover_of(tag):
-    g = os.path.join(HERE, "ab_perception", "grids_" + tag)
+def cover_of(tag, root=None):
+    # `root` is the directory that CONTAINS `grids_<tag>`.  It defaults to the
+    # archive, which is where the published table's snapshots live; a fresh run
+    # dumps its grids wherever it was told to, so it comes in through here
+    # rather than by copying snapshots into the archive (which would silently
+    # change what the archived table is made of).
+    g = os.path.join(root or os.path.join(HERE, "ab_perception"), "grids_" + tag)
     if not os.path.isdir(g):
         return None
     with open(os.path.join(g, "meta.json"), encoding="utf-8") as fh:
@@ -92,13 +97,25 @@ def cover_of(tag):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", default=None)
+    # `RUNS` above is the ARCHIVED list the published table was made with; it
+    # must keep reproducing that table byte-for-byte.  Fresh runs therefore come
+    # in through here instead of being appended above.
+    ap.add_argument("--run", action="append", default=[], metavar="TAG[:ARM]",
+                    help="extra run to score, e.g. `--run subr2_sim:subr2`. "
+                         "Appended after the archived list.")
+    ap.add_argument("--grids-root", default=None, metavar="DIR",
+                    help="directory holding `grids_<tag>` snapshots.  Default "
+                         "is the archive `out/ab_perception`, i.e. the same "
+                         "behaviour as before this flag existed.")
     a = ap.parse_args()
+    runs = list(RUNS) + [(s.partition(":")[0], s.partition(":")[2] or s.partition(":")[0])
+                         for s in a.run]
     all_cov = {}
     arms = {}
     print("%-11s %-9s %s" % ("run", "arm", "   ".join(
         "%-8s" % (n + "(%)") for n, *_ in ROOMS) + "   三房最小"))
-    for tag, arm in RUNS:
-        c = cover_of(tag)
+    for tag, arm in runs:
+        c = cover_of(tag, a.grids_root)
         if c is None:
             print("%-11s %-9s (无归档栅格)" % (tag, arm))
             continue
