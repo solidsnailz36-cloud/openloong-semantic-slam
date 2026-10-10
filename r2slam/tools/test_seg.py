@@ -93,8 +93,9 @@ crop[:5, :5] = True
 inst = {"mask": crop, "mask_box": (100.0, 50.0, 200.0, 150.0),
         "box": (100.0, 50.0, 200.0, 150.0), "score": 0.9, "coco": 0,
         "label": int(L.PERSON)}
-class _Seg:                      # only `mask_cell` is needed here
+class _Seg:                      # only the two mask queries are needed here
     mask_cell = S.OnnxSegDetector.mask_cell
+    mask_cells = staticmethod(S.OnnxSegDetector.mask_cells)
 _s = _Seg()
 ok(_s.mask_cell(inst, 110.0, 60.0, 400, 300), "a point in the lit quadrant is in")
 ok(not _s.mask_cell(inst, 190.0, 60.0, 400, 300),
@@ -109,6 +110,19 @@ full = {"mask": np.ones((4, 4), bool), "mask_box": (10.0, 20.0, 30.0, 40.0),
 ok(all(_s.mask_cell(full, u, v, 400, 300)
        for u, v in ((10, 20), (29.9, 39.9), (20, 30))),
    "a full crop accepts its own corners")
+
+# `mask_cells` (vectorised, used by the fusion) and `mask_cell` (one point) must
+# be the same rule -- `mask_cell` now delegates, and this pins that.  A second
+# implementation of one rule is how a mask and a box end up disagreeing.
+us = np.array([110.0, 190.0, 50.0, 110.0, 120.0])
+vs = np.array([60.0, 60.0, 60.0, 200.0, 70.0])
+mv = S.OnnxSegDetector.mask_cells(inst, us, vs)
+ms = np.array([_s.mask_cell(inst, float(u), float(v), 400, 300)
+               for u, v in zip(us, vs)])
+ok(list(mv) == list(ms), "the vectorised query agrees with the scalar one",
+   "vec %s scalar %s" % (mv.tolist(), ms.tolist()))
+ok(list(mv) == [True, False, False, False, True],
+   "and both say what the hand-built crop says")
 
 
 # ---------------------------------------------------------------- 3. the paint

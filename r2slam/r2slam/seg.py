@@ -246,20 +246,46 @@ class OnnxSegDetector:
     def mask_cell(self, inst: Dict, u: float, v: float, w: int, h: int) -> bool:
         """Is image point `(u, v)` inside `inst`?  `(u, v)` in ORIGINAL pixels.
 
-        This is the only mask query the 3D side needs: project a LiDAR point
-        into the image, ask whether it is inside the instance.  Going through
-        `mask_box` keeps it a lookup in the crop's own frame, so nothing has to
-        be upsampled.
+        One point, one call -- and it **delegates** to `mask_cells` rather than
+        repeating the arithmetic.  A second implementation of the same rule is
+        how the mask and the box end up disagreeing about which pixel is which
+        (the project has the same note on `viz.banner_size`), and this pair
+        would have differed from the first edit: the scalar version clamps the
+        column index twice and the vector one does not.  `w`/`h` are unused
+        (kept so the signature stays; the crop carries its own size).
         """
+        return bool(self.mask_cells(inst, np.array([u], float),
+                                    np.array([v], float))[0])
+
+    @staticmethod
+    def mask_cells(inst: Dict, us: np.ndarray, vs: np.ndarray) -> np.ndarray:
+        """Vectorised `mask_cell` over arrays of image points.
+
+        The fusion calls this once per detection with **every candidate point**,
+        so it has to be an array operation: a Python loop over a few thousand
+        returns per frame costs more than the network it is filtering, which
+        would turn a quality filter into a budget problem.
+
+        No upsampling: the point is mapped into the crop's own frame, which is
+        where the mask lives.
+        """
+        us = np.asarray(us, float).reshape(-1)
+        vs = np.asarray(vs, float).reshape(-1)
         mx0, my0 = inst["mask_box"][0], inst["mask_box"][1]
         mx1, my1 = inst["mask_box"][2], inst["mask_box"][3]
-        if not (mx0 <= u <= mx1 and my0 <= v <= my1):
-            return False
-        iy = int((v - my0) / max(my1 - my0, 1e-6) * inst["mask"].shape[0])
-        ix = int((u - mx0) / max(mx1 - mx0, 1e-6) * inst["mask"].shape[1])
-        iy = min(max(iy, 0), inst["mask"].shape[0] - 1)
-        ix = min(min(max(ix, 0), inst["mask"].shape[1] - 1), inst["mask"].shape[1] - 1)
-        return bool(inst["mask"][iy, ix])
+        m = inst["mask"]
+        out = np.zeros(us.shape, bool)
+        inside = (us >= mx0) & (us <= mx1) & (vs >= my0) & (vs <= my1)
+        if not inside.any():
+            return out
+        iy = ((vs[inside] - my0) / max(my1 - my0, 1e-6)
+              * m.shape[0]).astype(np.int64)
+        ix = ((us[inside] - mx0) / max(mx1 - mx0, 1e-6)
+              * m.shape[1]).astype(np.int64)
+        np.clip(iy, 0, m.shape[0] - 1, out=iy)
+        np.clip(ix, 0, m.shape[1] - 1, out=ix)
+        out[inside] = m[iy, ix]
+        return out
 
 
 def matches_for_label(insts: Sequence[Dict], label: int) -> List[Dict]:

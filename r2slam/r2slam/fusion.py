@@ -155,6 +155,7 @@ def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
               cluster_cell: float = 0.30,
               min_cluster_points: int = 10,
               plane: Optional[GroundPlane] = None,
+              mask_test=None,
               stats: Optional[Dict[str, int]] = None,
               trace: Optional[Dict] = None) -> Optional[Dict]:
     """3D localisation of one detection, in the LiDAR frame.
@@ -190,11 +191,37 @@ def object_3d(cloud: np.ndarray, cfg: SourceConfig, box,
     idx = points_in_box(cloud, cfg, box, pad=pad, yaw=yaw)
     if trace is not None:
         trace["n_in_box"] = int(len(idx))
+    # **The optional segmentation filter.**  Everything from here on used to
+    # treat "inside the box" as "part of the object", and on a real frame a
+    # person's box also contains the floor in front of them, the wall behind
+    # them and whatever the arms do not cover.  A mask answers the actual
+    # question -- is this return on the body -- and it is the one piece of
+    # information a 2D box cannot carry.
+    #
+    # `mask_test` is a callable `(N,3) -> (N,) bool`, built by the caller from
+    # `r2slam/seg.py`'s instance: fusion does not project points and does not
+    # know about masks, so a bug in the projection stays a bug in one place.
+    # Passing `None` (the default) skips the block entirely, which is what keeps
+    # the shipping path byte-identical.
+    if mask_test is not None and len(idx):
+        keep = np.asarray(mask_test(cloud[idx]), bool)
+        if trace is not None:
+            trace["n_mask_off"] = int((~keep).sum())
+        idx = idx[keep]
+        if trace is not None:
+            trace["n_after_mask"] = int(len(idx))
     if len(idx) < min_points:
         if stats is not None:
-            stats["reject_no_points"] = stats.get("reject_no_points", 0) + 1
+            # Two different findings, counted apart: "the box had nothing in it"
+            # is a detector/pose problem, while "the mask removed everything the
+            # box had" is the mask's own judgement being wrong -- and only the
+            # second one argues against the mask.
+            k = ("reject_mask_empty" if mask_test is not None
+                 else "reject_no_points")
+            stats[k] = stats.get(k, 0) + 1
         if trace is not None:
-            trace["reason"] = "no_points"
+            trace["reason"] = ("mask_empty" if mask_test is not None
+                               else "no_points")
         return None
     p = cloud[idx].astype(np.float64)
 

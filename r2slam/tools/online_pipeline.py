@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from r2slam import load_config, open_source, viz                     # noqa: E402
 from r2slam import labels as L                                        # noqa: E402
+from r2slam.camera import project, to_camera_frame                # noqa: E402
 from r2slam.deskew import Deskewer                                   # noqa: E402
 from r2slam.detect import (OnnxYoloDetector, load_names,        # noqa: E402
                            load_class_map, DEFAULT_MODEL_FILE)
@@ -158,6 +159,19 @@ def parse_args():
                          "they do for the detector")
     ap.add_argument("--seg-alpha", type=float, default=0.45,
                     help="mask tint opacity on the camera panel")
+    ap.add_argument("--seg-classes", choices=("person", "all"), default="person",
+                    help="which instances the seg head reports.  `person` "
+                         "(default) is the honest subset: P1/P2/P3 on the "
+                         "scoring sheet are all '人物' and the closed COCO-80 "
+                         "head's other classes cost more than they pay -- "
+                         "measured on the real corridor, `clock` fired 74 times "
+                         "on a wall of posters.  `all` is for a demo.")
+    ap.add_argument("--seg-fuse", action="store_true",
+                    help="let the mask decide **which LiDAR points belong to "
+                         "the object** (`fusion.object_3d(mask_test=...)`), "
+                         "instead of every point inside the box.  Default off, "
+                         "and off is byte-identical: the filter runs only when "
+                         "a mask is matched to the detection.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=0, help="0 = until --duration")
     ap.add_argument("--duration", type=float, default=60.0, help="wall seconds to run")
@@ -502,6 +516,48 @@ def _seg_frame_counts(insts):
         k = L.name(it["label"])
         out[k] = out.get(k, 0) + 1
     return out
+
+
+def _match_seg_box(box, insts, iou_thr=0.35):
+    """The seg instance that describes `box`, or None.
+
+    Best IoU among instances of the **same project label**.  Both heads ran on
+    the same image, so their boxes should agree; when they do not, the honest
+    answer is "the mask does not describe this detection" rather than tinting
+    whatever happens to overlap.  `iou_thr` is deliberately not tiny: a mask
+    from a neighbouring person would remove the very returns the fusion needs.
+    """
+    x1, y1, x2, y2 = (float(v) for v in box[:4])
+    lab = int(box[5]) if len(box) > 5 else -1
+    best, best_iou = None, 0.0
+    for it in insts:
+        if int(it["label"]) != lab:
+            continue
+        a1, b1, a2, b2 = (float(v) for v in it["box"])
+        iw = min(x2, a2) - max(x1, a1)
+        ih = min(y2, b2) - max(y1, b1)
+        if iw <= 0 or ih <= 0:
+            continue
+        inter = iw * ih
+        union = ((x2 - x1) * (y2 - y1) + (a2 - a1) * (b2 - b1) - inter)
+        v = inter / union if union > 0 else 0.0
+        if v > best_iou:
+            best, best_iou = it, v
+    return best if best_iou >= iou_thr else None
+
+
+def _mask_test_for(cfg, yaw, seg, inst):
+    """A callable `(N,3) -> (N,) bool` for `fusion.object_3d`.
+
+    The projection lives **here**, not in `fusion`: the fusion module neither
+    projects points nor knows what a mask is, so a sign error in this transform
+    stays a bug in one place instead of becoming a bug in two.
+    """
+    def test(pts):
+        xyz = np.asarray(pts, np.float64)
+        u, v = project(to_camera_frame(xyz, cfg.Tcl, yaw), cfg.camera)
+        return seg.mask_cells(inst, u, v)
+    return test
 
 
 def annotate(img, boxes, names, target_h, note=None, top_margin=0, masks=None,
@@ -1011,6 +1067,7 @@ def main():
     n_seg_total = 0
     n_seg_unmapped_total = 0
     n_seg_frames = 0
+    n_seg_fuse_matched = 0
     seg_class_counts = {}
     # Instance layer counters.  `cluster_totals` accumulates the per-frame
     # rejection reasons from `r2slam/instances.py` so the run report shows how
@@ -1146,6 +1203,8 @@ def main():
             seg_inst = []
             if seg is not None and fr.image is not None:
                 seg_inst = seg.detect(fr.image)
+                if a.seg_classes == "person":
+                    seg_inst = [i for i in seg_inst if int(i["label"]) == L.PERSON]
                 n_seg_total += len(seg_inst)
                 if seg_inst:
                     n_seg_frames += 1
@@ -1169,8 +1228,15 @@ def main():
             obj_label = np.zeros(len(cloud), np.uint8)
             for b in boxes:
                 n_boxes_fused += 1
+                mtest = None
+                if a.seg_fuse and seg_inst:
+                    _it = _match_seg_box(b, seg_inst)
+                    if _it is not None:
+                        mtest = _mask_test_for(cfg, yaw_proj, seg, _it)
+                        n_seg_fuse_matched += 1
                 p = object_3d(cloud, cfg, b[:4], b[4], label=b[5],
-                              yaw=yaw_proj, plane=plane, stats=reject_stats)
+                              yaw=yaw_proj, plane=plane, stats=reject_stats,
+                              mask_test=mtest)
                 if p is None:
                     continue
                 u, v = project_person_back(cfg, p, yaw_proj)
@@ -1736,13 +1802,20 @@ def main():
                           "frames_with_any": int(n_seg_frames),
                           "by_class": dict(sorted(seg_class_counts.items())),
                           "unmapped_boxes": int(n_seg_unmapped_total),
-                          "draws_on": "camera panel only",
+                          "classes": a.seg_classes,
+                          "fuse": bool(a.seg_fuse),
+                          "fuse_matched": int(n_seg_fuse_matched),
+                          "draws_on": ("camera panel only" if not a.seg_fuse
+                                       else "camera panel, and the mask filters "
+                                            "the points of a matched detection"),
                           "note": "drawn alongside the detector, not instead of "
                                   "it: the detector is the open-vocabulary head "
                                   "(51 baked prompts / 39 classes) and every "
                                   "plain seg export is closed COCO-80, so the "
-                                  "masks are shown on the picture and are NOT "
-                                  "fed into the 3D fusion or the map."}
+                                  "masks are shown on the picture.  The 3D "
+                                  "fusion still receives the detector's boxes; "
+                                  "`fuse` says whether the mask additionally "
+                                  "selected the points inside them."}
                          if seg is not None else None),
         "machine": {"before": t0_snap, "after": t1_snap,
                     "throttling_during_run": throttled},
