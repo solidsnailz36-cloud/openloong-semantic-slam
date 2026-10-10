@@ -58,6 +58,7 @@ from r2slam.nav import (ObjectRegistry, SemanticNavigator,           # noqa: E40
                         path_length)
 from r2slam.odometry import apply_thread_limits, make_odometry, register  # noqa: E402
 from r2slam.traversable import (fit_ground, ground_tolerance,        # noqa: E402
+                                geometric_label, SUBFLOOR_LO,
                                 OBSTACLE_LO, OBSTACLE_HI,
                                 GROUND_TOL_BASE, GROUND_TOL_SLOPE)
 from r2slam import sysinfo                                           # noqa: E402
@@ -120,6 +121,17 @@ def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True)
+    ap.add_argument("--footprint", choices=("square", "disc"), default="disc",
+                    metavar="{square,disc}",
+                    help="shape of the safety margin removed from the walkable "
+                         "grid.  `disc` (default) builds the kernel from the "
+                         "kinematic condition, so every cell the mask keeps is "
+                         "provably >= robot_radius from every obstacle surface; "
+                         "`square` is the historical 5x5 box, which reaches "
+                         "0.283 m on its diagonal where the radius is 0.19 m "
+                         "and therefore deletes corner cells the robot fits in "
+                         "(-- `PathPlanner.footprint`).  Passing `square` "
+                         "reproduces every pre-2026-10-11 run bit for bit")
     ap.add_argument("--voxel", type=float, default=None, metavar="M",
                     help="override runtime.voxel_size (the KISS-ICP map voxel). "
                          "Left at None so the default run is bit-for-bit the "
@@ -174,6 +186,14 @@ def parse_args():
                     help="skip the PNG panels (a pure capture or timing run)")
     ap.add_argument("--every", type=int, default=1,
                     help="record every Nth frame (processing still runs on all of them)")
+    ap.add_argument("--sync-render", action="store_true",
+                    help="draw each video frame inline, inside the control "
+                         "loop.  The default is a worker thread, because "
+                         "`ms_render` was 60.5 ms of a 236.8 ms frame and "
+                         "the 5 Hz budget is 200 ms; this flag exists so the "
+                         "deferred video can be compared against the inline "
+                         "one (it must be bit-identical) and so an old run "
+                         "can be reproduced exactly")
     ap.add_argument("--encode", action="store_true", help="run ffmpeg when done")
     ap.add_argument("--explore", action="store_true",
                     help="drive the robot with a frontier policy and publish /cmd_vel "
@@ -533,6 +553,129 @@ def annotate(img, boxes, names, target_h, note=None, top_margin=0):
     return out
 
 
+def compose_sheet(image, cloud, boxes, names, view, lines, panel_h, note,
+                  zoom=1.0, panel_w=None):
+    """One frame of the delivered video: `camera | map`, with the HUD block.
+
+    `view` is whatever `WorldMap.render` should be called on -- the live map, or
+    a frozen `WorldMap.render_view()`.  Returns `(sheet, panel_w)`; `panel_w` is
+    carried across frames because the first panel fixes the sheet's width and
+    every later one is matched to it.
+
+    Split out of the control loop so the same code can run on the render
+    worker (see `_RenderWorker`) and so a test can assert on the real thing
+    instead of on a restatement of it.
+    """
+    import cv2
+    # The HUD block is painted over this panel's top-left corner, so the panel
+    # has to be told how much of its top is spoken for.  Asked of the same
+    # function that draws the block, and measured from the same origin --
+    # passing the bare height was a 6 px error, because the block starts at
+    # `HUD_ORIGIN[1]` and a label clamped to "height + 2" still lost its top.
+    hud_h = HUD_ORIGIN[1] + viz.banner_size(lines, scale=HUD_SCALE)[1]
+    if image is not None:
+        left = annotate(image, boxes, names, panel_h, note=note,
+                        top_margin=hud_h)
+    else:
+        left = viz.topdown(cloud, size=panel_h)
+    if panel_w is None:
+        panel_w = left.shape[1]
+    elif left.shape[1] != panel_w:
+        left = cv2.resize(left, (panel_w, left.shape[0]),
+                          interpolation=cv2.INTER_AREA)
+    right = view.render(size=left.shape[0], zoom=zoom)
+    sheet = np.hstack([left, right])
+    # H.264 with yuv420p needs even dimensions, and the fisheye panel width is
+    # `round(1600 * 540/1296)` = 667 -> a 1207-wide sheet, which libx264
+    # refuses outright.  Trim the odd column rather than let the encoder fail
+    # after a multi-minute run.
+    if sheet.shape[1] % 2:
+        sheet = sheet[:, :-1]
+    if sheet.shape[0] % 2:
+        sheet = sheet[:-1, :]
+    sheet = viz.banner(sheet, lines, origin=HUD_ORIGIN, scale=HUD_SCALE)
+    return sheet, panel_w
+
+
+class _RenderWorker:
+    """Draws and writes the video frames on its own thread.
+
+    Why: `ms_render` was 60.46 ms (p50) of a 236.75 ms frame -- a quarter of the
+    loop -- for a panel nothing in the control path reads.  The 5 Hz budget is
+    200 ms, so this is the single largest item that can be moved without
+    touching a decision.
+
+    Identical output is the requirement, and it is what the payload buys: the
+    map is frozen with `WorldMap.render_view()` **in the frame that built the
+    payload**, so the worker cannot draw a later map into an earlier frame.
+    Nothing else it reads is mutated by the loop (`boxes` and `fr.image` are
+    allocated fresh per frame and only read downstream).
+
+    `ms_render` keeps its old meaning -- the cost the control loop pays for a
+    frame's picture -- and is now the payload build plus the queue put.  The
+    drawing time is reported separately in the summary as `render_worker_ms`.
+    If the worker falls behind, the bounded queue blocks the loop and that shows
+    up in `ms_render`: backpressure is reported, not hidden.
+    """
+
+    def __init__(self, frames_dir, panel_h, zoom, maxsize=4):
+        import queue
+        import threading
+        self._queue = queue
+        self.frames_dir = frames_dir
+        self.panel_h = int(panel_h)
+        self.zoom = float(zoom)
+        self.panel_w = None
+        self.n_written = 0
+        self.times = []
+        self.failed = None
+        self._q = queue.Queue(maxsize=max(1, int(maxsize)))
+        self._t = threading.Thread(target=self._run, name="render", daemon=True)
+        self._t.start()
+
+    def submit(self, payload) -> None:
+        if self.failed is not None:
+            raise RuntimeError("render worker died: %s" % self.failed)
+        self._q.put(payload)
+        if self.failed is not None:          # it can die while we were blocked
+            raise RuntimeError("render worker died: %s" % self.failed)
+
+    def _run(self) -> None:
+        while True:
+            p = self._q.get()
+            if p is None:
+                break
+            t0 = time.perf_counter()
+            try:
+                sheet, self.panel_w = compose_sheet(
+                    p["image"], p["cloud"], p["boxes"], p["names"], p["view"],
+                    p["lines"], self.panel_h, p["note"], self.zoom, self.panel_w)
+                viz.imwrite(os.path.join(self.frames_dir,
+                                         "%06d.png" % p["n"]), sheet)
+                self.n_written += 1
+            except Exception as exc:                     # noqa: BLE001
+                # A worker that dies silently would hang the loop as soon as the
+                # queue filled, so it records why and drains -- and `submit`
+                # raises, which turns a broken picture into a loud failure.
+                self.failed = "%s: %s" % (type(exc).__name__, exc)
+                while True:
+                    if self._q.get() is None:
+                        break
+                break
+            self.times.append((time.perf_counter() - t0) * 1e3)
+
+    def close(self) -> None:
+        self._q.put(None)
+        self._t.join()
+
+    def stats(self) -> dict:
+        t = sorted(self.times)
+        pct = lambda q: round(t[min(len(t) - 1, int(len(t) * q))], 2) if t else 0.0
+        return {"frames": self.n_written, "p50": pct(0.5), "p90": pct(0.9),
+                "max": round(max(t), 2) if t else 0.0,
+                "failed": self.failed}
+
+
 def main():
     a = parse_args()
     cfg = load_config(a.config)
@@ -671,9 +814,15 @@ def main():
     if a.explore:
         if a.npz:
             raise SystemExit("--explore needs a live source (nothing to drive in --npz mode)")
+        _ovr = _explore_overrides(a.explore_set)
+        # `--explore-set footprint=...` and `--footprint` would collide on the
+        # kwarg; the explicit flag is the documented one and the override wins
+        # only when the flag was left at its default.
+        if "footprint" not in _ovr:
+            _ovr = dict(_ovr, footprint=a.footprint)
         explorer = FrontierExplorer(v_max=a.v_max, w_max=a.w_max,
                                     sweep=not a.no_sweep,
-                                    **_explore_overrides(a.explore_set))
+                                    **_ovr)
         print("explore     : frontier policy  v_max=%.2f m/s  w_max=%.2f rad/s  "
               "sweep=%s" % (a.v_max, a.w_max, not a.no_sweep))
         for k, val in _explore_overrides(a.explore_set).items():
@@ -771,6 +920,16 @@ def main():
     # width costs a resize on those frames and makes every sheet the same shape,
     # which is what a video file needs anyway.
     panel_w = None
+    # Rendering runs on its own thread unless `--sync-render` says otherwise.
+    # Started here, before the loop, so the first frame's cost is measured the
+    # same way as every later one.  See `_RenderWorker` for why the output is
+    # still identical.  `None` means "draw inline", which is what the flag
+    # selects and what every pre-2026-10-11 run did.
+    render_worker = None
+    if (not a.no_render) and not a.sync_render:
+        render_worker = _RenderWorker(frames_dir, a.panel_h, a.zoom)
+        print("render      : worker thread (ms_render is now the payload build;"
+              " the drawing time is reported as render_worker_ms)")
     # Why a detection that the detector reported did not become an object.  Both
     # counts are reported at the end: a gate that silently removes things is
     # indistinguishable from a detector that never saw them.
@@ -1000,6 +1159,11 @@ def main():
             tol = ground_tolerance(rng_xy)
             ground_mask = np.abs(h) < tol
             obstacle_mask = (h > OBSTACLE_LO) & (h <= OBSTACLE_HI) & ~obj_mask
+            # The pcd's label column, decided **per point** from its own height.
+            # It used to be read off the point's (x, y) cell, which labelled the
+            # ceiling above the corridor `traversable`.  See
+            # `traversable.geometric_label`.
+            geom_label = geometric_label(h, ground_mask, obj_mask)
             t_trav = time.perf_counter()
 
             # ---------------- map (world frame) ----------------
@@ -1018,12 +1182,13 @@ def main():
             # A ceiling hit is a real measurement of the ceiling and says
             # nothing about what is under it; letting it mark the cell is what
             # put grey speckle in the middle of the walkable floor.
-            informative = (h <= OBSTACLE_HI) & (h >= -0.60)
+            informative = (h <= OBSTACLE_HI) & (h >= SUBFLOOR_LO)
             wmap.add(world_pts, ground_mask, obstacle_mask, obj_mask,
                      pose_xy=(t[0], t[1]), stamp=float(fr.stamp),
                      persons_xy=persons_world,
                      obj_labels=obj_label, objects_xy=objects_world,
-                     seen_mask=informative)
+                     seen_mask=informative,
+                     geom_labels=geom_label)
             st = wmap.stats()
             # Instance association runs on the same loop as the map: a named
             # instance is what the finals' "navigate to the sofa" needs, and it
@@ -1145,39 +1310,31 @@ def main():
                                     cmd["v"], cmd["w"],
                                     "" if cmd.get("target") is None
                                     else "  target %.1f m" % cmd["dist"]))
-                # The HUD block is painted over this panel's top-left corner,
-                # so the panel has to be told how much of its top is spoken
-                # for.  Asked of the same function that draws the block, and
-                # measured from the same origin -- passing the bare height was
-                # a 6 px error, because the block starts at `HUD_ORIGIN[1]` and
-                # a label clamped to "height + 2" still lost its top to it.
-                hud_h = HUD_ORIGIN[1] + viz.banner_size(lines,
-                                                        scale=HUD_SCALE)[1]
-                if fr.image is not None:
-                    left = annotate(fr.image, boxes, names, a.panel_h,
-                                    note="detected %d -> localised %d"
-                                         % (len(boxes), len(objects)),
-                                    top_margin=hud_h)
+                # `view` is the live map when rendering synchronously and a
+                # frozen `render_view()` otherwise -- either way it is *this*
+                # frame's map state, which is what keeps the deferred video
+                # identical to the inline one.
+                payload = {
+                    "n": n_rec,
+                    "image": fr.image,
+                    "cloud": cloud,
+                    "boxes": boxes,
+                    "names": names,
+                    "view": (wmap if render_worker is None
+                             else wmap.render_view()),
+                    "lines": lines,
+                    "note": "detected %d -> localised %d"
+                            % (len(boxes), len(objects)),
+                }
+                if render_worker is None:
+                    sheet, panel_w = compose_sheet(
+                        payload["image"], payload["cloud"], payload["boxes"],
+                        names, payload["view"], lines, a.panel_h,
+                        payload["note"], a.zoom, panel_w)
+                    viz.imwrite(os.path.join(frames_dir, "%06d.png" % n_rec),
+                                sheet)
                 else:
-                    left = viz.topdown(cloud, size=a.panel_h)
-                if panel_w is None:
-                    panel_w = left.shape[1]
-                elif left.shape[1] != panel_w:
-                    left = cv2.resize(left, (panel_w, left.shape[0]),
-                                      interpolation=cv2.INTER_AREA)
-                right = wmap.render(size=left.shape[0], zoom=a.zoom)
-                sheet = np.hstack([left, right])
-                # H.264 with yuv420p needs even dimensions, and the fisheye
-                # panel width is `round(1600 * 540/1296)` = 667 -> a 1207-wide
-                # sheet, which libx264 refuses outright.  Trim the odd column
-                # rather than let the encoder fail after a multi-minute run.
-                if sheet.shape[1] % 2:
-                    sheet = sheet[:, :-1]
-                if sheet.shape[0] % 2:
-                    sheet = sheet[:-1, :]
-                sheet = viz.banner(sheet, lines, origin=HUD_ORIGIN,
-                                   scale=HUD_SCALE)
-                viz.imwrite(os.path.join(frames_dir, "%06d.png" % n_rec), sheet)
+                    render_worker.submit(payload)
                 n_rec += 1
             t_render = time.perf_counter()
 
@@ -1332,6 +1489,19 @@ def main():
             ctx.close()
 
     # ---------------------------------------------------------------- outputs
+    # The render worker has to be drained before anything reports on the video:
+    # "frames written to X (N)" is read as a complete run, and a queue still
+    # holding pictures would make that number a lie.  It also has to happen
+    # before `--encode`, which reads the directory.
+    if render_worker is not None:
+        render_worker.close()
+        print("render      : worker drew %d frames  p50 %.2f  p90 %.2f  max %.2f"
+              " ms" % (render_worker.stats()["frames"],
+                       render_worker.stats()["p50"],
+                       render_worker.stats()["p90"],
+                       render_worker.stats()["max"]))
+        if render_worker.failed:
+            raise SystemExit("render worker failed: %s" % render_worker.failed)
     # Resolve the final 3D store ONCE, here, so the pcd, the point counts in the
     # summary and the label histogram are all reporting the same map.  They used
     # to read three different views of it: the pcd had every voxel repeated
@@ -1348,20 +1518,25 @@ def main():
     # reachable, i.e. quoting the first number as "area covered" overstates the
     # run by a factor of two.  Both are reported so the claim can be checked.
     reach_note = None
-    # 0.19, at boss's direction (2026-10-04).  NOTE: it is a no-op as things
-    # stand -- `free_space` quantises the erosion kernel with
-    # `round(2*r/res)|1`, so 0.19 and 0.22 both give 5x5.  The real lever is
-    # <= 0.15, which gives 3x3, i.e. cutting the clearance from 0.2 m to 0.1 m.
+    # 0.19, at boss's direction (2026-10-04).  NOTE: the *radius* is a no-op as
+    # things stand -- `free_space` quantises the erosion kernel with
+    # `round(2*r/res)|1`, so 0.19 and 0.22 both give 5x5, and the only radius
+    # that moves anything is <= 0.15 (3x3, i.e. clearance 0.2 m -> 0.1 m).
+    # What *is* a lever is the kernel's **shape** (`--footprint`): a 5x5 square
+    # reaches 0.283 m on the diagonal where the robot's radius is 0.19 m, so it
+    # deletes corner cells the robot fits in.
     # Kept in step with the explorer so the reachability note and the planner do
     # not describe different robots.
     reach_radius = 0.19            # FrontierExplorer's default robot radius
     try:
         from r2slam.nav import PathPlanner as _PP
-        _pl = _PP(robot_radius=reach_radius, close_px=5)
+        _pl = _PP(robot_radius=reach_radius, close_px=5,
+                  footprint=a.footprint)
         _free, _reach = _pl.reachable_from(wmap, wmap.traj[-1], poses=wmap.traj)
         _cell = wmap.resolution ** 2
         reach_note = {
             "robot_radius_m": reach_radius,
+            "footprint": a.footprint,
             "drivable_area_m2": round(float(_free.sum()) * _cell, 1),
             "reachable_area_m2": round(float(_reach.sum()) * _cell, 1),
             "stranded_green_m2": round(
@@ -1719,6 +1894,8 @@ def main():
                                        "used for scoring only"}
                               if truth_err_xy else None),
         "labels": wmap.label_histogram(),
+        "render_worker_ms": (render_worker.stats()
+                             if render_worker is not None else None),
         "objects": {"observations": wmap.object_histogram(),
                     "classes_in_map": len({lb for _x, _y, lb, _s in wmap.objects}),
                     "detector_unmapped_boxes": (n_unmapped_total

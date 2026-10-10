@@ -537,6 +537,39 @@ for _i, (_cocos, _en, _zh, _size, _conf) in enumerate(_SPECS):
 
 PERSON = COCO_TO_LABEL[0]
 
+# ----------------------------------------------------- structural (geometric)
+# The two classes that stop `background` from doing three jobs at once.
+#
+# Until now the geometric half of the table was 0 = background, 1 =
+# traversable, and `background` meant **anything above the drivable band** --
+# walls, partitions, ceilings, cabinets and anything else the object detector
+# did not name, all in one bucket.  Measured on the r2 delivery that bucket was
+# 48.0% of the pcd, and the label column was decided **per grid cell** ("is the
+# cell below this point drivable?") rather than per point, so the ceiling above
+# the corridor came out labelled `traversable` -- the points under the label
+# reach z = 3.43 m.
+#
+# `wall` and `ceiling` are decided from the LiDAR's own height above the fitted
+# floor (`traversable.geometric_label`), with no detector and no training, so
+# they cost nothing at run time.  Naming them is what turns "44% of this cloud
+# is unknown" into "this is a building": the map now says which returns are
+# structure and which are overhead.
+#
+# Ids go **after** the object block on purpose.  Inserting them next to
+# `traversable` would renumber every furniture class, and the delivered pcd's
+# `label` column plus the shipped table have to keep agreeing across a rebuild.
+_STRUCTURE_SPECS = [
+    # en              zh            rgb
+    ("wall",          "墙面/结构",   (196, 196, 202)),
+    ("ceiling",       "天花板",      (128, 128, 138)),
+]
+_STRUCTURE_BASE = 2 + len(_SPECS)
+for _j, (_en, _zh, _rgb) in enumerate(_STRUCTURE_SPECS):
+    _lab = _STRUCTURE_BASE + _j
+    LABEL_NAMES[_lab] = _en
+    LABEL_NAMES_ZH[_lab] = _zh
+    LABEL_RGB[_lab] = _rgb
+
 # ------------------------------------------------- geometric object classes
 # Resolved by name rather than by index so inserting a COCO class above cannot
 # silently renumber them -- the delivered pcd's `label` column and the shipped
@@ -544,6 +577,13 @@ PERSON = COCO_TO_LABEL[0]
 _by_name = {v: k for k, v in LABEL_NAMES.items()}
 UNKNOWN_OBJECT: int = _by_name["unclassified object"]
 RAILING: int = _by_name["railing"]
+# Resolved by name for the same reason: an id only ever means what the table
+# says it means.
+WALL: int = _by_name["wall"]
+CEILING: int = _by_name["ceiling"]
+# The geometric classes that are *not* driveability statements.  `write_table`
+# marks them `kind: geometric` and skips the object-only fields for them.
+STRUCTURE_LABELS: frozenset = frozenset({WALL, CEILING})
 
 # Resolved by name for the same reason the two above are: a class inserted into
 # `_SPECS` must not be able to silently re-point an alias at another label.
@@ -661,7 +701,7 @@ def write_table(path: str) -> str:
     ]
     for lab in sorted(LABEL_NAMES):
         r, g, b = LABEL_RGB[lab]
-        if lab <= TRAVERSABLE:
+        if lab <= TRAVERSABLE or lab in STRUCTURE_LABELS:
             kind = "geometric"
         elif lab in GEOMETRIC_OBJECT_LABELS:
             kind = "geometric-object"
@@ -672,7 +712,7 @@ def write_table(path: str) -> str:
         lines.append("    name_zh: %s" % LABEL_NAMES_ZH[lab])
         lines.append("    kind: %s" % kind)
         lines.append("    color_rgb: [%d, %d, %d]" % (r, g, b))
-        if lab > TRAVERSABLE:
+        if lab > TRAVERSABLE and lab not in STRUCTURE_LABELS:
             cocos = [c for c, l in sorted(COCO_TO_LABEL.items()) if l == lab]
             lines.append("    coco_ids: %s" % cocos)
             lines.append("    min_points: %d" % LABEL_MIN_POINTS[lab])

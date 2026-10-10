@@ -44,6 +44,56 @@ def is_floor(points: np.ndarray, plane: "GroundPlane") -> np.ndarray:
     return np.abs(plane.height_above(points)) < ground_tolerance(rng)
 
 
+# Below the floor plane by this much is not "a low thing on the floor", it is
+# the underside of the floor / another level.  Same threshold the pipeline uses
+# to decide whether a return says anything about the cell below it.
+SUBFLOOR_LO = -0.60
+
+
+def geometric_label(height: np.ndarray, ground_mask: np.ndarray,
+                    obj_mask: Optional[np.ndarray] = None,
+                    ceiling_hi: float = OBSTACLE_HI) -> np.ndarray:
+    """Per-point geometric class, from the height above the fitted floor.
+
+    Returns a uint8 array of label ids -- `traversable` / `wall` / `ceiling` /
+    `background` -- for points already transformed to the world frame, using the
+    per-point `height` the plane fit produced in the *sensor* frame.
+
+    Why per point and not per cell: the pcd's label column used to be decided
+    from the point's (x, y) cell alone ("is the cell beneath it drivable?"), so
+    a ceiling return over the corridor inherited the floor's `traversable`.  The
+    delivered cloud had `traversable` points up to z = 3.43 m.  A label that
+    describes the column and not the point is not a semantic label.
+
+    `obj_mask` points are left as `background`: they are inside a detected box
+    and the map's own vote promotes them to the detected class when the voxel
+    has been seen twice.  Calling them `wall` on the frames where the vote has
+    not yet accumulated would put a person's torso in the wall class.
+
+    The band boundaries are the ones `traversable` already defines, so "is this
+    point floor?" has exactly one answer in the codebase.  Structure starts at
+    the plane itself rather than at a negative offset: the ground tolerance
+    grows with range (0.80 m at 20 m), so a long-range floor return can sit
+    below the plane without being anything other than floor, and letting it
+    fall into `wall` would paint the far end of the corridor as a partition.
+    """
+    from . import labels as L
+    h = np.asarray(height, dtype=np.float64).reshape(-1)
+    g = np.asarray(ground_mask, dtype=bool).reshape(-1)
+    if obj_mask is None:
+        o = np.zeros(h.shape, bool)
+    else:
+        o = np.asarray(obj_mask, dtype=bool).reshape(-1)
+    out = np.full(h.shape, L.BACKGROUND, np.uint8)
+    # Order matters: floor last (it is a band around zero and must beat the wall
+    # band), ceiling before wall so the 2.0 m boundary is not counted twice.
+    out[h > ceiling_hi] = L.CEILING
+    out[(h > 0.0) & (h <= ceiling_hi)] = L.WALL
+    out[o] = L.BACKGROUND
+    out[g] = L.TRAVERSABLE
+    return out
+
+
 @dataclass
 class GroundPlane:
     """z = a*x + b*y + c in the LiDAR frame."""

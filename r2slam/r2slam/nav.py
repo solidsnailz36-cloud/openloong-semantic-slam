@@ -431,9 +431,41 @@ class PathPlanner:
     """
 
     def __init__(self, robot_radius: float = 0.25, max_expand: int = 300000,
-                 close_px: int = 0):
+                 close_px: int = 0, footprint: str = "disc"):
         self.robot_radius = float(robot_radius)
         self.max_expand = int(max_expand)
+        # Shape of the footprint that gets removed from the walkable mask.
+        #
+        # `"square"` is the historical behaviour: dilate the complement by a
+        # `k x k` box of ones.  `"disc"` builds the kernel from the actual
+        # kinematic condition instead of from a shape.
+        #
+        # A cell centre is drivable iff a disc of `robot_radius` centred there
+        # touches no obstacle cell.  For an obstacle `(a, b)` cells away the
+        # nearest surface is `res * hypot(max(|a|-0.5, 0), max(|b|-0.5, 0))`
+        # from the centre, so the offsets that must be deleted are exactly
+        # those where that value is under the radius.  At `r = 0.19`,
+        # `res = 0.10` that set is the 5x5 box **minus its four corners**
+        # (corner clearance is 0.212 m, which clears the radius; the cell
+        # beside it at 0.158 m does not).
+        #
+        # The box deletes those corners anyway, and on the r2 recording one of
+        # them was the only thing separating a 3.1 m2 patch of observed floor
+        # -- inside the glass-walled room beside the corridor -- from the
+        # corridor: a 48-vote obstacle cell dilated by the 3x3 `solid` step is
+        # one cell of "not free", and the square then projects a 5x5 dead zone
+        # off that single cell, covering the doorway.
+        #
+        # Note this is *not* `cv2.MORPH_ELLIPSE`.  cv2's 5x5 ellipse is a
+        # 17-cell diamond-ish set that keeps the offsets at 0.158 m, i.e. it
+        # admits cells the robot's footprint overlaps.  Building the kernel
+        # from the condition makes the guarantee exact: every cell the mask
+        # keeps is at least `robot_radius` from every obstacle surface.
+        # Default `"disc"` since 2026-10-11.  `"square"` is the historical
+        # behaviour and stays reachable so a pre-change run reproduces bit for
+        # bit, but it is wrong for a round robot: see the note above.
+        self.footprint = "disc" if str(footprint).lower().startswith("d") \
+            else "square"
         # Optional morphological closing applied BEFORE the robot-radius
         # erosion.  Default 0 = off, which is what the navigator wants: it plans
         # on the strict mask, so a route it finds is a route the robot fits
@@ -475,6 +507,24 @@ class PathPlanner:
         # `FrontierExplorer.fuse_planner`, never on the driving planner, so the
         # numbers are the fuse's alone.
         self.prof = None
+
+    def footprint_kernel(self, resolution: float) -> np.ndarray:
+        """The structuring element `free_space` dilates the complement by.
+
+        Sized from the metric, not from a cell count: the farthest offset that
+        can be under the radius is `|a| < robot_radius / resolution + 0.5`.
+        """
+        r, res = float(self.robot_radius), float(resolution)
+        if r <= 0:
+            return np.ones((1, 1), np.uint8)
+        if self.footprint == "square":
+            k = max(1, int(round(2 * r / res)) | 1)
+            return np.ones((k, k), np.uint8)
+        half = max(0, int(np.ceil(r / res - 0.5)))
+        yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
+        dx = np.maximum(np.abs(xx) - 0.5, 0.0) * res
+        dy = np.maximum(np.abs(yy) - 0.5, 0.0) * res
+        return (np.hypot(dx, dy) < r).astype(np.uint8)
 
     def free_space(self, wmap) -> np.ndarray:
         """Known-traversable cells, shrunk by the robot radius.
@@ -547,9 +597,8 @@ class PathPlanner:
             free = closed & ~solid
             _mark("t_and")
         if self.robot_radius > 0:
-            k = max(1, int(round(2 * self.robot_radius / wmap.resolution)) | 1)
-            bad = cv2.dilate(((~free).astype(np.uint8)),
-                             np.ones((k, k), np.uint8))
+            kern = self.footprint_kernel(wmap.resolution)
+            bad = cv2.dilate(((~free).astype(np.uint8)), kern)
             # NOTE: there is no `erode` call in this method.  The robot-radius
             # shrink is written as a dilate of the *complement*, which is why
             # "erode" never appears in the profile -- `t_radius` IS the erosion.

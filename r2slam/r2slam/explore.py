@@ -70,6 +70,7 @@ class FrontierExplorer:
                  barren_targets: int = 8, barren_blacklist_m: float = 0.60,
                  fb_relax: int = 0,
                  robot_radius: float = 0.19, replan_every: int = 12,
+                 footprint: str = "disc",
                  arc_scale: float = 0.40, arc_max_deg: float = 90.0,
                  arc_probe_deg: float = 40.0,
                  sweep: bool = True, sweep_radius: float = 0.60,
@@ -1296,7 +1297,8 @@ class FrontierExplorer:
         # "nothing reachable" on frame one.  The closing goes here rather than
         # into the shared planner because the navigator must plan on the strict
         # mask -- a route it finds has to be a route the robot fits through.
-        self.planner = PathPlanner(robot_radius=float(robot_radius), close_px=5)
+        self.planner = PathPlanner(robot_radius=float(robot_radius),
+                                   close_px=5, footprint=footprint)
         # The B3 topological fuse asks "what would the reach be if this cell were
         # not an obstacle", which means `free_space` gets called on maps that are
         # deliberately wrong.  It must **not** share a planner with the driving
@@ -1306,7 +1308,7 @@ class FrontierExplorer:
         # amputated map can hand that map's mask to `_masks` -- the policy then
         # drives on a map it never built.  Separate instance, separate cache.
         self.fuse_planner = PathPlanner(robot_radius=float(robot_radius),
-                                        close_px=5)
+                                        close_px=5, footprint=footprint)
         self.robot_radius = float(robot_radius)
         self.replan_every = int(replan_every)
         self._mask_key = None

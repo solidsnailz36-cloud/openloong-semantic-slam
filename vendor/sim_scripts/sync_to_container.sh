@@ -62,9 +62,20 @@ PKG_PATHS=(
   "r2slam/deskew.py"
   "r2slam/camera.py"
   "r2slam/odometry.py"
+  # `viz.py` was off this list for the same reason `frames.py` was: it had not
+  # changed since the container was seeded.  It changed on 2026-10-10 (`banner`
+  # grew `banner_size`/`place_labels`/`label_chip` for the overlay work), and
+  # `online_pipeline.py` -- which IS on the list -- calls `viz.banner_size`, so
+  # a container run would have died with `AttributeError` on the first rendered
+  # frame while the copy step printed nothing wrong.
+  "r2slam/viz.py"
   "tools/online_pipeline.py"
   "tools/eval_semantic_truth.py"
   "tools/package_submission.py"
+  # Not a shipping module, but the A/B harness for everything the explorer does.
+  # It has been copied by hand on every round since 2026-10-07 and forgotten at
+  # least twice (`docs/B3成本剖析_20261008.md` records one), so it belongs here.
+  "tools/replay_explore.py"
 )
 ROOT_PATHS=(
   "vendor/detector/yolo26n.onnx"

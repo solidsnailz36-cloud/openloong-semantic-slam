@@ -55,6 +55,7 @@ from r2slam.fusion import object_3d, project_person_back           # noqa: E402
 from r2slam.nav import ObjectRegistry                              # noqa: E402
 from r2slam.odometry import apply_thread_limits, make_odometry, register  # noqa: E402
 from r2slam.traversable import (fit_ground, ground_tolerance,      # noqa: E402
+                                geometric_label, SUBFLOOR_LO,
                                 OBSTACLE_LO, OBSTACLE_HI)          # noqa: E402
 from r2slam.worldmap import WorldMap                               # noqa: E402
 from r2slam import worldmap as _wm_mod                             # noqa: E402
@@ -707,7 +708,7 @@ def main():
             objects_world.append((pw[0], pw[1], p["label"]))
             if p["label"] == L.PERSON:
                 persons_world.append((pw[0], pw[1]))
-        informative = (h <= OBSTACLE_HI) & (h >= -0.60)
+        informative = (h <= OBSTACLE_HI) & (h >= SUBFLOOR_LO)
 
         if pt_cells is not None:
             # The last link of the chain: `votes` grow only from obstacle
@@ -740,7 +741,8 @@ def main():
         wmap.add(world_pts, ground_mask, obstacle_mask, obj_mask,
                  pose_xy=(t[0], t[1]), stamp=float(fr.stamp),
                  persons_xy=persons_world, obj_labels=obj_label,
-                 objects_xy=objects_world, seen_mask=informative)
+                 objects_xy=objects_world, seen_mask=informative,
+                 geom_labels=geometric_label(h, ground_mask, obj_mask))
 
         if cf is not None:
             # `--cf-hold-cells`: the cells never enter the memory layer.  Set it

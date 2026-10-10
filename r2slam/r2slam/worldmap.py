@@ -22,14 +22,24 @@ because the FAQ does not publish a class table and a judge reading
 Two of them are **geometric** (a statement about driveability, decided from the
 LiDAR alone, no training):
 
-    0  background          anything above the drivable band
+    0  background          below the floor plane, or nothing the classifier named
     1  traversable         the floor band, free of obstacles
+
+and so are two more, added because `background` was carrying the walls and the
+ceiling in one bucket (48.0% of the delivered pcd) and the label column was
+decided per *cell* rather than per point -- so a ceiling return over the corridor
+came out `traversable`:
+
+    wall                   floor-to-ceiling structure (0.35-2.0 m band)
+    ceiling                overhead returns (above 2.0 m)
 
 and the rest are **objects**: a learned 2D detection projected into 3D through
 the camera-LiDAR calibration (`person` = 2, then the furniture classes).
 
 Note the honest limit on the geometric half: "traversable" means "flat, low and
-not occupied", which is a statement about driveability rather than material.
+not occupied", which is a statement about driveability rather than material,
+and "wall" means "the LiDAR saw something between the floor and 2 m here that no
+detector claimed" -- a cabinet and a partition land in the same class.
 """
 from __future__ import annotations
 
@@ -997,7 +1007,8 @@ class WorldMap:
             persons_xy: Sequence[Tuple[float, float]] = (),
             obj_labels: Optional[np.ndarray] = None,
             objects_xy: Sequence[Tuple[float, float, int]] = (),
-            seen_mask: Optional[np.ndarray] = None) -> None:
+            seen_mask: Optional[np.ndarray] = None,
+            geom_labels: Optional[np.ndarray] = None) -> None:
         """Fold one frame in.
 
         `world_pts` is (N,3) in the world frame; the two boolean masks are (N,)
@@ -1228,8 +1239,21 @@ class WorldMap:
         trav_cell = np.zeros(len(v), bool)
         if ok.any():
             trav_cell[ok] = self.ground[cy[ok], cx[ok]]
-        lab = np.where(trav_cell, LABEL_TRAVERSABLE,
-                       LABEL_BACKGROUND).astype(np.uint8)
+        if geom_labels is None:
+            # Fallback: the whole column takes the cell's driveability, which is
+            # what this used to do for every caller.  It cannot tell a ceiling
+            # return from a floor one, so a caller that knows each point's
+            # height above the floor should pass `geom_labels` and get the
+            # per-point answer (`traversable.geometric_label`).
+            lab = np.where(trav_cell, LABEL_TRAVERSABLE,
+                           LABEL_BACKGROUND).astype(np.uint8)
+        else:
+            lab = np.asarray(geom_labels)[finite].astype(np.uint8)
+            # A point the classifier called `background` in an unobserved or
+            # not-yet-promoted cell still inherits the cell's answer, so the
+            # fallback costs nothing when the classifier abstains.
+            lab = np.where((lab == LABEL_BACKGROUND) & trav_cell,
+                           LABEL_TRAVERSABLE, lab).astype(np.uint8)
 
         # Voxel keys are **absolute** (derived from the map origin, not from
         # this frame's own minimum), so they mean the same thing in every frame.
@@ -1536,6 +1560,40 @@ class WorldMap:
         return out
 
     # ---------------------------------------------------------------- render
+    # Everything `render` reads.  Kept as a list next to the method it serves so
+    # adding a field to `render` and forgetting it here is visible in one place.
+    _RENDER_ATTRS = ("ground", "obstacle", "seen", "objects", "persons",
+                     "inst_still", "inst_moving", "traj", "t_last")
+
+    def render_view(self) -> "WorldMap":
+        """A copy whose render-relevant state is frozen at this instant.
+
+        The pipeline draws video frames on a worker thread while the control
+        loop keeps folding frames into the same `WorldMap`.  Rendering from the
+        live object would mix two moments into one picture -- a wall appearing
+        in a panel that is supposed to show the map from 60 ms ago -- and would
+        also let a mutable list change length mid-iteration.
+
+        Copying the nine attributes `render` touches costs ~1.5 ms against the
+        ~60 ms the drawing itself costs, and it is what lets the deferred video
+        be identical to the synchronous one.  The big point store (`_pts`,
+        `_lab`, `_votes`) is shared on purpose: `render` never reads it, and
+        deep-copying a quarter of a million points per frame is the one thing
+        that would make this slower than drawing inline.
+        """
+        import copy as _copy
+        view = _copy.copy(self)
+        for a in self._RENDER_ATTRS:
+            v = getattr(self, a)
+            if isinstance(v, np.ndarray):
+                v = v.copy()
+            elif isinstance(v, list):
+                v = list(v)
+            # `None` (an instance layer that was never populated) and immutable
+            # scalars are shared: copying them would say nothing extra.
+            setattr(view, a, v)
+        return view
+
     def render(self, size: int = 620, zoom: float = 1.0,
                centre: Optional[Tuple[float, float]] = None,
                max_persons: int = 40) -> np.ndarray:

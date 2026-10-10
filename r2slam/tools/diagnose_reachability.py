@@ -233,6 +233,9 @@ def main():
     ap.add_argument("--robot-radius", type=float, default=0.22,
                     help="must match FrontierExplorer's default")
     ap.add_argument("--close-px", type=int, default=5)
+    ap.add_argument("--footprint", choices=("square", "disc"), default="disc",
+                    help="shape of the safety margin; `disc` is the robot's "
+                         "actual round footprint")
     ap.add_argument("--inspect", default="",
                     help="x,y -- explain why this world point is not reachable")
     ap.add_argument("--project", default="", metavar="X,Y",
@@ -260,7 +263,8 @@ def main():
 
     cell = res * res
     free = PathPlanner(robot_radius=a.robot_radius,
-                       close_px=a.close_px).free_space(w)
+                       close_px=a.close_px,
+                       footprint=a.footprint).free_space(w)
     print("grid %s  %dx%d @ %.2f m  (%s)" % (a.grids, ground.shape[0],
                                              ground.shape[1], res,
                                              meta.get("source", "?")))
@@ -330,12 +334,25 @@ def main():
     # `reach` is a component of the ERODED grid, so the two-cell lining that the
     # safety radius takes off every obstacle is "ground outside reach" too.  A
     # headline number like `stranded_green_m2 = 159.6` therefore mixes a real
-    # separated room with dust, and the two need different answers: the first is
-    # a map fact, the second is a property of our own safety margin.  The bands
-    # below separate them, and the shell test says how much of the total lies
-    # within 2 cells of an obstacle.
+    # separated room with our own safety margin, and the two need different
+    # answers: the first is a fact about the map, the second is a property of a
+    # number we chose.
+    #
+    # The split is **exact and needs no threshold**:
+    #
+    #   stranded = (ground & ~free)                  <- the margin, by definition
+    #            ∪ (ground & free & lab != seed)     <- walkable, but not ours
+    #
+    # Only the second set is a candidate for "the map is wrong here".  The first
+    # version of this test used a distance threshold instead and had two bugs: it
+    # built a 41-cell (2.0 m) neighbourhood while printing "<= 0.20 m", so every
+    # number it produced was mislabelled by 10x, and it also could not have
+    # separated the two sets anyway -- a cell removed because it is next to
+    # *unknown* space is not near an obstacle at all.
     stranded = (lab != seed) & ground
     tot = float(stranded.sum()) * cell
+    shell = ground & ~free
+    other = ground & free & (lab != seed)
     if stranded.any():
         _n_all, lab_all = cv2.connectedComponents(
             stranded.astype(np.uint8), connectivity=4)
@@ -351,18 +368,20 @@ def main():
             print("  %5.1f–%-7s m2 : %4d 块   %7.2f m2  (%.1f%%)"
                   % (lo_b, "%.1f" % hi_b if hi_b < 1e8 else "∞", len(sel),
                      float(sel.sum()), 100.0 * sel.sum() / max(tot, 1e-9)))
-        k_shell = max(1, int(round(2.0 / res)))          # 2 cells == 0.20 m
-        near_obs = cv2.dilate(obstacle.astype(np.uint8),
-                              np.ones((2 * k_shell + 1,) * 2,
-                                      np.uint8)) > 0
-        shell = stranded & near_obs
-        print("  距障碍 <= %.2f m 的（= 安全半径外壳）: %.1f m2  (%.1f%%)"
-              % (2 * res, float(shell.sum()) * cell,
-                 100.0 * shell.sum() / max(stranded.sum(), 1)))
-        far = stranded & ~near_obs
-        print("  离障碍更远的（才是「另一个区域」）      : %.1f m2  (%.1f%%)"
-              % (float(far.sum()) * cell,
-                 100.0 * far.sum() / max(stranded.sum(), 1)))
+        print("  绿但被安全边拿走（ground & ~free）  : %7.2f m2  (%5.1f%%)"
+              "  <- 由我们自己选的半径决定，不是地图事实"
+              % (float(shell.sum()) * cell,
+                 100.0 * float(shell.sum()) * cell / max(tot, 1)))
+        print("  绿、可走、但不是机器人那一块        : %7.2f m2  (%5.1f%%)"
+              "  <- 只有这一块可能说明『地图断了』"
+              % (float(other.sum()) * cell,
+                 100.0 * float(other.sum()) * cell / max(tot, 1)))
+        if other.any():
+            _n2, _l2 = cv2.connectedComponents(other.astype(np.uint8),
+                                               connectivity=4)
+            _sz = sorted((float((_l2 == i).sum()) * cell
+                          for i in range(1, _n2 + 1)), reverse=True)
+            print("    其中前 5 块: %s m2" % [round(v, 2) for v in _sz[:5]])
 
     # For each stranded patch: is it connected in the RAW grid?  That separates
     # "our erosion sealed a real doorway" from "there is a wall / no door seen".
@@ -443,9 +462,10 @@ def map_figure(free, lab, seed, ground, obstacle, seen, traj, res, ext, out_png,
     Four classes, and the point of drawing them apart is that the headline
     number mixes two of them:
       green   the robot's own component (what it can drive on)
-      orange  ground within 0.20 m of an obstacle -- the safety-margin lining
-      red     ground outside the component and away from obstacles: the only
-              cells that are honestly "another region"
+      orange  green that the safety margin took (`ground & ~free`) -- by
+              definition, no threshold involved
+      red     green and walkable but in another component: the only cells that
+              are honestly "another region"
       grey    obstacle, dark = never seen
     """
     h, w = free.shape
@@ -453,11 +473,9 @@ def map_figure(free, lab, seed, ground, obstacle, seen, traj, res, ext, out_png,
     img = np.full((h, w, 3), (28, 28, 32), np.uint8)
     img[seen] = (60, 60, 66)
     img[obstacle] = (110, 110, 118)
-    k = max(1, int(round(2.0 / res)))
-    shell = cv2.dilate(obstacle.astype(np.uint8),
-                       np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
-    img[ground & shell & (lab != seed)] = (0, 165, 255)          # BGR orange
-    img[ground & ~shell & (lab != seed)] = (0, 0, 255)           # red
+    shell = ground & ~free
+    img[shell & (lab != seed)] = (0, 165, 255)                   # BGR orange
+    img[ground & free & (lab != seed)] = (0, 0, 255)             # red
     img[lab == seed] = (0, 200, 0)
     for p in traj:
         c = wm.cell_of(p[0], p[1])
@@ -475,8 +493,8 @@ def map_figure(free, lab, seed, ground, obstacle, seen, traj, res, ext, out_png,
     big = cv2.resize(crop, None, fx=scale, fy=scale,
                      interpolation=cv2.INTER_NEAREST)
     big = cv2.flip(big, 0)                      # +y up, matching the panel
-    big = viz.banner(big, ["绿 = 机器人可达   橙 = 安全半径外壳(<=0.20 m)   "
-                           "红 = 真正的「另一个区域」",
+    big = viz.banner(big, ["绿 = 机器人可达   橙 = 绿但被安全边拿走（ground & ~free）   "
+                           "红 = 绿、可走、但不是机器人那一块",
                            "白圈 = 唯一一块>=0.5 m2 的孤立地面  "
                            "(%.2f, %.2f)" % stranded_xy
                            if stranded_xy else "白圈 = 无"],
