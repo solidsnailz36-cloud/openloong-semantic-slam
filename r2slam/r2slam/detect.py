@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""COCO object detection, shared by both data sources.
+"""Object detection, shared by both data sources.
 
-Model: **YOLO11n**, exported to ONNX at 640x640 by
-`vendor/detector/_export/export_yolo11n.py`.  It replaced the ONNX-zoo
-`tiny-yolov3-11` on 2026-10-03 for a measured reason, not a fashion one: on the
-simulator's own camera frames the old model reported 25 person instances where
-`/gazebo/model_states` says there are **three**, and it reported the same wrong
-place up to 42 times, so the "seen at least twice" gate could not filter them.
-The object it was most persistent about is the `youbot` parked at (4.32, -6.16),
-an orange-and-white mobile manipulator.  A stronger backbone fixes the cause.
+Model: **YOLO-World v2-S with a baked vocabulary**, exported to ONNX at 320x320
+(`vendor/detector/yoloworld_alias_320.onnx`; 51 baked prompts -> 39 classes).
+It is an **open-vocabulary** head: the indices in its output are *our own prompt
+order*, not COCO's, and the index -> project-label-id mapping lives in the
+`.classmap.json` sidecar beside the model, which `OnnxYoloDetector` loads by
+itself when it is there.  `--model` falls back to a closed-set COCO export
+(`yolo26n.onnx`).  Nothing here is trained or fine-tuned: every file in
+`vendor/detector/` is an upstream export, and which of its classes reach the map
+is decided by the physical gates in `r2slam/labels.py`, not by weights.
+
+The swap history is measured, not fashionable.  The ONNX-zoo `tiny-yolov3-11`
+came first; on the simulator's own camera frames it reported 25 person instances
+where `/gazebo/model_states` says there are **three**, and it reported the same
+wrong place up to 42 times, so the "seen at least twice" gate could not filter
+them.  The object it was most persistent about is the `youbot` parked at
+(4.32, -6.16), an orange-and-white mobile manipulator.  A stronger backbone
+fixed the cause; an open vocabulary is what lets a thing the COCO-80 table has
+no word for still be *named* rather than silently dropped.
 
 Two properties still matter and both still hold:
 
@@ -17,20 +27,17 @@ Two properties still matter and both still hold:
     2 GB torch install onto the target is the opposite of that.  torch is used
     once, offline, only to *produce* the .onnx -- it never enters the pipeline,
     the delivery environment or the container.
-  * **the decode is checked against the reference implementation.**  Dropping
-    tiny-yolov3 means we now own the anchor decode (YOLO11's ONNX output is the
-    raw `[1, 84, 8400]`: 4 box + 80 class, no objectness, no NMS).  A wrong
-    decoder fails silently and yields plausible-but-mislocated boxes, so
-    `tools/check_onnx_parity.py` runs ultralytics' own predictor and this
-    decoder over the same frames and asserts the boxes agree to a fraction of a
-    pixel.  That script is the reason this file is allowed to do arithmetic on
-    raw tensors.
+  * **the decode is checked against the reference implementation.**  Owning the
+    anchor decode means owning a silent failure mode: a wrong decoder yields
+    plausible-but-mislocated boxes, which is the same class of bug the
+    tiny-yolov3 numbers above were.  `tools/check_onnx_parity.py` runs
+    ultralytics' own predictor and this decoder over the same frames and asserts
+    the boxes agree to a fraction of a pixel -- it was written against the
+    closed-set export (raw `[1, 84, 8400]`: 4 box + 80 class, no objectness, no
+    NMS) and is the reason this file is allowed to do arithmetic on raw tensors.
 
-The network is a **COCO-80** detector and is used as-is: nothing here is
-trained or fine-tuned.  Which of the 80 classes end up in the map is decided by
-the label table in `r2slam/labels.py` (physical gates, not tuned weights), and
-`detect_mapped()` returns the project's own label id so the rest of the stack
-never has to know about COCO.
+`detect_mapped()` returns the project's own label id, so the rest of the stack
+never has to know which vocabulary the current model speaks.
 """
 from __future__ import annotations
 

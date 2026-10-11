@@ -2,15 +2,38 @@
 # -*- coding: utf-8 -*-
 """Per-room trajectory coverage, in the same boxes the earlier rounds used.
 
+*** DO NOT MAKE DECISIONS ON THIS NUMBER -- USE `_room_cover2.py` INSTEAD. ***
+
+The denominator here is "the room's cells that are reachable in the FINAL map".
+That denominator collapses: the obstacle layer keeps accumulating, so a doorway
+the robot drove through half an hour earlier can be sealed by the end of the run,
+the room leaves the robot's connected component, and the ratio becomes 0/0
+(printed as `nan`) or a percentage of a few square tenths.
+
+Measured 2026-10-08 on three repeats of the same build: this script reported
+"min over three rooms = 90%" for `subr2_sim`, but only ONE room was actually in
+that minimum -- the other two had a final denominator of 0.00 m2 and were
+silently dropped, because `nan` does not lose a `min()`.  The monotone-denominator
+value for that same run is 32%.  `_room_cover2.py` exists for exactly this
+reason and states it in its own docstring.
+
+This script is kept because `docs/探索算法_v2_设计与参考.md` §16 was made with
+it and that table must remain reproducible; `run_repeat.sh` prints it after the
+authoritative one so the two can be told apart.
+
 The quantity, stated once and applied to every run: inside a room's box, the
 fraction of **planner-walkable cells reachable from the robot's own component**
 that come within `VISITED_R` of the recorded trajectory.  It is the same
 quantity `_explore_ab.py` draws, restricted to a room.
 
-Validated against the table already in `docs/探索算法_v2_设计与参考.md` §16: run
-this on `grids_v16_sim` and the four numbers must come out 50 / 0 / 44 / 0
-(右上 / 左下 / 左上 / 帘子).  If they do not, the boxes here are not the boxes
-that table was made with and neither table should be compared with the other.
+This script's own historical check: `docs/探索算法_v2_设计与参考.md` §16 lists
+`v16_sim` as 50 / 0 / 44 / 0 (右上 / 左下 / 左上 / 帘子).  Re-run on 2026-10-08 it
+gives **53 / 0 / 55 / 0** -- the two non-zero rooms moved by 3 and 11 points while
+both zeros reproduce exactly.  The cause was NOT chased (see the top of this
+docstring: this script no longer decides anything).  What matters when using it
+for continuity is that the *pattern* of zeros reproduces, and that §16's
+conclusion -- a 71-79 point spread across rooms -- is far larger than the
+discrepancy.  **Do not treat 50/0/44/0 as an exact regression gate.**
 
     python out/_room_cover.py [run_dir:grids_dir ...]
 """

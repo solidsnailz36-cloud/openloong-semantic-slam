@@ -54,6 +54,15 @@ r2slam/mobileclip_blt.ts
 # 一次性诊断的帧转储（几百 MB，可重出）
 _tmp_fr/
 
+# `_tmp_gate/` = 探索退化的门控实验工作区（n=3 对照臂那一仗）。
+# 规矩：**脚本入库**（`*.py` / `*.sh`，可复现），**跑一次就变的东西不入库**。
+#  `gold/` 尤其不能入：它是 gold 对照臂的整棵源码副本（3.2 MB），
+#  跟主代码树重复，而且快照冻结在改史之前 —— 里面还带着未脱敏的手机号。
+_tmp_gate/gold/
+_tmp_gate/*.log
+_tmp_gate/*.csv
+_tmp_gate/*.txt
+
 # 注：`vendor/detector/*.onnx`（35.5 MB 检测模型）被上面的 *.onnx 排除。
 # 它是**静态资产、从不改动**，要重建环境时从 `docs/灾备与恢复清单.md` 取回即可。
 

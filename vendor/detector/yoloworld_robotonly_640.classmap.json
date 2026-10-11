@@ -1,0 +1,11 @@
+{
+  "variant": "yolov8s-worldv2.pt",
+  "imgsz": 640,
+  "note": "index -> project label id, in the order the prompts were baked; r2slam/detect.py loads this when it sits beside the .onnx so no COCO mapping is applied",
+  "index_to_label": {
+    "0": 40
+  },
+  "prompts": [
+    "robot"
+  ]
+}
