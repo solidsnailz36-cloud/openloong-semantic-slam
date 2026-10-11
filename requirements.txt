@@ -1,0 +1,52 @@
+# ============================================================================
+#  运行依赖 —— 在线栈（tools/online_pipeline.py）
+#
+#  分三档，只有第一档是"跑起来必须有"的：
+#
+#    ① 核心，两源都要           numpy  opencv-python  onnxruntime  PyYAML
+#    ② 按数据源二选一           仿真 → ROS 1 rospy  |  真实 → rosbags（纯 python）
+#    ③ 可选（有则更好）         imageio-ffmpeg（编码视频）  Pillow（特殊图像）
+#
+#  ⚠️ 交付/嵌入式环境的硬约束（这不是建议）：
+#    **出厂只有 numpy + cv2 + onnxruntime。** 诊断脚本一律不许 `import scipy`，
+#    运行时不带 PyTorch —— torch 只在**离线**用来*产出* .onnx，它不进管线、
+#    不进交付环境、不进容器。
+#
+#  ⚠️ 版本：容器基线是 py3.8.10 / **onnxruntime 1.16.3（只支持到 opset 19）** /
+#    cv2 5.0.0 / 没有 onnx 包。**导出 ONNX 一律 `--opset 19`**，否则容器里加载失败。
+# ============================================================================
+
+# ---- ① 核心（两个数据源都必须） ----
+numpy>=1.24,<2
+opencv-python>=4.8
+onnxruntime>=1.16,<1.18          # 1.16 是容器基线；只到 opset 19
+PyYAML>=6.0
+
+# ---- ② 里程计：题面要求"输入只允许点云/图像/IMU"，这是本项目唯一的配准实现 ----
+# 全项目只有 r2slam/r2slam/odometry.py 一处构造它（测量工具与管线共用，防参数漂移）
+kiss-icp>=1.0
+
+# ---- ③ 数据源 A：官方仿真（ROS 1 Noetic + Gazebo Classic） ----
+# 不走 pip，随 ROS 发行版提供；容器里由 `source /opt/ros/noetic/setup.bash` 提供
+# rospy  message_filters  sensor_msgs  nav_msgs  geometry_msgs
+
+# ---- ③ 数据源 B：真实 ROS 2 bag（纯 python 读取，不需要装 ROS 2） ----
+rosbags>=0.9
+
+# ---- ④ 可选 ----
+imageio-ffmpeg>=0.4              # 取 ffmpeg 可执行文件做视频编码
+Pillow>=10.0                     # 少数图像格式的解码回退
+
+# ============================================================================
+#  离线工具专用（**不要**装进交付环境 / 容器）
+#  只有 tools/fetch_yoloworld.py、export_yoloe.py、quantize_onnx.py、
+#  check_onnx_parity.py、bench_seg_head.py 需要它们。
+#
+#  它们做的是：把 ultralytics 的 YOLO-World / YOLOE / YOLO-seg 导出成 ONNX，
+#  并做数值一致性核对。导出完就与运行时无关了。
+# ============================================================================
+# ultralytics>=8.4
+# torch>=2.0
+# onnx>=1.15
+# onnxruntime  # 已在上面的核心档，`onnxruntime.quantization` 做 INT8 静态量化
+# open3d       # 仅 tools/time_odometry.py 与 check_map_vs_official.py 读 .pcd 用

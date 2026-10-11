@@ -39,11 +39,20 @@ r2slam/out/
 .workbuddy/out/
 docs/_bak/
 
+# ---------- 2b. 单个的大资产（按路径点名，不用通配符，避免误伤） ----------
+# `mobileclip_blt.ts` 是 572 MB 的 MobileCLIP 文本塔，只在**离线**构建 YOLO-World
+# baked vocabulary 时用得到，从不进运行时。`.gitignore` 原来漏了它（`*.ts` 不敢用，
+# 那会连带忽略 TypeScript）⇒ 一次 `git add -A` 就能把 572 MB 提交进去。
+r2slam/mobileclip_blt.ts
+
 # ---------- 3. 派生图（由脚本重出，不进库） ----------
 /*.png
 /*.html
 /viz_out/
 /viz_out_before/
+
+# 一次性诊断的帧转储（几百 MB，可重出）
+_tmp_fr/
 
 # 注：`vendor/detector/*.onnx`（35.5 MB 检测模型）被上面的 *.onnx 排除。
 # 它是**静态资产、从不改动**，要重建环境时从 `docs/灾备与恢复清单.md` 取回即可。
