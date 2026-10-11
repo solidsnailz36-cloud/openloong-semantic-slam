@@ -39,7 +39,7 @@
 | `deskew.py` | **真实侧必需**：匀速模型运动补偿（`p_ref = T_motion(dt) @ p`） |
 | `odometry.py` | KISS-ICP 的唯一构造处（测量工具与管线共用，避免参数漂移） |
 | `heading.py` | **只有扫描器不随车体转时用**：用上一条指令的角速度死推航向（见下） |
-| `detect.py` | `tiny-yolov3` ONNX 检测（onnxruntime / cv2 双后端，**线程数受限**）；`detect_mapped()` 直接给**本项目的 label id** |
+| `detect.py` | ONNX 检测（onnxruntime / cv2 双后端，**线程数受限**）。默认 `yoloworld_alias_320.onnx`＝**开放词汇**头（51 条烘焙 prompt / 39 类，词表在 `.classmap.json` sidecar）；`--model` 可换回闭集 COCO（`yolo26n.onnx`）。`detect_mapped()` 直接给**本项目的 label id** |
 | `fusion.py` | 框 → 三维位置（取框内点 30 分位深度）+ **反投影回框内的硬判据**；人与物体走同一条几何 |
 | `labels.py` | **类别表的唯一定义源**（id ↔ 名称 ↔ 颜色 ↔ COCO 映射 ↔ 门限），并导出 `label_table.yaml` |
 | `traversable.py` | 地面 RANSAC + 高度带 / 闭运算 / 障碍膨胀 → 2D 可通行栅格 |

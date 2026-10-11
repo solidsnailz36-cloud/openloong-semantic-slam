@@ -1,11 +1,20 @@
-# 检测器（人物）
+# 检测器
+
+> ⚠️ **2026-10-09 起默认已换**：`detect.py:DEFAULT_MODEL_FILE = "yoloworld_alias_320.onnx"`
+> ——**开放词汇**头（51 条烘焙 prompt / 39 类），**不再是**下面的闭集 COCO 模型。
+> 这份 README 余下部分讲的是**闭集那条线**（yolo11n → yolo26n，COCO-80），
+> 它现在是 `--model` 的**回退选项**，取舍与实测数字仍然有效。
+> 开放词汇那一轮的 32 个臂在 `docs/开放词汇边缘化_第一轮实测_20261009.md`。
 
 ## 在用的是什么
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| **`yolo26n.onnx`** | **9,883,834 B** | **当前默认**（`online_pipeline.py` / `detect.py`） |
-| `yolo11n.onnx` | 10,741,326 B | 上一版默认，保留作对照 / 回退 |
+| **`yoloworld_alias_320.onnx`** | **50,368,392 B** | **当前默认**（`detect.py:DEFAULT_MODEL_FILE`；`online_pipeline.py` / `replay_explore.py` 共读这一个常量）。**开放词汇**头：**51 条烘焙 prompt / 39 类**，类别索引是**我们自己的 prompt 顺序**（不是 COCO 的），映射在同目录 `.classmap.json` sidecar |
+| `yoloworld_*` 其余臂 | 13–50 MB | `open` / `persononly` / `robotonly` / `promptform` / `templ` / `s*` 是**词表臂**；`int8` / `pc` / `t4` / `t6` / `416` / `640` 是**量化与尺寸臂**。⚠️ **INT8 在 51 类上失效 ⇒ 只能 fp32** |
+| `yolo26n-seg_320.onnx` | 11,026,122 B | **实例分割头**（`r2slam/seg.py`，`--seg-model`）。**与检测器并跑、不是替它**：它是闭集 COCO-80 ⇒ 只提供形状，`--seg-classes` 默认 `person` |
+| `yolo26n.onnx` | 9,883,834 B | 闭集 COCO-80 检测器（2026-10-04 起曾是默认）⇒ 回退：`--model vendor/detector/yolo26n.onnx` |
+| `yolo11n.onnx` | 10,741,326 B | 更早一版闭集默认，保留作对照 |
 | `coco.names` | 625 B | 80 个类名（`labels.py` 里的 COCO id 都对着它） |
 | `tiny-yolov3-11.onnx` | 35,511,756 B | 已退役（会把 youbot / 椅子认成人），只留档 |
 | `_export/*.onnx` | yolo11s 38 MB / yolo11m 80 MB / yolo26n / yolo11n | 实验导出的候选，**不进包** |
@@ -13,7 +22,7 @@
 ⚠️ `*.onnx` 在 `.gitignore` 里 ⇒ **模型不在版本库里**，换机器/重新 clone 后必须手动补齐，
 否则 `_resolve_vendor` 找不到文件会直接报错（不会静默退回别的模型）。
 
-两个模型的**原始输出相同**：`[1, 84, 8400]`，`cxcywh + letterbox`，**无自带 NMS**。
+闭集那一对（`yolo11n` / `yolo26n`）的**原始输出相同**：`[1, 84, 8400]`，`cxcywh + letterbox`，**无自带 NMS**。
 所以 `r2slam/detect.py` 的解码是共用的，换模型不需要改解码器 ——
 但**每次换模型都必须跑 `tools/check_onnx_parity.py`**（它逐帧比对 ultralytics 的参考结果）：
 

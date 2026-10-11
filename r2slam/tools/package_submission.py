@@ -414,6 +414,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="out", help="root holding online_sim / online_real")
     ap.add_argument("--out", required=True, help="where to write the package")
+    # 手机号默认打码：这是公开仓库，真实号码不应出现在源码里。
+    # 正式打包时用 --team 传入完整名称（格式见 docs/HANDOFF_项目交接.md §1.3）。
     ap.add_argument("--team", default="大师赛第一期赛题2—【固态蜗牛队】—【张煜晨】—【156****6887】")
     ap.add_argument("--no-zip", action="store_true")
     a = ap.parse_args()
