@@ -48,7 +48,7 @@
 - 唯一不可再得：`D://E-Downd//data.bag`（初赛 2532 MB，81 分）。
 - 交付：实时＋整集视频＋自建 pcd；官方 pcd 只作提示；仿真 LiDAR yaw **不修**；输入只允许点云/图像/IMU；输出 pcd＋TF；建图 50%/感知 50%。
 - 边缘算力是规则要求；类别表组委会不给；**真实侧无真值⇒任何 mIoU/识别率都是编的（要敢说“不知道”）**。
-- **成果已归档 GitHub**：`solidsnailz36-cloud/openloong-semantic-slam`（public；根 README＝对外版）。⚠️ **本地已做第 2 次 `filter-branch`（memory 里漏网的真实号码）但未推送**：token 已被 boss revoke、GCM 无凭据（`push` 挂死而 `ls-remote` 秒回＝凭据问题）⇒ **远端 public 仍停在旧提交**。★ `memory/` 是入版本库的 ⇒ 别把被脱敏的值再抄一遍。短 hash 引用全失效（按标题找）。
+- **成果已归档 GitHub**：`solidsnailz36-cloud/openloong-semantic-slam`（**public**；根 README＝对外版）。**已删库重建**（★ force-push 不算解决：旧 blob 经 CDN/源站仍可读）⇒ 远端＝本地＝`a19faaf`／149 提交／匿名克隆全史 0 处号码。★ `memory/` 入版本库 ⇒ 别把被脱敏的值再抄一遍。短 hash 引用全失效（按标题找）。
 - ⚠️ **OpenLoong 赛题二（＝本项目）复赛未晋级**（10-10 22:19 群内出名单 / 官方公布日 10-13）：把“赛题一延期”外推成“赛题二也延期”⇒交了未修订版；**赛题一延期至 ~10-12 仍活着**。申诉口径：`docs/OpenLoong复赛_赛题二结果与申诉_20261011.md`。
 
 ## 环境
